@@ -4,7 +4,9 @@
 Checks, rename/delete aware (git diff --name-status -z):
   - every changed path is inside the declared write set
   - no forbidden path is touched
-  - shared surfaces (lockfiles, build/config files, migrations) are flagged
+  - shared surfaces require an explicit allow_shared_surfaces declaration
+  - empty diffs fail unless the task explicitly allows them
+  - task mode requires successful structured verification evidence
   - the task worktree has no uncommitted changes (all work is in task commits)
 
 Task mode (reads the run's task record):
@@ -27,11 +29,14 @@ import subprocess
 import sys
 from pathlib import Path
 
-SHARED_SURFACE_WARN = [
+SHARED_SURFACES = [
     "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
-    "go.mod", "go.sum", "Cargo.toml", "Cargo.lock", "requirements.txt",
-    "Makefile", "CMakeLists.txt", "configure.ac", ".gitignore",
-    ".github/**", "migrations/**",
+    "pyproject.toml", "setup.cfg", "tox.ini", "go.mod", "go.sum",
+    "Cargo.toml", "Cargo.lock", "requirements*.txt", "Makefile",
+    "CMakeLists.txt", "configure.ac", "Dockerfile*", "docker-compose*.yml",
+    ".gitignore", ".github/**", "migrations/**", "schemas/**", "generated/**",
+    "**/*.proto", "**/openapi*", "**/schemas/**", "**/fixtures/**",
+    "**/__snapshots__/**", "**/*.snap",
 ]
 
 
@@ -44,8 +49,19 @@ def run_git(args, cwd):
     return res.stdout
 
 
+def ref_exists(ref, cwd):
+    if not ref:
+        return False
+    res = subprocess.run(["git", "rev-parse", "--verify", "--quiet", ref],
+                         cwd=cwd, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    return res.returncode == 0
+
+
 def match(path, glob):
     if fnmatch.fnmatch(path, glob):
+        return True
+    if glob.startswith("**/") and fnmatch.fnmatch(path, glob[3:]):
         return True
     if glob.endswith("/**") and (path == glob[:-3] or path.startswith(glob[:-3] + "/")):
         return True
@@ -94,9 +110,14 @@ def main():
     ap.add_argument("--worktree", help="task worktree to check for cleanliness")
     ap.add_argument("--write-set", action="append", default=[], dest="write_set")
     ap.add_argument("--forbidden", action="append", default=[], dest="forbidden")
+    ap.add_argument("--allow-empty-diff", action="store_true")
+    ap.add_argument("--allow-shared-surface", action="append", default=[])
+    ap.add_argument("--verification-evidence", action="append", default=[],
+                    help="JSON evidence file; direct mode only")
     args = ap.parse_args()
 
     repo = run_git(["rev-parse", "--show-toplevel"], Path.cwd()).strip()
+    state_data = {}
 
     if args.task:
         if not args.run:
@@ -115,34 +136,66 @@ def main():
             state_file = Path(repo) / args.run / "state.json"
             if state_file.is_file():
                 try:
-                    base = json.loads(state_file.read_text(encoding="utf-8")) \
-                        .get("integration_branch")
+                    state_data = json.loads(state_file.read_text(encoding="utf-8"))
+                    base = state_data.get("integration_branch")
                 except (OSError, json.JSONDecodeError):
                     base = None
+        if base and not ref_exists(base, repo):
+            base = None
         if not base:
             base = rec.get("base_commit")
         head = args.head or rec.get("branch")
         write_set = args.write_set or rec.get("write_set", [])
         forbidden = args.forbidden or rec.get("forbidden_paths", [])
         worktree = args.worktree or rec.get("worktree")
+        allow_empty = args.allow_empty_diff or rec.get("allow_empty_diff", False)
+        allowed_shared = args.allow_shared_surface or rec.get("allow_shared_surfaces", [])
+        shared_surfaces = list(dict.fromkeys([
+            *SHARED_SURFACES, *state_data.get("shared_surfaces", [])
+        ]))
+        evidence = rec.get("verification_evidence", [])
+        expected_verification = rec.get("verification")
     else:
         base, head = args.base, args.head
         write_set, forbidden, worktree = args.write_set, args.forbidden, args.worktree
+        allow_empty = args.allow_empty_diff
+        allowed_shared = args.allow_shared_surface
+        shared_surfaces = SHARED_SURFACES
+        evidence = []
+        expected_verification = None
+        for evidence_file in args.verification_evidence:
+            try:
+                loaded = json.loads(Path(evidence_file).read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                sys.stderr.write(f"error: invalid verification evidence {evidence_file}: {exc}\n")
+                sys.exit(2)
+            evidence.extend(loaded if isinstance(loaded, list) else [loaded])
 
     if not base or not head:
         ap.error("need --base and --head (or a task record providing them)")
     if not write_set:
         ap.error("empty write set: declare at least one --write-set glob")
 
-    entries = changed_paths(base, head, repo)
-    violations, forbidden_hits, warnings = [], [], []
+    base_sha = run_git(["rev-parse", base], repo).strip()
+    head_sha = run_git(["rev-parse", head], repo).strip()
+    entries = changed_paths(base_sha, head_sha, repo)
+    violations, forbidden_hits, shared_hits = [], [], []
     for status, path in entries:
         if matches_any(path, forbidden):
             forbidden_hits.append((status, path))
         if not matches_any(path, write_set):
             violations.append((status, path))
-        elif matches_any(path, SHARED_SURFACE_WARN):
-            warnings.append((status, path))
+        elif matches_any(path, shared_surfaces) and not matches_any(path, allowed_shared):
+            shared_hits.append((status, path))
+
+    empty_violation = not entries and not allow_empty
+    verification_ok = any(
+        isinstance(item, dict) and item.get("exit_code") == 0 and item.get("command")
+        and (not expected_verification or item.get("command") == expected_verification)
+        and (not args.task or item.get("head_sha") == head_sha)
+        for item in evidence
+    )
+    verification_missing = bool(args.task) and not verification_ok
 
     dirty = ""
     if worktree:
@@ -155,7 +208,8 @@ def main():
                              f"cannot verify the task worktree is clean\n")
             sys.exit(2)
 
-    ok = not violations and not forbidden_hits and not dirty
+    ok = not (violations or forbidden_hits or shared_hits or dirty or
+              empty_violation or verification_missing)
     print(f"check-task: {len(entries)} changed path(s), base={base} head={head}")
     if forbidden_hits:
         print("FORBIDDEN paths touched:")
@@ -165,14 +219,35 @@ def main():
         print("write-set VIOLATIONS (changed outside declared write set):")
         for s, p in violations:
             print(f"  {s}  {p}")
+    if shared_hits:
+        print("UNDECLARED shared surfaces touched (serialize and declare allow_shared_surfaces):")
+        for s, p in shared_hits:
+            print(f"  {s}  {p}")
+    if empty_violation:
+        print("EMPTY diff (task produced no declared change; set allow_empty_diff only for audit tasks)")
+    if verification_missing:
+        print("VERIFICATION evidence missing (need command + exit_code=0 in task record)")
     if dirty:
         print("worktree NOT CLEAN (uncommitted changes must be committed or dropped):")
         for line in dirty.splitlines():
             print(f"  {line}")
-    if warnings:
-        print("warnings (shared surfaces inside write set / setup):")
-        for s, p in warnings:
-            print(f"  {s}  {p}")
+    if args.task:
+        state_tool = Path(__file__).with_name("agent-team-state.py")
+        if not state_tool.exists():
+            state_tool = Path(repo) / ".codex/bin/agent-team-state"
+        res = subprocess.run(
+            [sys.executable, str(state_tool), "--run", args.run, "task-check",
+             args.task, "passed" if ok else "failed", "--base", base_sha, "--head", head_sha,
+             "--evidence", (f"{len(entries)} changed paths; "
+                            f"violations={len(violations)} forbidden={len(forbidden_hits)} "
+                            f"shared={len(shared_hits)} dirty={bool(dirty)} "
+                            f"empty={empty_violation} verification_missing={verification_missing}")],
+            cwd=repo, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        if res.returncode:
+            sys.stderr.write(res.stderr)
+            sys.stderr.write("error: mechanical check result could not be recorded\n")
+            sys.exit(2)
     print("result: PASS" if ok else "result: FAIL")
     sys.exit(0 if ok else 1)
 

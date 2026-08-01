@@ -8,7 +8,7 @@ SMOKE=0
 [[ "${1:-}" == "--smoke" ]] && SMOKE=1
 
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "error: not in a git repo" >&2; exit 2; }
-cd "$ROOT"
+cd "$ROOT" || exit 2
 FAIL=0
 WARN=0
 
@@ -17,18 +17,42 @@ warn() { echo "warn: $*"; WARN=1; }
 ok()   { echo "ok:   $*"; }
 
 # --- installed files ---
-AGENTS=(researcher architect parallel-planner developer debugger frontend-debugger \
-        system-debugger tester integration-tester spec-reviewer code-reviewer knowledge-distiller)
+AGENTS=(researcher architect parallel-planner test-designer spec-reviewer standards-reviewer risk-reviewer)
 for a in "${AGENTS[@]}"; do
   [[ -f ".codex/agents/$a.toml" ]] || fail "missing .codex/agents/$a.toml"
 done
 [[ -f ".codex/agents/${AGENTS[0]}.toml" ]] && ok "${#AGENTS[@]} agent TOMLs present (or failures listed above)"
 
-for b in wake-agent-team agent-team-finish agent-team-check-task agent-team-doctor; do
+for b in wake-agent-team agent-team-finish agent-team-check-task agent-team-doctor \
+         agent-team-state agent-team-worker agent-team-review; do
   if [[ ! -x ".codex/bin/$b" ]]; then fail "missing or non-executable .codex/bin/$b"; fi
 done
-[[ -f ".agents/skills/agent-team-dev/SKILL.md" ]] && ok "agent-team-dev skill installed" \
-  || fail "missing .agents/skills/agent-team-dev/SKILL.md"
+if [[ -f ".agents/skills/agent-team-dev/SKILL.md" ]]; then
+  ok "agent-team-dev skill installed"
+else
+  fail "missing .agents/skills/agent-team-dev/SKILL.md"
+fi
+
+for role in developer debugger frontend-debugger system-debugger test-writer \
+            integration-tester fixer knowledge-distiller; do
+  [[ -f ".codex/worker-prompts/$role.md" ]] || fail "missing worker prompt: $role"
+done
+for schema in run-state task worker-result verification finding review-result; do
+  [[ -f ".codex/schemas/$schema.schema.json" ]] || fail "missing schema: $schema"
+done
+SCHEMA_OK=1
+for schema_file in .codex/schemas/*.schema.json; do
+  python3 -m json.tool "$schema_file" >/dev/null 2>&1 || { fail "invalid JSON schema: $schema_file"; SCHEMA_OK=0; }
+done
+[[ $SCHEMA_OK -eq 1 ]] && ok "all JSON schemas parse"
+
+for competing in using-superpowers executing-plans subagent-driven-development \
+                 requesting-code-review receiving-code-review \
+                 finishing-a-development-branch using-git-worktrees \
+                 test-driven-development systematic-debugging \
+                 dispatching-parallel-agents; do
+  [[ ! -d ".agents/skills/$competing" ]] || fail "competing skill remains installed: $competing"
+done
 
 # --- config.toml schema ---
 CFG=".codex/config.toml"
@@ -39,9 +63,11 @@ agents_block() {
 }
 if [[ -f "$CFG" ]]; then
   if grep -qE '^\s*\[\s*agents\s*\]' "$CFG"; then
-    agents_block | grep -q '^\s*max_concurrent_threads_per_session\s*=' \
-      && ok "[agents] max_concurrent_threads_per_session set" \
-      || fail "$CFG [agents] missing max_concurrent_threads_per_session (concurrency cap silently absent)"
+    if agents_block | grep -q '^\s*max_concurrent_threads_per_session\s*='; then
+      ok "[agents] max_concurrent_threads_per_session set"
+    else
+      fail "$CFG [agents] missing max_concurrent_threads_per_session (concurrency cap silently absent)"
+    fi
     agents_block | grep -q '^\s*max_depth\s*=' || warn "$CFG [agents] missing max_depth"
     agents_block | grep -q '^\s*max_threads\s*=' \
       && warn "$CFG has legacy 'max_threads' — codex ignores it; remove it (re-run installer)"
@@ -116,12 +142,12 @@ if [[ $SMOKE -eq 1 ]]; then
   if command -v codex >/dev/null 2>&1; then
     echo "info: running smoke test (read-only codex exec)..."
     OUT="$(codex exec -C "$ROOT" --sandbox read-only \
-      "List the names of the custom subagent roles available in this project's configuration. Reply with names only, one per line. Do not edit anything." 2>&1 | tail -20)"
-    if echo "$OUT" | grep -q "developer"; then
-      ok "smoke: codex loaded custom agent roles"
+      "Spawn the test_designer role with fork_turns=none. Ask it to return only its QTEAM_ROLE_MARKER. Return that marker only. Do not edit anything." 2>&1 | tail -40)"
+    if echo "$OUT" | grep -q "QTEAM_ROLE_MARKER:test-designer-v1"; then
+      ok "smoke: specified role loaded with bounded context"
     else
-      fail "smoke: codex did not report custom agent roles; output tail:"
-      echo "$OUT" | sed 's/^/      /'
+      fail "smoke: specified role/fork_turns=none contract failed; output tail:"
+      while IFS= read -r line; do printf '      %s\n' "$line"; done <<< "$OUT"
     fi
   else
     fail "smoke requested but codex CLI not on PATH"

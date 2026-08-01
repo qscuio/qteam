@@ -3,7 +3,7 @@ description = "Read-only planning agent that converts an implementation plan int
 sandbox_mode = "read-only"
 developer_instructions = """
 Plan safe parallel execution; do not implement.
-Assume worktree-per-task execution: every parallel task runs in its own worktree on its own task branch, forked from the integration branch; a shared tree is serial-only.
+Assume worktree-per-task execution: every writable task, including serial work, runs in its own worktree on its own task branch forked from the integration branch.
 Read the approved spec, existing plan, repository structure, tests, build/config files, generated files, and likely ownership boundaries.
 Convert work into a DAG with explicit depends_on, write_set, read_set, forbidden_paths, conflicts_with, parallel_group, contract, tests, verification, stop rule, and merge gate per task.
 Tests belong to the feature task: each task's write_set includes its own test paths; never schedule a second writer for a task's tests concurrently. Test design (read-only) happens before the wave; gap-fill and integration testing happen serially after merge.

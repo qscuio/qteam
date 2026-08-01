@@ -11,12 +11,12 @@ pushed without explicit flags.
   agent-team-finish ... --allow-default-branch   # required on main/master/trunk
 
 Commit behavior:
-  - With an active run in READY_TO_FINISH whose integration branch carries the
-    work: fast-forward the current branch to the integration branch.
-  - Otherwise (serial/shared-tree work): stage only paths in the run manifest
-    (union of task write sets); with no active run, --all is required to stage
-    everything. Installer backups (*.bak.*) and .agents/runs/ are never staged.
-Quality gates are the workflow's job; this script gates scope and destination.
+  - Require exactly one active READY_TO_FINISH run and the recorded base branch.
+  - Preflight all state/review/verification invariants before Git mutation.
+  - Fast-forward the base branch to the integration branch; no shared-tree or
+    manifest-staging fallback exists.
+After successful local integration (and optional push), the run is atomically
+closed through agent-team-state. Push-only completion is forbidden.
 """
 
 import argparse
@@ -52,7 +52,7 @@ def match(path, glob):
 def porcelain_entries():
     """[(XY, path)] from `git status --porcelain -z` (NUL-safe: no C-quoting
     of non-ASCII paths); renames yield the new path, the orig field is skipped."""
-    out = git(["status", "--porcelain", "-z"])
+    out = git(["status", "--porcelain", "-z", "--untracked-files=all"])
     fields = out.split("\0")
     entries, i = [], 0
     while i < len(fields):
@@ -69,25 +69,18 @@ def porcelain_entries():
 def find_active_run(repo):
     runs = sorted((repo / ".agents" / "runs").glob("*/state.json"))
     active = []
+    corrupt = []
     for sf in runs:
         try:
             state = json.loads(sf.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as exc:
+            corrupt.append(f"{sf}: {exc}")
             continue
         if not state.get("finished", False):
             active.append((sf.parent, state))
+    if corrupt:
+        raise RuntimeError("cannot safely enumerate runs; corrupt state: " + "; ".join(corrupt))
     return active
-
-
-def manifest_globs(run_dir):
-    globs = []
-    for tf in sorted((run_dir / "tasks").glob("*.json")):
-        try:
-            rec = json.loads(tf.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        globs.extend(rec.get("write_set", []))
-    return globs
 
 
 def main():
@@ -97,17 +90,25 @@ def main():
     ap.add_argument("--push", action="store_true", help="push current branch to origin")
     ap.add_argument("--allow-default-branch", action="store_true",
                     help="permit --commit/--push on main/master/trunk")
-    ap.add_argument("--all", action="store_true",
-                    help="with no active run: stage all changes (minus junk)")
     ap.add_argument("--yes", action="store_true", help="skip interactive confirmation")
     args = ap.parse_args()
+
+    if args.push and not args.commit:
+        sys.stderr.write("error: --push requires --commit; push-only finish is forbidden\n")
+        sys.exit(3)
 
     repo = Path(git(["rev-parse", "--show-toplevel"]).strip())
     branch = git(["rev-parse", "--abbrev-ref", "HEAD"]).strip()
     entries = porcelain_entries()
     untracked = [p for xy, p in entries if xy == "??"]
     junk = [p for p in untracked if any(match(p, g) for g in NEVER_STAGE)]
-    active = find_active_run(repo)
+    material_entries = [(xy, p) for xy, p in entries
+                        if not any(match(p, g) for g in NEVER_STAGE)]
+    try:
+        active = find_active_run(repo)
+    except RuntimeError as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        sys.exit(3)
 
     print(f"branch: {branch}")
     if entries:
@@ -132,54 +133,48 @@ def main():
         sys.stderr.write(f"error: refusing to --commit/--push on default branch '{branch}' "
                          f"without --allow-default-branch\n")
         sys.exit(3)
-    if len(active) > 1:
-        sys.stderr.write("error: multiple active runs; finish is ambiguous. "
-                         "Mark stale runs finished in their state.json first.\n")
+    if len(active) != 1:
+        sys.stderr.write(f"error: finish requires exactly one active run; found {len(active)}\n")
+        sys.exit(3)
+    run_dir, state = active[0]
+    if branch != state.get("base_branch"):
+        sys.stderr.write(f"error: current branch {branch!r} is not run base_branch "
+                         f"{state.get('base_branch')!r}\n")
+        sys.exit(3)
+    if material_entries:
+        sys.stderr.write("error: working tree is dirty; integration finish needs a clean tree\n")
+        sys.exit(3)
+    integ = state.get("integration_branch")
+    if not integ or not git(["rev-parse", "--verify", "--quiet", integ],
+                            check=False).strip():
+        sys.stderr.write("error: recorded integration branch does not exist\n")
+        sys.exit(3)
+    state_tool = Path(__file__).with_name("agent-team-state.py")
+    if not state_tool.exists():
+        state_tool = repo / ".codex/bin/agent-team-state"
+    preflight = subprocess.run(
+        [sys.executable, str(state_tool), "--run", str(run_dir), "finish", "--check-only"],
+        cwd=repo, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if preflight.returncode:
+        sys.stderr.write(preflight.stderr)
+        sys.stderr.write("error: finish preflight failed; no Git mutation was performed\n")
+        sys.exit(3)
+    try:
+        frozen_head = json.loads(preflight.stdout.splitlines()[-1])["integration_head"]
+    except (IndexError, KeyError, json.JSONDecodeError):
+        sys.stderr.write("error: finish preflight returned no frozen integration SHA\n")
+        sys.exit(3)
+    if not frozen_head or git(["rev-parse", "--verify", f"{frozen_head}^{{commit}}"],
+                              check=False).strip() != frozen_head:
+        sys.stderr.write("error: finish preflight returned an invalid integration SHA\n")
+        sys.exit(3)
+    if subprocess.run(["git", "merge-base", "--is-ancestor", "HEAD", frozen_head],
+                      cwd=repo).returncode:
+        sys.stderr.write("error: base branch cannot fast-forward to reviewed integration SHA\n")
         sys.exit(3)
 
-    plan = []
-    ff_target = None
-    stage = []
-    if args.commit:
-        state = active[0][1] if active else {}
-        # the phase gate applies to ANY active run, whichever commit path runs:
-        # a run mid-wave must finish its workflow gates before anything lands
-        if active and state.get("phase") != "READY_TO_FINISH":
-            sys.stderr.write(f"error: run phase is {state.get('phase')}, not READY_TO_FINISH; "
-                             f"finish the workflow gates first\n")
-            sys.exit(3)
-        integ = state.get("integration_branch")
-        integ_exists = bool(integ and git(["rev-parse", "--verify", "--quiet", integ],
-                                          check=False).strip())
-        if integ and not integ_exists:
-            sys.stderr.write(f"error: state.json names integration branch '{integ}' but it "
-                             f"does not exist — refusing to degrade to tree staging\n")
-            sys.exit(3)
-        if integ_exists:
-            if entries:
-                sys.stderr.write("error: working tree is dirty; integration finish needs a clean "
-                                 "tree (commit or stash unrelated changes first)\n")
-                sys.exit(3)
-            ff_target = integ
-            plan.append(f"fast-forward {branch} to {integ}")
-        else:
-            globs = manifest_globs(active[0][0]) if active else []
-            changed = [p for _, p in entries]
-            if globs:
-                stage = [p for p in changed
-                         if any(match(p, g) for g in globs)
-                         and not any(match(p, g) for g in NEVER_STAGE)]
-                plan.append(f"stage {len(stage)} manifest path(s) and commit")
-            elif args.all:
-                stage = [p for p in changed
-                         if not any(match(p, g) for g in NEVER_STAGE)]
-                plan.append(f"stage all {len(stage)} path(s) (minus junk) and commit")
-            else:
-                sys.stderr.write("error: no active run manifest to scope staging; "
-                                 "pass --all to stage everything (minus junk)\n")
-                sys.exit(3)
-            if not stage:
-                plan.append("nothing to stage")
+    plan = [f"fast-forward {branch} to reviewed {frozen_head}"]
     if args.push:
         plan.append(f"push {branch} to origin")
 
@@ -194,13 +189,16 @@ def main():
             print("aborted")
             sys.exit(1)
 
-    if ff_target:
-        git(["merge", "--ff-only", ff_target], capture=False)
-    elif args.commit and stage:
-        git(["add", "--", *stage], capture=False)
-        git(["commit", "-m", args.commit], capture=False)
+    git(["merge", "--ff-only", frozen_head], capture=False)
     if args.push:
         git(["push", "origin", "HEAD"], capture=False)
+    res = subprocess.run(
+        [sys.executable, str(state_tool), "--run", str(run_dir), "finish",
+         "--expected-head", frozen_head], cwd=repo,
+    )
+    if res.returncode:
+        sys.stderr.write("error: preflight passed but run state could not be closed\n")
+        sys.exit(4)
     print("done")
 
 

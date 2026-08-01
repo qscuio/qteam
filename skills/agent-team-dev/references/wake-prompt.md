@@ -12,8 +12,11 @@ creating a new one; never restart brainstorming or redo merged work.
 
 Non-negotiables (full rules live in the skill):
 
-- Parallel writers require isolated task worktrees and task branches; a shared
-  tree is serial-only.
+- Every writer, including a serial one, requires its exact isolated task
+  worktree and task branch. The shared checkout is never a writable worker.
+- Native subagents are read-only and use `fork_turns=none`; all writable roles
+  launch through `agent-team-worker` with an exact task-worktree cwd.
+- Mutate run/task lifecycle only through `agent-team-state`, never direct JSON.
 - No task merges before `.codex/bin/agent-team-check-task` passes for it.
 - Developers commit only to their own task branch; never push, never touch the
   integration or user branch. The coordinator owns integration and gates.

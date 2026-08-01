@@ -1,146 +1,77 @@
----
-tags: [tools, codex-agent-team-template, skills, agent-team-dev, run-state, resume, state-machine, ai]
-timestamp: 2026-08-01T00:00:00.000Z
----
-# Run State Schema
+# Durable run state (schema version 2)
 
-Every agent-team run owns one directory under the target repository. The
-markdown plan is for humans; `state.json` + `events.jsonl` are the durable,
-machine-readable state the coordinator resumes from. `.agents/runs/` must be
-gitignored (the installer ensures this).
-
-## Directory layout
+`.agents/runs/<run-id>/` is runtime state and is gitignored. The coordinator
+must mutate it through `agent-team-state`, never by editing JSON.
 
 ```text
-.agents/runs/<run-id>/
-├── state.json          # authoritative run state (schema below)
-├── events.jsonl        # append-only event log, one JSON object per line
-├── plan.md             # human-readable plan (copy or link of docs/plans entry)
-├── tasks/
-│   ├── T01.json        # per-task record (schema below)
-│   └── T02.json
-├── worktrees/
-│   ├── integration/    # integration-branch checkout
-│   └── T01/            # task worktree, branch agent/<run-id>/T01
-├── reviews/
-│   ├── wave-1-spec.md
-│   └── wave-1-code.md
-└── learning-outbox/    # see learning-outbox-template.md
+state.json                 authoritative small run state
+events.jsonl               append-only audit events
+tasks/<id>.json            full task records
+workers/<id>.json          worker identity/lifecycle
+workers/<id>.result.json   durable exit result
+reviews/wave-N-<axis>.json immutable packet + finding ledger
+reviews/sources/<sha>.source content-addressed frozen review input
+reviews/results/*.json     bounded reviewer verdict artifacts
+worktrees/integration/     integration checkout
+worktrees/<id>/            task checkouts
+learning-outbox/           reviewed proposals
 ```
 
-`<run-id>` format: `<yyyymmdd>-<slug>` (e.g. `20260801-auth-refresh`).
+Canonical JSON Schemas are installed under `.codex/schemas/`. State version 2
+requires run identity, base/integration refs, phase, compact task status map,
+and `finished`. Task records require a branch, exact worktree, non-empty write
+set, forbidden paths, and verification command. A passing mechanical gate also
+requires `verification_evidence` containing at least one object with a command
+and `exit_code: 0`.
 
-## state.json
+State also carries `final_verification`, `reviews`, and `learning` gates.
+`READY_TO_FINISH` requires the first two `passed` and learning either `passed`
+or explicitly `skipped`; every non-pending gate update includes evidence.
 
-```json
-{
-  "schema_version": 1,
-  "run_id": "20260801-auth-refresh",
-  "goal": "one-line goal",
-  "base_branch": "main",
-  "base_commit": "abc123",
-  "integration_branch": "agent/20260801-auth-refresh/integration",
-  "phase": "WAVE_MERGING",
-  "current_wave": 2,
-  "waves": {
-    "1": { "status": "merged", "merge_commit": "def456", "gate_failures": 0 }
-  },
-  "tasks": {
-    "T01": { "status": "merged" },
-    "T02": { "status": "failed", "attempt": 1, "failure": "write_set_violation" }
-  },
-  "plan_file": "docs/plans/2026-08-01-auth-refresh.md",
-  "finished": false
-}
-```
-
-Task details (write sets, branches, commits) live in `tasks/<id>.json`;
-`state.json.tasks` carries only status/attempt so it stays small.
-
-## Run phases
+## State machine
 
 ```text
 INIT → SPEC_READY → PLAN_READY
 → WAVE_RUNNING → WAVE_VALIDATING → WAVE_MERGING
 → INTEGRATION_TESTING → REVIEWING → FIXING → RE_REVIEWING
-→ (next wave: WAVE_RUNNING …)
-→ LEARNING_EXPORT → READY_TO_FINISH → DONE
-        ↘ REPLANNING (from any gate failure that triggers replan)
+→ next WAVE_RUNNING or LEARNING_EXPORT
+→ READY_TO_FINISH → DONE
+
+Any active gate may enter REPLANNING, which returns only to SPEC_READY or
+PLAN_READY.
 ```
 
-The coordinator updates `phase` before starting the phase's work, so a crash
-resumes into the phase that was interrupted, never past it.
+`agent-team-state` validates every phase/task transition, locks `.state.lock`,
+persists a write-ahead `.transaction.json`, writes projections through fsync +
+atomic rename, appends a transaction-tagged event, then clears the intent.
+Every command recovers an interrupted intent before reading or mutating state.
+`DONE` is available only through its `finish` command; it requires
+`READY_TO_FINISH` and every task `merged` or `superseded`.
 
-## tasks/<id>.json
+Task statuses:
 
-```json
-{
-  "id": "T01",
-  "title": "Implement auth middleware",
-  "status": "merged",
-  "attempt": 1,
-  "wave": 1,
-  "parallel_group": "wave-1",
-  "depends_on": [],
-  "branch": "agent/20260801-auth-refresh/T01",
-  "worktree": ".agents/runs/20260801-auth-refresh/worktrees/T01",
-  "base_commit": "abc123",
-  "commits": ["f398609"],
-  "write_set": ["src/auth/**", "tests/auth/**"],
-  "read_set": ["src/shared/types.ts"],
-  "forbidden_paths": ["package.json", "migrations/**"],
-  "env": {
-    "TMPDIR": ".agents/tmp/T01",
-    "PORT_BASE": "42100",
-    "TEST_DB_NAME": "test_20260801_T01"
-  },
-  "tests": ["npm test -- auth"],
-  "verification": "npm test -- auth",
-  "stop_rule": "stop before editing outside write_set; report instead",
-  "check_result": "pass",
-  "review_findings": []
-}
+```text
+pending → running → completed → merged
+   │          ├── blocked → pending/running/failed/superseded
+   │          └── failed → pending/superseded
+   └── superseded
 ```
 
-Task statuses: `pending`, `running`, `blocked`, `completed` (implemented +
-check-task passed, not yet merged), `failed`, `superseded` (replaced during
-replan), `merged`.
+## Resume
 
-## events.jsonl
+Find unfinished state files. With one, read state plus the event tail and
+resume its current phase. With multiple, ask the user (or fail unattended).
+With none, call `agent-team-state init` before other work.
 
-Append one line per significant transition. Minimum fields:
+Idempotent resume checks registered worktrees and existing branches before
+creation, task status before worker spawn, commit ancestry before cherry-pick,
+review packet head SHA before reuse, and worker PID start time/result before
+assuming a process still owns a record.
 
-```json
-{"ts": "2026-08-01T10:00:00+09:00", "event": "task_status", "task": "T01", "from": "running", "to": "completed"}
-{"ts": "2026-08-01T10:05:00+09:00", "event": "phase", "from": "WAVE_VALIDATING", "to": "WAVE_MERGING"}
-{"ts": "2026-08-01T10:06:00+09:00", "event": "gate_failure", "gate": "check-task", "task": "T02", "reason": "write_set_violation"}
-```
-
-Events are for audit and post-mortem; `state.json` alone must be sufficient to
-resume.
-
-## Resume rules (coordinator, on wake)
-
-1. Search `.agents/runs/*/state.json` for runs with `"finished": false`.
-2. If exactly one active run exists, read `state.json` and the tail of
-   `events.jsonl`, then resume from `phase`. Do not re-enter brainstorming or
-   re-plan completed waves unless `phase` is `REPLANNING`.
-3. If multiple active runs exist, list them and ask the user which to resume
-   (interactive) or fail with the list (exec mode).
-4. If none exist, start a new run: create the run directory and `state.json`
-   with `phase: INIT` before any other work.
-
-## Idempotency rules
-
-Every phase must be re-runnable after a crash without duplicating work:
-
-- Before `git worktree add`, check whether the worktree path is already
-  registered (`git worktree list`); reuse it.
-- Before creating a branch, check whether it exists (`git rev-parse --verify`);
-  reuse it.
-- Before cherry-picking a task commit into integration, check whether it is
-  already contained (`git merge-base --is-ancestor <commit> <integration>` or
-  `git cherry`); skip if present.
-- Before re-spawning a task agent, check `tasks/<id>.json` status; never respawn
-  a task in `completed`/`merged`.
-- Record every commit hash in `tasks/<id>.json` as soon as it is created.
+Task verification is executed by `agent-team-state verify-task` inside the
+exact task worktree and records command, exit code, log, timestamp, and task
+HEAD SHA. Final verification uses `verify-final` in the exact integration
+worktree. Review and finish gates revalidate the current integration HEAD;
+mandatory axes also require distinct reviewer/session attestations, and merged
+task check/merge commits must remain ancestors of the frozen finish SHA.
+Arbitrary evidence strings cannot mark those gates passed.

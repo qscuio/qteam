@@ -48,10 +48,31 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-active_run() {
-  # whitespace-tolerant: state.json may be compact-serialized ("finished":false)
-  grep -lsE '"finished"[[:space:]]*:[[:space:]]*false' \
-    "$ROOT"/.agents/runs/*/state.json 2>/dev/null | head -1
+active_runs() {
+  # Fail closed: a corrupt state file must not disappear from discovery and
+  # permit a second run to start against the same repository.
+  python3 - "$ROOT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+errors = []
+for path in sorted((root / ".agents/runs").glob("*/state.json")):
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(state, dict) or not isinstance(state.get("finished"), bool):
+            raise ValueError("state must be an object with boolean 'finished'")
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        errors.append(f"{path}: {exc}")
+        continue
+    if not state["finished"]:
+        print(path)
+if errors:
+    for error in errors:
+        print(f"error: invalid run state: {error}", file=sys.stderr)
+    raise SystemExit(5)
+PY
 }
 
 BASE_PROMPT="$(cat "$PROMPT_FILE")"
@@ -86,7 +107,14 @@ Approved plan: $PLAN_REF — execute it; do not re-brainstorm the design."
 fi
 
 if [[ "$MODE" == "exec" ]]; then
-  RUN="$(active_run || true)"
+  RUNS="$(active_runs)"
+  RUN_COUNT="$(printf '%s\n' "$RUNS" | sed '/^$/d' | wc -l)"
+  if [[ "$RUN_COUNT" -gt 1 ]]; then
+    echo "error: multiple active runs; unattended execution cannot choose:" >&2
+    printf '%s\n' "$RUNS" | sed '/^$/d;s/^/  /' >&2
+    exit 4
+  fi
+  RUN="$RUNS"
   if [[ -z "$RUN" && -z "$PLAN_FILE" && $ALLOW_ASSUMPTIONS -eq 0 ]]; then
     echo "EXEC_REQUIRES_APPROVED_SPEC" >&2
     echo "error: --exec needs an active run, --plan <file>, or --allow-assumptions." >&2
@@ -105,6 +133,14 @@ An active run exists ($RUN): resume it from its recorded phase."
 Assumptions are explicitly allowed: derive minimal assumptions from the goal, record them in the plan file before implementing, prefer the safest reasonable interpretation, and list open questions in the final summary."
   fi
   exec codex exec -C "$ROOT" "$FULL_PROMPT"
+fi
+
+RUNS="$(active_runs)"
+RUN_COUNT="$(printf '%s\n' "$RUNS" | sed '/^$/d' | wc -l)"
+if [[ "$RUN_COUNT" -gt 1 ]]; then
+  FULL_PROMPT="$FULL_PROMPT
+Multiple active runs exist. List them and ask the user which one to resume before any other action:
+$RUNS"
 fi
 
 exec codex -C "$ROOT" "$FULL_PROMPT"

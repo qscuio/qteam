@@ -5,8 +5,8 @@ timestamp: 2026-08-01T00:00:00.000Z
 # Parallel Plan Template
 
 Use this template when writing an implementation plan that may be executed by
-multiple implementers concurrently. Parallel tasks always run worktree-per-task
-(see SKILL.md "Isolation model"); a shared tree is serial-only.
+multiple implementers concurrently. Every writable task runs worktree-per-task
+(see SKILL.md "Isolation model"), including serial tasks.
 
 ## Required task fields
 
@@ -23,6 +23,7 @@ Worktree:          .agents/runs/<run-id>/worktrees/<task-id>
 Write set:
 Read set:
 Forbidden paths:
+Allowed shared surfaces: (normally empty; forces serial execution)
 Conflicts with:
 Resource namespaces:   (TMPDIR / port range / test DB / compose project / build dir)
 Contract:
@@ -164,9 +165,10 @@ Done gate:
     - cherry-pick task commits into agent/20260801-auth/integration in
       dependency order; resolve conflicts serially
     - run the wave's focused tests together on the integration branch
-    - spawn tester (gap-fill) if the wave left focused-test gaps
-    - spawn integration_tester (serial) when behavior crosses real boundaries
-    - spawn spec_reviewer and code_reviewer on the integration diff
+    - run test-writer worker (serial, isolated) if focused-test gaps remain
+    - run integration-tester worker (serial, isolated) across real boundaries
+    - create immutable review packets; spawn spec_reviewer and standards_reviewer
+    - spawn risk_reviewer only when a high-risk trigger applies
     - fix every confirmed finding via fix tasks; re-review until findings close
-    - update state.json and plan status before Wave 2
+    - update lifecycle through agent-team-state before Wave 2
 ```

@@ -11,10 +11,9 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-QNOTE_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
 TARGET_ARG="${1:-$PWD}"
 PROJECT_ROOT="$(git -C "$TARGET_ARG" rev-parse --show-toplevel)"
-STAMP="$(date +%Y%m%d%H%M%S)"
+STAMP="$(date +%Y%m%d%H%M%S%N)-$$"
 TEMPLATE_VERSION="$(cat "$SCRIPT_DIR/VERSION" 2>/dev/null || echo unknown)"
 SOURCE_COMMIT="$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
@@ -35,14 +34,23 @@ install_dir_replace() {
   local dst="$2"
   mkdir -p "$(dirname "$dst")"
   if [[ -e "$dst" ]]; then
-    rm -rf "$dst.bak.$STAMP"
-    mv "$dst" "$dst.bak.$STAMP"
+    local backup
+    if [[ "$dst" == "$PROJECT_ROOT/.agents/skills/"* ]]; then
+      mkdir -p "$PROJECT_ROOT/.codex/qteam-backups/skills"
+      backup="$PROJECT_ROOT/.codex/qteam-backups/skills/$(basename "$dst").$STAMP"
+    else
+      backup="$dst.bak.$STAMP"
+    fi
+    [[ ! -e "$backup" ]] || { echo "error: backup collision: $backup" >&2; exit 2; }
+    mv "$dst" "$backup"
   fi
   mkdir -p "$dst"
   cp -R "$src"/. "$dst"/
 }
 
-mkdir -p "$PROJECT_ROOT/.codex/agents" "$PROJECT_ROOT/.codex/bin" "$PROJECT_ROOT/.agents/skills"
+mkdir -p "$PROJECT_ROOT/.codex/agents" "$PROJECT_ROOT/.codex/bin" \
+  "$PROJECT_ROOT/.codex/worker-prompts" "$PROJECT_ROOT/.codex/schemas" \
+  "$PROJECT_ROOT/.agents/skills"
 
 # --- .codex/config.toml: [agents] concurrency + depth ---
 # Field names verified against the Codex binary's config schema; legacy
@@ -101,15 +109,36 @@ path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 PY
 
 # --- agents, bin, skills ---
-for agent in researcher architect parallel-planner developer debugger frontend-debugger system-debugger tester integration-tester spec-reviewer code-reviewer knowledge-distiller; do
+for agent in researcher architect parallel-planner test-designer spec-reviewer standards-reviewer risk-reviewer; do
   install_file "$SCRIPT_DIR/agents/$agent.toml" "$PROJECT_ROOT/.codex/agents/$agent.toml"
+done
+
+# Remove role files from old releases that could let a coordinator accidentally
+# spawn writable native subagents without a per-task cwd boundary.
+for obsolete in developer debugger frontend-debugger system-debugger tester \
+                integration-tester code-reviewer knowledge-distiller; do
+  if [[ -f "$PROJECT_ROOT/.codex/agents/$obsolete.toml" ]]; then
+    mv "$PROJECT_ROOT/.codex/agents/$obsolete.toml" \
+      "$PROJECT_ROOT/.codex/agents/$obsolete.toml.bak.$STAMP"
+  fi
+done
+
+for prompt in "$SCRIPT_DIR"/worker-prompts/*.md; do
+  install_file "$prompt" "$PROJECT_ROOT/.codex/worker-prompts/$(basename "$prompt")"
+done
+for schema in "$SCRIPT_DIR"/schemas/*.json; do
+  install_file "$schema" "$PROJECT_ROOT/.codex/schemas/$(basename "$schema")"
 done
 
 install_file "$SCRIPT_DIR/bin/wake-agent-team.sh" "$PROJECT_ROOT/.codex/bin/wake-agent-team" 0755
 install_file "$SCRIPT_DIR/bin/agent-team-finish.py" "$PROJECT_ROOT/.codex/bin/agent-team-finish" 0755
 install_file "$SCRIPT_DIR/bin/agent-team-check-task.py" "$PROJECT_ROOT/.codex/bin/agent-team-check-task" 0755
 install_file "$SCRIPT_DIR/bin/agent-team-doctor.sh" "$PROJECT_ROOT/.codex/bin/agent-team-doctor" 0755
-install_dir_replace "$SCRIPT_DIR/skills/agent-team-dev" "$PROJECT_ROOT/.agents/skills/agent-team-dev"
+install_file "$SCRIPT_DIR/bin/agent-team-state.py" "$PROJECT_ROOT/.codex/bin/agent-team-state" 0755
+install_file "$SCRIPT_DIR/bin/agent-team-worker.py" "$PROJECT_ROOT/.codex/bin/agent-team-worker" 0755
+install_file "$SCRIPT_DIR/bin/agent-team-review.py" "$PROJECT_ROOT/.codex/bin/agent-team-review" 0755
+install_file "$SCRIPT_DIR/THIRD_PARTY_NOTICES.md" "$PROJECT_ROOT/.codex/QTEAM-THIRD-PARTY-NOTICES.md"
+install_file "$SCRIPT_DIR/LICENSES/Matt-Pocock-MIT.txt" "$PROJECT_ROOT/.codex/licenses/Matt-Pocock-MIT.txt"
 
 # --- version stamp (read by agent-team-doctor for drift detection) ---
 cat > "$PROJECT_ROOT/.codex/agent-team-template.version" <<V
@@ -131,30 +160,27 @@ if ! grep -qs '^\.agents/runs/$' "$GITIGNORE"; then
   } >> "$GITIGNORE"
 fi
 
-# --- bundled Superpowers process skills ---
-SUPERPOWER_SKILLS=(
-  using-superpowers
-  brainstorming
-  writing-plans
-  executing-plans
-  subagent-driven-development
-  requesting-code-review
-  receiving-code-review
-  verification-before-completion
-  finishing-a-development-branch
-  using-git-worktrees
-  test-driven-development
-  systematic-debugging
-  dispatching-parallel-agents
-)
-
-missing=()
-for skill in "${SUPERPOWER_SKILLS[@]}"; do
-  src="$QNOTE_ROOT/skills/superpowers/$skill"
-  if [[ -d "$src" ]]; then
-    install_dir_replace "$src" "$PROJECT_ROOT/.agents/skills/$skill"
+# --- bundled skills: QTeam owns orchestration; raw upstream sources are not installed ---
+for src in "$SCRIPT_DIR"/skills/*; do
+  [[ -d "$src" ]] || continue
+  if [[ "$(basename "$src")" == "superpowers" ]]; then
+    continue
   else
-    missing+=("$skill")
+    install_dir_replace "$src" "$PROJECT_ROOT/.agents/skills/$(basename "$src")"
+  fi
+done
+
+# Retire competing/overlapping skills installed by QTeam <=0.3. They are
+# preserved as backups but cannot remain triggerable in the live skill set.
+for name in using-superpowers executing-plans subagent-driven-development \
+            requesting-code-review receiving-code-review \
+            finishing-a-development-branch using-git-worktrees \
+            test-driven-development systematic-debugging \
+            dispatching-parallel-agents; do
+  if [[ -d "$PROJECT_ROOT/.agents/skills/$name" ]]; then
+    mkdir -p "$PROJECT_ROOT/.codex/qteam-backups/skills"
+    mv "$PROJECT_ROOT/.agents/skills/$name" \
+      "$PROJECT_ROOT/.codex/qteam-backups/skills/$name.$STAMP"
   fi
 done
 
@@ -174,9 +200,3 @@ finish after the workflow reaches READY_TO_FINISH:
 qnote-side learning import after a run:
   tools/codex-agent-team-template/bin/import-agent-learning.py <this-repo> <run-id>
 OUT
-
-if [[ ${#missing[@]} -gt 0 ]]; then
-  printf 'warning: missing bundled Superpowers skills:' >&2
-  printf ' %s' "${missing[@]}" >&2
-  printf '\n' >&2
-fi

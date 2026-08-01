@@ -4,7 +4,7 @@ timestamp: 2026-07-16T04:35:57.000Z
 ---
 # Task / Wave Session Digest Template
 
-Every write-capable or review agent should return a concise digest. The coordinator passes these digests to `knowledge_distiller` only after implementation, review fixes, and verification are complete; the distiller turns them into learning-outbox proposals under `.agents/runs/<run-id>/learning-outbox/` (see `learning-outbox-template.md`) — it never writes to qnote directly.
+Every write-capable or review agent should return a concise digest. The coordinator passes these digests to `knowledge_distiller` only after implementation, review fixes, and verification are complete; the distiller writes `.qteam-learning-outbox/` inside its isolated worktree and the coordinator harvests it into `.agents/runs/<run-id>/learning-outbox/` (see `learning-outbox-template.md`) — it never writes to qnote directly.
 
 ## Task session digest
 
