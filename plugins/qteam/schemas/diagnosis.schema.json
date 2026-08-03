@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qteam.local/schemas/diagnosis.schema.json",
+  "type": "object",
+  "required": ["schema_version", "repro_commit", "feedback_loop", "observed_red", "minimized_repro", "hypotheses", "root_cause", "causal_chain", "fix_boundary", "cleanup", "preventive_lesson", "repro_exit_code", "repro_log", "failure_pattern", "recorded_at"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "repro_commit": {"type": "string", "minLength": 40},
+    "feedback_loop": {"type": "string", "minLength": 1},
+    "observed_red": {"type": "string", "minLength": 1},
+    "minimized_repro": {"type": "string", "minLength": 1},
+    "hypotheses": {
+      "type": "array", "minItems": 3, "maxItems": 5,
+      "items": {
+        "type": "object",
+        "required": ["rank", "statement", "prediction", "check", "outcome"],
+        "properties": {
+          "rank": {"type": "integer", "minimum": 1, "maximum": 5},
+          "statement": {"type": "string", "minLength": 1},
+          "prediction": {"type": "string", "minLength": 1},
+          "check": {"type": "string", "minLength": 1},
+          "outcome": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": true
+      }
+    },
+    "root_cause": {"type": "string", "minLength": 1},
+    "causal_chain": {"type": "array", "minItems": 2, "items": {"type": "string", "minLength": 1}},
+    "fix_boundary": {"type": "string", "minLength": 1},
+    "cleanup": {"type": "string", "minLength": 1},
+    "preventive_lesson": {"type": "string", "minLength": 1},
+    "repro_exit_code": {"type": "integer", "not": {"const": 0}},
+    "repro_log": {"type": "string", "minLength": 1},
+    "failure_pattern": {"type": "string", "minLength": 1},
+    "green_exit_code": {"type": "integer"},
+    "green_head": {"type": "string", "minLength": 40},
+    "green_log": {"type": "string", "minLength": 1},
+    "green_verified_at": {"type": "string", "minLength": 1},
+    "recorded_at": {"type": "string", "minLength": 1}
+  },
+  "additionalProperties": true
+}

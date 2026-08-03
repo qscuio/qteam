@@ -1,0 +1,37 @@
+---
+name: qteam-router
+description: Route work into QTeam's single development workflow without creating competing orchestrators.
+---
+
+# QTeam Router
+
+Load `goal-execution-discipline` as the standing execution contract. QTeam is
+the only orchestration authority. Other skills are bounded decision,
+planning, test, diagnosis, or review primitives; none may start their own
+implementation loop.
+
+Before starting or resuming execution, require the repository runtime marker
+`.codex/qteam-project.json` and executable `.codex/bin/agent-team-state`. If
+either is absent, do not create partial run state: tell the operator to run
+`./qteam setup <repository>` from a QTeam checkout, then start a new Codex task
+so the plugin and read-only role configuration are both loaded.
+
+Route in this order:
+
+1. Active unfinished run: resume its recorded phase. Never brainstorm again.
+2. Bug, regression, hang, or performance failure: use `qteam-diagnose`.
+3. Clear destination but unknown solution space, or an explicit request to find
+   paths/ideas/knowledge beyond the stated options: use `qteam-explore`. It
+   produces a bounded evidence brief; an explicit deep/broad request uses its
+   full research-frontier rule. It never starts an implementation loop.
+4. Huge multi-session effort whose decision path is foggy: use `wayfinder`;
+   when the route is clear, hand off to `to-spec`.
+5. Unclear new behavior: use `brainstorming`; invoke `grilling` only on an
+   unresolved high-impact branch and `grill-with-docs` only when the domain
+   vocabulary is changing.
+6. Sufficient approved context: use `to-spec`, then `to-tickets`, then
+   `agent-team-dev` execution.
+
+Do not invoke Superpowers `executing-plans`, `subagent-driven-development`, or
+Matt-style issue implementation as a second coordinator. During QTeam runs,
+`agent-team-dev` owns phases, workers, merging, reviews, and finish.

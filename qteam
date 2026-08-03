@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PLUGIN_ID="qteam@qteam"
+
+usage() {
+  cat <<'USAGE'
+usage: ./qteam setup [project]
+       ./qteam uninstall [project]
+       ./qteam doctor <project> [--smoke]
+
+setup installs the local QTeam marketplace and plugin. When project is given,
+it also installs the small repository runtime required for isolated workers.
+
+uninstall removes that project runtime when project is given, then removes the
+QTeam plugin and its marketplace registration.
+USAGE
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "error: $1 is required" >&2
+    exit 127
+  }
+}
+
+marketplace_status() {
+  local payload
+  payload="$(codex plugin marketplace list --json)"
+  python3 -c '
+import json, os, sys
+expected = os.path.realpath(sys.argv[1])
+payload = json.load(sys.stdin)
+matches = [item for item in payload.get("marketplaces", []) if item.get("name") == "qteam"]
+if not matches:
+    print("absent")
+elif len(matches) == 1 and os.path.realpath(matches[0].get("root", "")) == expected:
+    print("match")
+else:
+    print("conflict")
+' "$ROOT" <<<"$payload"
+}
+
+setup_plugin() {
+  local added=0
+  local status
+  status="$(marketplace_status)"
+  case "$status" in
+    absent)
+      codex plugin marketplace add "$ROOT"
+      added=1
+      ;;
+    match) ;;
+    conflict)
+      echo "error: a different marketplace named qteam is already configured" >&2
+      exit 3
+      ;;
+    *)
+      echo "error: could not determine QTeam marketplace status" >&2
+      exit 3
+      ;;
+  esac
+  if codex plugin add "$PLUGIN_ID"; then
+    return 0
+  else
+    status=$?
+    if [[ $added -eq 1 ]]; then
+      codex plugin marketplace remove qteam || true
+    fi
+    return "$status"
+  fi
+}
+
+remove_plugin() {
+  local plugins
+  local status
+  status="$(marketplace_status)"
+  plugins="$(codex plugin list --json)"
+  if [[ "$status" == "conflict" ]]; then
+    echo "error: marketplace name qteam belongs to a different source; no uninstall changes made" >&2
+    exit 3
+  fi
+  if [[ "$status" == "absent" ]] && python3 -c '
+import json, sys
+payload = json.load(sys.stdin)
+raise SystemExit(0 if any(item.get("pluginId") == "qteam@qteam" for item in payload.get("installed", [])) else 1)
+' <<<"$plugins"; then
+    echo "error: qteam@qteam is installed but its owning marketplace is absent; no uninstall changes made" >&2
+    exit 3
+  fi
+  if python3 -c '
+import json, sys
+payload = json.load(sys.stdin)
+raise SystemExit(0 if any(item.get("pluginId") == "qteam@qteam" for item in payload.get("installed", [])) else 1)
+' <<<"$plugins"
+  then
+    codex plugin remove "$PLUGIN_ID"
+  fi
+  case "$status" in
+    match) codex plugin marketplace remove qteam ;;
+    absent) ;;
+  esac
+}
+
+require_uninstall_ownership() {
+  local plugins status
+  status="$(marketplace_status)"
+  plugins="$(codex plugin list --json)"
+  if [[ "$status" == "conflict" ]]; then
+    echo "error: marketplace name qteam belongs to a different source; no uninstall changes made" >&2
+    exit 3
+  fi
+  if [[ "$status" == "absent" ]] && python3 -c '
+import json, sys
+payload = json.load(sys.stdin)
+raise SystemExit(0 if any(item.get("pluginId") == "qteam@qteam" for item in payload.get("installed", [])) else 1)
+' <<<"$plugins"; then
+    echo "error: qteam@qteam is installed but its owning marketplace is absent; no uninstall changes made" >&2
+    exit 3
+  fi
+}
+
+main() {
+  local project_root=""
+  require_command codex
+  require_command python3
+  case "${1:-}" in
+    setup)
+      [[ $# -le 2 ]] || { usage >&2; exit 2; }
+      if [[ -n "${2:-}" ]]; then
+        require_command git
+        project_root="$(git -C "$2" rev-parse --show-toplevel)"
+        if [[ -e "$project_root/.agents/skills/qteam-explore" || \
+              -L "$project_root/.agents/skills/qteam-explore" ]]; then
+          echo "error: repository-local .agents/skills/qteam-explore conflicts with the QTeam plugin and is not QTeam-owned" >&2
+          exit 3
+        fi
+      fi
+      setup_plugin
+      if [[ -n "${2:-}" ]]; then
+        if [[ -e "$project_root/.codex/qteam-project.json" || \
+              -L "$project_root/.codex/qteam-project.json" ]]; then
+          echo "Recovering or refreshing the existing QTeam project runtime."
+          "$ROOT/plugins/qteam/scripts/project-uninstall.py" "$project_root"
+        fi
+        "$ROOT/plugins/qteam/scripts/project-setup.py" "$project_root"
+      fi
+      echo "QTeam setup complete. Start a new Codex task to load the plugin."
+      ;;
+    uninstall)
+      [[ $# -le 2 ]] || { usage >&2; exit 2; }
+      require_uninstall_ownership
+      if [[ -n "${2:-}" ]]; then
+        "$ROOT/plugins/qteam/scripts/project-uninstall.py" "$2"
+      fi
+      remove_plugin
+      echo "QTeam uninstall complete. Start a new Codex task to drop cached skills."
+      ;;
+    doctor)
+      [[ $# -ge 2 && $# -le 3 ]] || { usage >&2; exit 2; }
+      if [[ -n "${3:-}" ]]; then
+        (cd "$2" && .codex/bin/agent-team-doctor "$3")
+      else
+        (cd "$2" && .codex/bin/agent-team-doctor)
+      fi
+      ;;
+    -h|--help|help)
+      usage
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"

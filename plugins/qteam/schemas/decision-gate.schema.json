@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qteam.local/schemas/decision-gate.schema.json",
+  "type": "object",
+  "required": ["schema_version", "id", "status", "question", "authority", "scope"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "id": {"type": "string", "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"},
+    "status": {"enum": ["open", "resolved", "superseded"]},
+    "question": {"type": "string", "pattern": "\\S"},
+    "authority": {"enum": ["user", "maintainer", "security", "release-owner"]},
+    "scope": {
+      "type": "object",
+      "required": ["kind", "targets"],
+      "properties": {
+        "kind": {"enum": ["global", "task", "wave", "action"]},
+        "targets": {
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"kind": {"const": "global"}}, "required": ["kind"]},
+          "then": {"properties": {"targets": {"maxItems": 0}}}
+        },
+        {
+          "if": {"properties": {"kind": {"const": "task"}}, "required": ["kind"]},
+          "then": {"properties": {"targets": {"minItems": 1, "items": {"type": "string", "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"}}}}
+        },
+        {
+          "if": {"properties": {"kind": {"const": "wave"}}, "required": ["kind"]},
+          "then": {"properties": {"targets": {"minItems": 1, "items": {"type": "integer", "minimum": 1}}}}
+        },
+        {
+          "if": {"properties": {"kind": {"const": "action"}}, "required": ["kind"]},
+          "then": {"properties": {"targets": {"minItems": 1, "items": {"enum": ["task-start", "wave-start", "merge", "learning-export", "finish", "publish"]}}}}
+        }
+      ],
+      "additionalProperties": false
+    },
+    "resolution": {
+      "type": "object",
+      "required": ["outcome", "choice", "evidence", "resolved_at"],
+      "properties": {
+        "outcome": {"enum": ["allow", "deny"]},
+        "choice": {"type": "string", "pattern": "\\S"},
+        "evidence": {"type": "string", "pattern": "\\S"},
+        "resolved_at": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "superseded_reason": {"type": "string", "pattern": "\\S"},
+    "created_at": {"type": "string", "minLength": 1},
+    "updated_at": {"type": "string", "minLength": 1}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "open"}}, "required": ["status"]},
+      "then": {
+        "not": {"anyOf": [{"required": ["resolution"]}, {"required": ["superseded_reason"]}]}
+      }
+    },
+    {
+      "if": {"properties": {"status": {"const": "resolved"}}, "required": ["status"]},
+      "then": {"required": ["resolution"], "not": {"required": ["superseded_reason"]}}
+    },
+    {
+      "if": {"properties": {"status": {"const": "superseded"}}, "required": ["status"]},
+      "then": {"required": ["superseded_reason"], "not": {"required": ["resolution"]}}
+    }
+  ],
+  "additionalProperties": false
+}

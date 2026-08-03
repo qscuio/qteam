@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qteam.local/schemas/run-state.schema.json",
+  "type": "object",
+  "required": ["schema_version", "run_id", "goal", "base_branch", "base_commit", "integration_branch", "integration_provenance_head", "integration_provenance", "phase", "tasks", "waves", "gates", "risk_forced", "risk_required", "model_profiles", "shared_surfaces", "finished"],
+  "properties": {
+    "schema_version": {"const": 5},
+    "run_id": {"type": "string", "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"},
+    "goal": {"type": "string", "minLength": 1},
+    "base_branch": {"type": "string", "minLength": 1},
+    "base_commit": {"type": "string", "minLength": 7},
+    "integration_branch": {"type": "string", "minLength": 1},
+    "integration_provenance_head": {"type": "string", "minLength": 7},
+    "integration_provenance": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["task", "from_sha", "to_sha", "commits", "patch_sha256", "recorded_at"],
+        "properties": {
+          "task": {"type": "string", "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"},
+          "from_sha": {"type": "string", "minLength": 7},
+          "to_sha": {"type": "string", "minLength": 7},
+          "commits": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 7}},
+          "patch_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "recorded_at": {"type": "string", "minLength": 1},
+          "migrated_from_schema": {"const": 2}
+        },
+        "additionalProperties": false
+      }
+    },
+    "phase": {"enum": ["INIT", "SPEC_READY", "PLAN_READY", "WAVE_RUNNING", "WAVE_VALIDATING", "WAVE_MERGING", "INTEGRATION_TESTING", "REVIEWING", "FIXING", "RE_REVIEWING", "REPLANNING", "LEARNING_EXPORT", "READY_TO_FINISH", "DONE"]},
+    "tasks": {"type": "object"},
+    "waves": {
+      "type": "object",
+      "patternProperties": {
+        "^[1-9][0-9]*$": {
+          "type": "object",
+          "required": ["tasks", "execution_tier", "review_intensity", "require_risk_review", "risk_flags"],
+          "properties": {
+            "tasks": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}},
+            "execution_tier": {"enum": ["economy", "standard", "deep"]},
+            "review_intensity": {"enum": ["compact", "full", "risk"]},
+            "require_risk_review": {"type": "boolean"},
+            "risk_flags": {
+              "type": "array", "uniqueItems": true,
+              "items": {"enum": ["concurrency", "security", "migration", "data-loss", "authorization", "authentication", "compatibility", "public-api"]}
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "risk_required": {"type": "boolean"},
+    "risk_forced": {"type": "boolean"},
+    "model_profiles": {
+      "type": "object",
+      "required": ["economy", "standard", "deep"],
+      "additionalProperties": false,
+      "properties": {
+        "economy": {"$ref": "#/$defs/modelProfile"},
+        "standard": {"$ref": "#/$defs/modelProfile"},
+        "deep": {"$ref": "#/$defs/modelProfile"}
+      }
+    },
+    "shared_surfaces": {"type": "array", "items": {"type": "string"}},
+    "decisions": {"type": "object"},
+    "publication_seal": {
+      "type": "object",
+      "required": ["status", "purpose", "head_sha", "decision_sha256", "authorization_sha256", "sealed_at"],
+      "properties": {
+        "status": {"const": "sealed"},
+        "purpose": {"enum": ["integrate", "publish"]},
+        "head_sha": {"type": "string", "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"},
+        "decision_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "authorization_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "sealed_at": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "policy_migration_pending": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+    "gates": {
+      "type": "object",
+      "required": ["final_verification", "reviews", "learning", "public_boundary"],
+      "properties": {
+        "final_verification": {"type": "object"},
+        "reviews": {"type": "object"},
+        "learning": {"type": "object"},
+        "public_boundary": {"type": "object"}
+      }
+    },
+    "finished": {"type": "boolean"}
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "modelProfile": {
+      "type": "object",
+      "required": ["model", "thinking"],
+      "properties": {
+        "model": {"type": "string", "minLength": 1},
+        "thinking": {"enum": ["low", "medium", "high", "xhigh"]}
+      },
+      "additionalProperties": false
+    }
+  }
+}

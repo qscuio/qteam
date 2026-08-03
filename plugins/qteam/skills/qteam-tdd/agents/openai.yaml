@@ -1,0 +1,4 @@
+interface:
+  display_name: "QTeam TDD"
+  short_description: "Prove behavior-first RED and GREEN cycles"
+  default_prompt: "Use $qteam-tdd to implement this behavior through approved test seams with replayed RED/GREEN evidence."

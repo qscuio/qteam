@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qteam.local/schemas/experiment.schema.json",
+  "type": "object",
+  "required": ["schema_version", "task", "goal", "metric", "guard_command", "holdout_command", "max_attempts", "plateau_window", "attempts", "stop_reason", "final_head"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "task": {"type": "string", "minLength": 1},
+    "goal": {"type": "string", "minLength": 1},
+    "metric": {
+      "type": "object",
+      "required": ["name", "direction", "command", "baseline", "final", "minimum_delta"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "direction": {"enum": ["higher_is_better", "lower_is_better"]},
+        "command": {"type": "string", "minLength": 1},
+        "baseline": {"type": "number"},
+        "final": {"type": "number"},
+        "minimum_delta": {"type": "number", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "guard_command": {"type": "string", "minLength": 1},
+    "holdout_command": {"type": "string", "minLength": 1},
+    "max_attempts": {"type": "integer", "minimum": 1, "maximum": 50},
+    "plateau_window": {"type": "integer", "minimum": 1, "maximum": 50},
+    "attempts": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 50,
+      "items": {
+        "type": "object",
+        "required": ["number", "hypothesis", "status", "commit", "metric", "delta", "guard_exit_code", "evidence"],
+        "properties": {
+          "number": {"type": "integer", "minimum": 1},
+          "hypothesis": {"type": "string", "minLength": 1},
+          "status": {"enum": ["kept", "discarded", "crashed", "no-op"]},
+          "commit": {"type": ["string", "null"]},
+          "metric": {"type": ["number", "null"]},
+          "delta": {"type": ["number", "null"]},
+          "guard_exit_code": {"type": ["integer", "null"]},
+          "evidence": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": false
+      }
+    },
+    "stop_reason": {"enum": ["goal-met", "budget", "plateau", "blocked"]},
+    "final_head": {"type": "string", "minLength": 7}
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,42 @@
+{
+  "name": "qteam",
+  "version": "0.9.0",
+  "description": "Durable multi-agent delivery with mechanically enforced dependencies, evidence exploration, scoped decisions, typed handoffs, isolated workers, adaptive review, scenario-complete TDD, diagnosis, and safe finish gates.",
+  "author": {
+    "name": "qscuio",
+    "url": "https://github.com/qscuio"
+  },
+  "homepage": "https://github.com/qscuio/qteam",
+  "repository": "https://github.com/qscuio/qteam",
+  "keywords": [
+    "agents",
+    "orchestration",
+    "research",
+    "discovery",
+    "tdd",
+    "debugging",
+    "code-review",
+    "worktrees"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "QTeam",
+    "shortDescription": "Durable, gated multi-agent software delivery",
+    "longDescription": "Discover evidence-backed solution paths, then run software work through mechanically enforced task dependencies, scoped human decisions, typed handoffs, isolated task worktrees, scenario-complete TDD, deterministic review policy, durable evidence, and safe finish gates.",
+    "developerName": "qscuio",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/qscuio/qteam",
+    "defaultPrompt": [
+      "Set up QTeam in this repository.",
+      "Use QTeam to execute this implementation goal.",
+      "Resume the active QTeam run."
+    ],
+    "brandColor": "#2563EB",
+    "screenshots": []
+  }
+}

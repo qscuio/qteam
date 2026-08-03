@@ -1,0 +1,4 @@
+interface:
+  display_name: "QTeam Diagnose"
+  short_description: "Trace failures to evidence-backed root causes"
+  default_prompt: "Use $qteam-diagnose to reproduce, minimize, and trace this failure before proposing a fix."

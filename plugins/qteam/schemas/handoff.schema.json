@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qteam.local/schemas/handoff.schema.json",
+  "type": "object",
+  "required": ["kind", "rationale"],
+  "properties": {
+    "kind": {"enum": ["successor", "user-decision", "replan", "no-followup"]},
+    "rationale": {"type": "string", "pattern": "\\S"},
+    "target_task": {"type": "string", "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"},
+    "decision_id": {"type": "string", "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"kind": {"const": "successor"}}},
+      "then": {"required": ["target_task"], "not": {"required": ["decision_id"]}}
+    },
+    {
+      "if": {"properties": {"kind": {"const": "user-decision"}}},
+      "then": {"required": ["decision_id"], "not": {"required": ["target_task"]}}
+    },
+    {
+      "if": {"properties": {"kind": {"enum": ["replan", "no-followup"]}}},
+      "then": {
+        "not": {"anyOf": [{"required": ["target_task"]}, {"required": ["decision_id"]}]}
+      }
+    }
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "QTeam Explore"
+  short_description: "Expand and deeply test evidence-backed solution frontiers"
+  default_prompt: "Use $qteam-explore to expand beyond my known options and deeply investigate the evidence-backed candidates."

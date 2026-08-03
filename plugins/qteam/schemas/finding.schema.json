@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qteam.local/schemas/finding.schema.json",
+  "type": "object",
+  "required": ["id", "severity", "title", "body", "review_evidence", "impact", "fix_direction", "owner", "reviewer", "status", "created_at"],
+  "properties": {
+    "id": {"type": "string", "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"},
+    "severity": {"enum": ["P0", "P1", "P2", "P3"]},
+    "title": {"type": "string", "minLength": 1},
+    "body": {"type": "string", "minLength": 1},
+    "review_evidence": {"type": "string", "minLength": 1},
+    "impact": {"type": "string", "minLength": 1},
+    "fix_direction": {"type": "string", "minLength": 1},
+    "file": {"type": ["string", "null"]},
+    "line": {"type": ["integer", "null"], "minimum": 1},
+    "owner": {"type": "string", "minLength": 1},
+    "reviewer": {"type": "string", "minLength": 1},
+    "status": {"enum": ["open", "resolved", "invalid"]},
+    "resolution": {"type": ["string", "null"]},
+    "evidence": {"type": ["string", "null"]},
+    "created_at": {"type": "string"}
+  },
+  "additionalProperties": true
+}

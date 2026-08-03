@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qteam.local/schemas/scenario-coverage.schema.json",
+  "type": "array",
+  "minItems": 12,
+  "maxItems": 12,
+  "items": {
+    "type": "object",
+    "required": ["dimension", "applicability", "scenario", "seam_ids", "rationale"],
+    "properties": {
+      "dimension": {"enum": ["happy-path", "error-path", "boundary", "abuse-security", "scale", "concurrency", "temporal", "data-variation", "permissions", "integrations", "recovery", "state-transitions"]},
+      "applicability": {"enum": ["applicable", "not-applicable"]},
+      "scenario": {"type": "string"},
+      "seam_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"}},
+      "rationale": {"type": "string", "pattern": "\\S"}
+    },
+    "allOf": [
+      {
+        "if": {"properties": {"applicability": {"const": "applicable"}}, "required": ["applicability"]},
+        "then": {"properties": {"scenario": {"pattern": "\\S"}, "seam_ids": {"minItems": 1}}}
+      },
+      {
+        "if": {"properties": {"applicability": {"const": "not-applicable"}}, "required": ["applicability"]},
+        "then": {"properties": {"scenario": {"maxLength": 0}, "seam_ids": {"maxItems": 0}}}
+      },
+      {
+        "if": {"properties": {"dimension": {"const": "happy-path"}, "applicability": {"const": "applicable"}}, "required": ["dimension", "applicability"]},
+        "then": {"properties": {"scenario": {"pattern": "^happy-path: \\S"}}}
+      },
+      {
+        "if": {"properties": {"dimension": {"const": "error-path"}, "applicability": {"const": "applicable"}}, "required": ["dimension", "applicability"]},
+        "then": {"properties": {"scenario": {"pattern": "^error-path: \\S"}}}
+      },
+      {
+        "if": {"properties": {"dimension": {"const": "boundary"}, "applicability": {"const": "applicable"}}, "required": ["dimension", "applicability"]},
+        "then": {"properties": {"scenario": {"pattern": "^boundary: \\S"}}}
+      },
+      {
+        "if": {"properties": {"dimension": {"const": "abuse-security"}, "applicability": {"const": "applicable"}}, "required": ["dimension", "applicability"]},
+        "then": {"properties": {"scenario": {"pattern": "^abuse-security: \\S"}}}
+      },
+      {
+        "if": {"properties": {"dimension": {"const": "scale"}, "applicability": {"const": "applicable"}}, "required": ["dimension", "applicability"]},
+        "then": {"properties": {"scenario": {"pattern": "^scale: \\S"}}}
+      },
+      {
+        "if": {"properties": {"dimension": {"const": "concurrency"}, "applicability": {"const": "applicable"}}, "required": ["dimension", "applicability"]},
+        "then": {"properties": {"scenario": {"pattern": "^concurrency: \\S"}}}
+      },
+      {
+        "if": {"properties": {"dimension": {"const": "temporal"}, "applicability": {"const": "applicable"}}, "required": ["dimension", "applicability"]},
+        "then": {"properties": {"scenario": {"pattern": "^temporal: \\S"}}}
+      },
+      {
+        "if": {"properties": {"dimension": {"const": "data-variation"}, "applicability": {"const": "applicable"}}, "required": ["dimension", "applicability"]},
+        "then": {"properties": {"scenario": {"pattern": "^data-variation: \\S"}}}
+      },
+      {
+        "if": {"properties": {"dimension": {"const": "permissions"}, "applicability": {"const": "applicable"}}, "required": ["dimension", "applicability"]},
+        "then": {"properties": {"scenario": {"pattern": "^permissions: \\S"}}}
+      },
+      {
+        "if": {"properties": {"dimension": {"const": "integrations"}, "applicability": {"const": "applicable"}}, "required": ["dimension", "applicability"]},
+        "then": {"properties": {"scenario": {"pattern": "^integrations: \\S"}}}
+      },
+      {
+        "if": {"properties": {"dimension": {"const": "recovery"}, "applicability": {"const": "applicable"}}, "required": ["dimension", "applicability"]},
+        "then": {"properties": {"scenario": {"pattern": "^recovery: \\S"}}}
+      },
+      {
+        "if": {"properties": {"dimension": {"const": "state-transitions"}, "applicability": {"const": "applicable"}}, "required": ["dimension", "applicability"]},
+        "then": {"properties": {"scenario": {"pattern": "^state-transitions: \\S"}}}
+      }
+    ],
+    "additionalProperties": false
+  },
+  "allOf": [
+    {"contains": {"properties": {"dimension": {"const": "happy-path"}}, "required": ["dimension"]}, "minContains": 1, "maxContains": 1},
+    {"contains": {"properties": {"dimension": {"const": "error-path"}}, "required": ["dimension"]}, "minContains": 1, "maxContains": 1},
+    {"contains": {"properties": {"dimension": {"const": "boundary"}}, "required": ["dimension"]}, "minContains": 1, "maxContains": 1},
+    {"contains": {"properties": {"dimension": {"const": "abuse-security"}}, "required": ["dimension"]}, "minContains": 1, "maxContains": 1},
+    {"contains": {"properties": {"dimension": {"const": "scale"}}, "required": ["dimension"]}, "minContains": 1, "maxContains": 1},
+    {"contains": {"properties": {"dimension": {"const": "concurrency"}}, "required": ["dimension"]}, "minContains": 1, "maxContains": 1},
+    {"contains": {"properties": {"dimension": {"const": "temporal"}}, "required": ["dimension"]}, "minContains": 1, "maxContains": 1},
+    {"contains": {"properties": {"dimension": {"const": "data-variation"}}, "required": ["dimension"]}, "minContains": 1, "maxContains": 1},
+    {"contains": {"properties": {"dimension": {"const": "permissions"}}, "required": ["dimension"]}, "minContains": 1, "maxContains": 1},
+    {"contains": {"properties": {"dimension": {"const": "integrations"}}, "required": ["dimension"]}, "minContains": 1, "maxContains": 1},
+    {"contains": {"properties": {"dimension": {"const": "recovery"}}, "required": ["dimension"]}, "minContains": 1, "maxContains": 1},
+    {"contains": {"properties": {"dimension": {"const": "state-transitions"}}, "required": ["dimension"]}, "minContains": 1, "maxContains": 1}
+  ]
+}

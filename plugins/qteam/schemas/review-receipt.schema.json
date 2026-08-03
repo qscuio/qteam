@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qteam.local/schemas/review-receipt.schema.json",
+  "type": "object",
+  "required": ["schema_version", "status", "ledger", "packet_sha256", "ledger_findings_sha256", "review_contract_sha256", "review_head_sha", "reviewer", "session_id", "execution", "result", "stdout_log", "stderr_log"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "status": {"enum": ["running", "passed", "needs-fix", "failed"]},
+    "ledger": {"type": "string", "pattern": "^reviews/wave-[1-9][0-9]*-(spec|standards|risk)(-r[1-9][0-9]*)?\\.json$"},
+    "packet_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "ledger_findings_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "review_contract_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "review_head_sha": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+    "review_cwd": {"type": "string", "minLength": 1},
+    "reviewer": {"type": "string", "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"},
+    "session_id": {"type": "string", "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"},
+    "execution": {
+      "type": "object",
+      "required": ["tier", "model", "thinking"],
+      "properties": {
+        "tier": {"enum": ["economy", "standard", "deep"]},
+        "model": {"type": "string", "minLength": 1},
+        "thinking": {"enum": ["low", "medium", "high", "xhigh"]}
+      },
+      "additionalProperties": false
+    },
+    "result": {"type": "string", "pattern": "^reviews/results/[A-Za-z0-9][A-Za-z0-9._-]*\\.json$"},
+    "result_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "stdout_log": {"type": "string", "minLength": 1},
+    "stderr_log": {"type": "string", "minLength": 1},
+    "exit_code": {"type": "integer"},
+    "started_at": {"type": "string", "minLength": 1},
+    "completed_at": {"type": "string", "minLength": 1},
+    "validation_error": {"type": "string", "minLength": 1}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"enum": ["passed", "needs-fix"]}}},
+      "then": {"required": ["result_sha256", "exit_code", "completed_at"], "properties": {"exit_code": {"const": 0}}}
+    },
+    {
+      "if": {"properties": {"status": {"const": "running"}}},
+      "then": {"required": ["started_at"]}
+    },
+    {
+      "if": {"properties": {"status": {"const": "failed"}}},
+      "then": {"required": ["exit_code", "completed_at"]}
+    }
+  ],
+  "additionalProperties": false
+}

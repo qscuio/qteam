@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qteam.local/schemas/task.schema.json",
+  "type": "object",
+  "required": ["id", "status", "branch", "worktree", "wave", "depends_on", "base_commit", "parallel_group", "write_set", "forbidden_paths", "verification", "work_kind", "risk_flags", "policy", "tdd_required", "diagnosis_required"],
+  "properties": {
+    "id": {"type": "string", "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"},
+    "status": {"enum": ["pending", "running", "blocked", "completed", "failed", "superseded", "merged", "artifact_complete"]},
+    "artifact_kind": {"type": "string"},
+    "work_kind": {"enum": ["feature", "bugfix", "debug", "refactor", "test", "integration", "docs", "config", "generated", "learning", "experiment"]},
+    "risk_flags": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"enum": ["concurrency", "security", "migration", "data-loss", "authorization", "authentication", "compatibility", "public-api"]}
+    },
+    "policy": {"$ref": "task-policy.schema.json"},
+    "tdd_required": {"type": "boolean"},
+    "diagnosis_required": {"type": "boolean"},
+    "review_fix": {"type": "boolean"},
+    "finding_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"}},
+    "finding_ledgers": {"type": "object"},
+    "required_decisions": {
+      "type": "array", "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"}
+    },
+    "handoff_required": {"type": "boolean"},
+    "handoff": {"$ref": "handoff.schema.json"},
+    "handoff_resolution": {
+      "type": "object",
+      "required": ["kind", "reason", "replacement_task", "closed_at"],
+      "properties": {
+        "kind": {"const": "replan"},
+        "reason": {"type": "string", "minLength": 1},
+        "replacement_task": {"type": ["string", "null"]},
+        "closed_at": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "tdd_evidence": {"type": "array", "items": {"$ref": "tdd-cycle.schema.json"}},
+    "diagnosis_evidence": {"$ref": "diagnosis.schema.json"},
+    "experiment": {
+      "type": "object",
+      "required": ["goal", "metric", "guard_command", "holdout_command", "max_attempts", "plateau_window"],
+      "properties": {
+        "goal": {"type": "string", "minLength": 1},
+        "metric": {
+          "type": "object",
+          "required": ["name", "direction", "command", "baseline", "minimum_delta"],
+          "properties": {
+            "name": {"type": "string", "minLength": 1},
+            "direction": {"enum": ["higher_is_better", "lower_is_better"]},
+            "command": {"type": "string", "minLength": 1},
+            "baseline": {"type": ["number", "null"]},
+            "minimum_delta": {"type": "number", "minimum": 0}
+          },
+          "additionalProperties": false
+        },
+        "guard_command": {"type": "string", "minLength": 1},
+        "holdout_command": {"type": "string", "minLength": 1},
+        "max_attempts": {"type": "integer", "minimum": 1, "maximum": 50},
+        "plateau_window": {"type": "integer", "minimum": 1, "maximum": 50}
+      },
+      "additionalProperties": false
+    },
+    "experiment_evidence": {"$ref": "experiment.schema.json"},
+    "policy_migration": {"type": "object"},
+    "test_seams": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "behavior", "test_paths", "command", "red_pattern"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"},
+          "behavior": {"type": "string", "minLength": 1},
+          "test_paths": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[^*?\\[]+$"}},
+          "command": {"type": "string", "minLength": 1},
+          "red_pattern": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": false
+      }
+    },
+    "scenario_coverage": {"$ref": "scenario-coverage.schema.json"},
+    "diagnosis_command": {"type": "string", "minLength": 1},
+    "failure_pattern": {"type": "string", "minLength": 1},
+    "branch": {"type": "string", "minLength": 1},
+    "worktree": {"type": "string", "minLength": 1},
+    "base_commit": {"type": "string", "minLength": 7},
+    "parallel_group": {"type": "string", "minLength": 1},
+    "wave": {"type": "integer", "minimum": 1},
+    "depends_on": {
+      "type": "array", "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"}
+    },
+    "write_set": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+    "forbidden_paths": {"type": "array", "items": {"type": "string"}},
+    "allow_shared_surfaces": {"type": "array", "items": {"type": "string"}},
+    "verification": {"type": "string", "minLength": 1},
+    "verification_evidence": {"type": "array", "items": {"$ref": "verification.schema.json"}}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"tdd_required": {"const": true}}},
+      "then": {"required": ["test_seams", "scenario_coverage"]}
+    },
+    {
+      "if": {"properties": {"tdd_required": {"const": false}}, "required": ["tdd_required"]},
+      "then": {"not": {"required": ["scenario_coverage"]}}
+    },
+    {
+      "if": {"properties": {"handoff_required": {"const": true}}},
+      "then": {"required": ["handoff"]}
+    },
+    {
+      "if": {"properties": {"handoff_required": {"const": false}}, "required": ["handoff_required"]},
+      "then": {"not": {"required": ["handoff"]}}
+    },
+    {
+      "if": {"properties": {"diagnosis_required": {"const": true}}},
+      "then": {"required": ["diagnosis_command", "failure_pattern"]}
+    },
+    {
+      "if": {"properties": {"work_kind": {"const": "experiment"}}, "required": ["work_kind"]},
+      "then": {"required": ["experiment"]}
+    },
+    {
+      "if": {"properties": {"review_fix": {"const": true}}, "required": ["review_fix"]},
+      "then": {
+        "required": ["finding_ids", "finding_ledgers"],
+        "properties": {"parallel_group": {"const": "serial"}}
+      }
+    }
+  ],
+  "additionalProperties": true
+}
