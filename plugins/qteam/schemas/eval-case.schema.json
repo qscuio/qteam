@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qteam.local/schemas/eval-case.schema.json",
+  "type": "object",
+  "required": ["schema_version", "id", "status", "source", "observation", "attribution", "capability", "expected_outcome", "validation_scope", "claim_boundary"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "id": {"type": "string", "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"},
+    "status": {"enum": ["candidate", "approved", "rejected"]},
+    "source": {
+      "type": "object",
+      "required": ["kind", "run_id", "evidence", "sha256"],
+      "properties": {
+        "kind": {"enum": ["user-correction", "trajectory-anomaly", "review-finding", "rollback", "tool-failure"]},
+        "run_id": {"type": "string", "minLength": 1},
+        "evidence": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)(?!.*/$)(?!.*\\\\).+$"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "observation": {"type": "string", "minLength": 1},
+    "attribution": {"enum": ["agent", "dependency", "mixed"]},
+    "capability": {"type": "string", "minLength": 1},
+    "expected_outcome": {"type": "string", "minLength": 1},
+    "validation_scope": {"type": "string", "minLength": 1},
+    "claim_boundary": {"type": "string", "minLength": 1},
+    "decision": {
+      "type": "object",
+      "required": ["authority", "outcome", "evidence", "decided_at"],
+      "properties": {
+        "authority": {"const": "coordinator"},
+        "outcome": {"enum": ["approved", "rejected"]},
+        "evidence": {"type": "string", "minLength": 1},
+        "decided_at": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "candidate"}}},
+      "then": {"not": {"required": ["decision"]}},
+      "else": {"required": ["decision"]}
+    },
+    {
+      "if": {"properties": {"status": {"const": "approved"}}},
+      "then": {"properties": {"decision": {"properties": {"outcome": {"const": "approved"}}}}}
+    },
+    {
+      "if": {"properties": {"status": {"const": "rejected"}}},
+      "then": {"properties": {"decision": {"properties": {"outcome": {"const": "rejected"}}}}}
+    }
+  ],
+  "additionalProperties": false
+}

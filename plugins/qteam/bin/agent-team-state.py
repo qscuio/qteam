@@ -25,7 +25,13 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 
 from agent_team_policy import (
-    MODEL_PROFILES, derive_task_policy, review_contract_digest, safe_identifier,
+    MODEL_PROFILES, REVIEW_MODEL_PROFILES, REVERSIBILITY_ORDER,
+    derive_task_policy, review_contract_digest, safe_identifier,
+)
+from agent_team_eval import (
+    calibration_suite, execution_profile, object_sha256,
+    run_regular_file, trajectory_independence, validate_calibration,
+    validate_eval_case, validate_trajectory, wave_trajectory,
 )
 from agent_team_artifact import (
     ArtifactError, epic_binding, locked_regular, require_bound_drift, safe_regular,
@@ -377,16 +383,46 @@ def event_recorded(run_dir, txid):
     path = state_regular(run_dir / "events.jsonl", "run event log")
     if not path.exists():
         return False
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    for line in path.read_text(encoding="utf-8", errors="strict").splitlines():
         try:
             record = json.loads(line)
             if not isinstance(record, dict):
                 raise SystemExit("error: run event log entries must be JSON objects")
             if record.get("txid") == txid:
                 return True
-        except json.JSONDecodeError:
-            continue
+        except (json.JSONDecodeError, RecursionError) as exc:
+            raise SystemExit(f"error: invalid run event log: {exc}")
     return False
+
+
+def repair_truncated_event_tail(run_dir):
+    path = state_regular(run_dir / "events.jsonl", "run event log")
+    if not path.exists():
+        return
+    raw = path.read_bytes()
+    offset = 0
+    lines = raw.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        complete = line.endswith(b"\n")
+        try:
+            text = line.decode("utf-8", errors="strict").strip()
+            record = json.loads(text) if text else None
+            if text and not isinstance(record, dict):
+                raise ValueError("event is not an object")
+        except (UnicodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
+            if index == len(lines) - 1 and not complete:
+                flags = os.O_RDWR
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                descriptor = os.open(path, flags)
+                try:
+                    os.ftruncate(descriptor, offset)
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                return
+            raise SystemExit(f"error: invalid durable run event log: {exc}")
+        offset += len(line)
 
 
 def validate_transaction_write(run_dir, relative, value):
@@ -404,7 +440,7 @@ def validate_transaction_write(run_dir, relative, value):
             "plan_file", "finished", "created_at", "updated_at",
         }
         if (not required.issubset(value)
-                or value.get("schema_version") not in {2, 3, 4, 5}
+                or value.get("schema_version") not in {2, 3, 4, 5, 6}
                 or value.get("run_id") != run_dir.name
                 or value.get("phase") not in PHASES
                 or not isinstance(value.get("finished"), bool)
@@ -414,6 +450,75 @@ def validate_transaction_write(run_dir, relative, value):
                 or ("integration_provenance" in value
                     and not isinstance(value["integration_provenance"], list))):
             raise SystemExit("error: invalid state.json in run transaction")
+        if value.get("schema_version") == 6:
+            v6_required = {
+                "integration_provenance_head", "integration_provenance", "waves",
+                "risk_forced", "hard_to_reverse", "model_profiles",
+                "review_model_profiles",
+            }
+            if (not v6_required.issubset(value)
+                    or not isinstance(value.get("integration_provenance_head"), str)
+                    or not isinstance(value.get("integration_provenance"), list)
+                    or not isinstance(value.get("waves"), dict)
+                    or not isinstance(value.get("risk_forced"), bool)
+                    or not isinstance(value.get("hard_to_reverse"), bool)
+                    or any(not isinstance(value.get(field), dict)
+                           for field in ("model_profiles", "review_model_profiles"))):
+                raise SystemExit("error: invalid schema-version-6 state core")
+        return
+    if relative == "learning-outbox/manifest.json":
+        try:
+            current = load_json(run_regular_file(run_dir, relative))
+        except ValueError as exc:
+            raise SystemExit(f"error: invalid learning manifest target: {exc}")
+        if current == value:
+            return
+        if (not isinstance(current, dict) or not isinstance(value, dict)
+                or set(current) != set(value)
+                or any(current.get(key) != value.get(key)
+                       for key in set(current) - {"items"})
+                or not isinstance(current.get("items"), list)
+                or not isinstance(value.get("items"), list)
+                or len(current["items"]) != len(value["items"])):
+            raise SystemExit("error: invalid learning manifest transition")
+        changed = 0
+        for old, new in zip(current["items"], value["items"]):
+            if old == new:
+                continue
+            changed += 1
+            decision = new.get("decision") if isinstance(new, dict) else None
+            if (not isinstance(old, dict) or not isinstance(new, dict)
+                    or any(old.get(key) != new.get(key)
+                           for key in set(old) | set(new)
+                           if key not in {"status", "decision"})
+                    or old.get("status") != "proposed"
+                    or new.get("status") not in {"approved", "rejected"}
+                    or not isinstance(decision, dict)
+                    or decision.get("authority") != "coordinator"
+                    or decision.get("outcome") != new.get("status")
+                    or not decision.get("evidence")
+                    or not decision.get("decided_at")):
+                raise SystemExit("error: invalid learning item decision transition")
+        if changed != 1:
+            raise SystemExit("error: learning decision must change exactly one item")
+        return
+    if (len(path.parts) == 3 and path.parts[:2]
+            == ("learning-outbox", "eval-cases") and path.suffix == ".json"):
+        try:
+            current = validate_eval_case(
+                load_json(run_regular_file(run_dir, relative)), run_dir
+            )
+            validate_eval_case(value, run_dir)
+        except ValueError as exc:
+            raise SystemExit(f"error: invalid eval-case transaction: {exc}")
+        if current == value:
+            return
+        if (current.get("id") != path.stem or value.get("id") != path.stem
+                or current.get("status") != "candidate"
+                or value.get("status") not in {"approved", "rejected"}
+                or any(current.get(key) != value.get(key)
+                       for key in current if key != "status")):
+            raise SystemExit("error: invalid eval-case decision transition")
         return
     if len(path.parts) != 2 or path.suffix != ".json":
         raise SystemExit("error: unsupported run transaction target")
@@ -448,9 +553,12 @@ def validate_transaction_write(run_dir, relative, value):
 
 
 def validate_run_transaction(run_dir, transaction):
-    if (not isinstance(transaction, dict)
-            or set(transaction) != {"schema_version", "txid", "writes", "event"}
-            or transaction.get("schema_version") != 1
+    if not isinstance(transaction, dict):
+        raise SystemExit("error: invalid run transaction")
+    version = transaction.get("schema_version")
+    fields = {"schema_version", "txid", "writes", "event"}
+    if (set(transaction) != fields
+            or version not in {1, 2}
             or not isinstance(transaction.get("txid"), str)
             or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", transaction["txid"])
             or not isinstance(transaction.get("writes"), dict)
@@ -459,8 +567,107 @@ def validate_run_transaction(run_dir, transaction):
             or not isinstance(transaction["event"].get("event"), str)
             or not transaction["event"]["event"]):
         raise SystemExit("error: invalid run transaction")
+    if version == 1:
+        state_path = run_dir / "state.json"
+        current_version = (load_json(state_path).get("schema_version")
+                           if state_path.is_file() else None)
+        legacy_init = False
+        if current_version is None:
+            value = transaction.get("writes", {}).get("state.json")
+            legacy_init = (
+                set(transaction.get("writes", {})) == {"state.json"}
+                and isinstance(value, dict)
+                and value.get("schema_version") in {2, 3, 4, 5}
+                and value.get("run_id") == run_dir.name
+                and value.get("phase") == "INIT"
+                and value.get("finished") is False
+                and value.get("tasks") == {}
+                and transaction.get("event", {}).get("event") == "run_created"
+            )
+        if current_version not in {2, 3, 4, 5} and not legacy_init:
+            raise SystemExit(
+                "error: legacy run transactions are rejected for current runs"
+            )
+    else:
+        digest = object_sha256(transaction)
+        prepared = False
+        final_recorded = False
+        event_path = state_regular(run_dir / "events.jsonl", "run event log")
+        if event_path.exists():
+            try:
+                event_text = event_path.read_text(
+                    encoding="utf-8", errors="strict"
+                )
+            except UnicodeError as exc:
+                raise SystemExit(f"error: invalid run event log encoding: {exc}")
+            for line in event_text.splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except (json.JSONDecodeError, RecursionError) as exc:
+                    raise SystemExit(f"error: invalid run event log: {exc}")
+                if not isinstance(record, dict):
+                    raise SystemExit("error: run event log entries must be objects")
+                if (record.get("event") == "transaction_prepared"
+                        and record.get("prepared_txid") == transaction["txid"]
+                        and record.get("transaction_sha256") == digest):
+                    prepared = True
+                if record.get("txid") == transaction["txid"]:
+                    final_recorded = True
+        if not prepared:
+            raise SystemExit("error: run transaction has no durable prepare record")
+        if final_recorded:
+            for relative, updated in transaction["writes"].items():
+                path = run_dir / relative
+                if not path.is_file() or load_json(path) != updated:
+                    raise SystemExit(
+                        "error: completed run transaction cannot replay stale writes"
+                    )
     for relative, value in transaction["writes"].items():
         validate_transaction_write(run_dir, relative, value)
+    learning = [path for path in transaction["writes"]
+                if path.startswith("learning-outbox/")]
+    if learning:
+        event = transaction["event"]
+        manifest = transaction["writes"].get(
+            "learning-outbox/manifest.json", {}
+        )
+        decided = [
+            item for item in manifest.get("items", [])
+            if isinstance(item, dict) and item.get("id") == event.get("item")
+        ] if isinstance(manifest, dict) else []
+        if (event.get("event") != "learning_item_decided"
+                or event.get("outcome") not in {"approved", "rejected"}
+                or not safe_task_id(event.get("item"))
+                or len(decided) != 1
+                or decided[0].get("status") != event.get("outcome")
+                or decided[0].get("decision", {}).get("evidence")
+                != event.get("evidence")
+                or event.get("item_sha256") != object_sha256(decided[0])):
+            raise SystemExit("error: invalid learning decision transaction binding")
+        if decided[0].get("category") == "eval":
+            expected_case = (
+                f"learning-outbox/eval-cases/{event.get('case_id')}.json"
+            )
+            if (set(learning) != {
+                    "learning-outbox/manifest.json", expected_case,
+                    }
+                    or not safe_task_id(event.get("case_id"))
+                    or event.get("case_sha256") != object_sha256(
+                        transaction["writes"][expected_case]
+                    )):
+                raise SystemExit(
+                    "error: invalid eval learning decision transaction binding"
+                )
+        elif (decided[0].get("category")
+              not in {"knowledge", "lesson", "skill"}
+              or set(learning) != {"learning-outbox/manifest.json"}
+              or event.get("category") != decided[0].get("category")
+              or "case_id" in event or "case_sha256" in event):
+            raise SystemExit(
+                "error: invalid non-eval learning decision transaction binding"
+            )
     return transaction
 
 
@@ -494,14 +701,20 @@ def recover_transaction(run_dir):
 
 def commit_transaction(run_dir, writes, event):
     transaction = {
-        "schema_version": 1, "txid": uuid.uuid4().hex,
+        "schema_version": 2, "txid": uuid.uuid4().hex,
         "writes": {str(Path(path).relative_to(run_dir)): value
                    for path, value in writes.items()},
         "event": event,
     }
     intent = state_regular(run_dir / ".transaction.json", "run transaction")
     state_regular(run_dir / "events.jsonl", "run event log")
+    repair_truncated_event_tail(run_dir)
     event_recorded(run_dir, transaction["txid"])
+    append_event(run_dir, {
+        "event": "transaction_prepared",
+        "prepared_txid": transaction["txid"],
+        "transaction_sha256": object_sha256(transaction),
+    })
     atomic_json(intent, transaction)
     apply_transaction(run_dir, transaction)
     intent.unlink()
@@ -520,6 +733,7 @@ def locked(run_dir, *, allow_sealed=False):
         with locked_regular(lock_path, "run state lock"):
             state_regular(run_dir / ".transaction.json", "run transaction")
             state_regular(run_dir / "events.jsonl", "run event log")
+            repair_truncated_event_tail(run_dir)
             event_recorded(run_dir, "")
             state_path = state_regular(run_dir / "state.json", "run state")
             recover_transaction(run_dir)
@@ -597,6 +811,9 @@ def validate_reviews(repo, run_dir, state, head_sha=None, require_risk=None,
             "execution_tier": "standard", "review_intensity": "full",
             "require_risk_review": bool(state.get("risk_forced")),
             "risk_flags": [], "tasks": [],
+            "reversibility": "contained-reversible",
+            "integration_lane": "shadow",
+            "require_user_finish_decision": False,
         }
 
     def object_sha(value):
@@ -604,19 +821,57 @@ def validate_reviews(repo, run_dir, state, head_sha=None, require_risk=None,
         return hashlib.sha256(encoded).hexdigest()
 
     def packet_policy_valid(packet, wave):
+        if (not isinstance(packet, dict)
+                or not isinstance(packet.get("trajectory"), dict)):
+            return False
         policy = wave_policy(wave)
         tier = policy.get("execution_tier")
-        profiles = state.get("model_profiles")
+        profiles = state.get("review_model_profiles")
         profile = profiles.get(tier) if isinstance(profiles, dict) else None
         expected_execution = ({"tier": tier, "model": profile.get("model"),
-                               "thinking": profile.get("thinking")}
+                               "thinking": profile.get("thinking"),
+                               "provider": profile.get("provider"),
+                               "family": profile.get("family")}
                               if isinstance(profile, dict) else None)
+        if (expected_execution is None
+                or any(not isinstance(expected_execution.get(field), str)
+                       or not expected_execution[field]
+                       for field in (
+                           "tier", "model", "thinking", "provider", "family"
+                       ))):
+            return False
+        try:
+            expected_trajectory = wave_trajectory(
+                run_dir, state, wave, packet.get("base_sha"),
+                packet.get("head_sha"),
+                task_ids=packet["trajectory"].get("tasks"),
+            )
+            expected_calibration = calibration_suite(packet.get("axis"))
+        except ValueError:
+            return False
+        expected_families = sorted({
+            item.get("execution", {}).get("family")
+            for item in expected_trajectory["worker_trajectories"]
+            if item.get("execution", {}).get("family")
+        })
+        expected_independence = trajectory_independence(
+            expected_trajectory, expected_execution["family"]
+        )
         return (
-            packet.get("wave") == wave
+            packet.get("schema_version") == 3
+            and packet.get("wave") == wave
             and packet.get("execution_tier") == tier
             and packet.get("review_intensity") == policy.get("review_intensity")
             and packet.get("risk_flags") == policy.get("risk_flags", [])
             and packet.get("review_execution") == expected_execution
+            and packet.get("trajectory") == expected_trajectory
+            and packet.get("calibration") == expected_calibration
+            and packet.get("generator_families") == expected_families
+            and packet.get("judge_independence") == expected_independence
+            and isinstance(packet.get("runner"), dict)
+            and packet.get("runner", {}).get("name") == "codex-cli"
+            and isinstance(packet.get("runner", {}).get("version"), str)
+            and bool(packet.get("runner", {}).get("version"))
             and packet.get("review_contract_sha256") == review_contract_digest(
                 packet.get("axis"), policy.get("review_intensity")
             )
@@ -643,6 +898,31 @@ def validate_reviews(repo, run_dir, state, head_sha=None, require_risk=None,
                     return False
         return True
 
+    def receipt_trajectory_valid(receipt):
+        try:
+            trace_path = run_regular_file(run_dir, receipt.get("stdout_log"))
+            validate_trajectory(
+                receipt.get("trajectory"), "review", receipt.get("session_id"),
+                receipt.get("execution"), trace_path,
+            )
+        except ValueError:
+            return False
+        return (
+            receipt.get("trajectory", {}).get("runner") == receipt.get("runner")
+            and receipt.get("trajectory", {}).get("disposition") == "pass"
+        )
+
+    def receipt_paths_valid(receipt):
+        session = receipt.get("session_id") if isinstance(receipt, dict) else None
+        return bool(
+            safe_task_id(session)
+            and receipt.get("result") == f"reviews/results/{session}.json"
+            and receipt.get("stdout_log")
+            == f"reviews/logs/{session}.stdout.log"
+            and receipt.get("stderr_log")
+            == f"reviews/logs/{session}.stderr.log"
+        )
+
     def attestation_valid(ledger):
         packet = ledger.get("packet", {})
         attestation = ledger.get("attestation", {})
@@ -653,7 +933,15 @@ def validate_reviews(repo, run_dir, state, head_sha=None, require_risk=None,
                 or not attestation.get("reviewer")
                 or not attestation.get("session_id")
                 or result.get("axis") != packet.get("axis")
-                or result.get("verdict") != "pass"):
+                or result.get("verdict") != "pass"
+                or result.get("trajectory_verdict") != "pass"):
+            return False
+        try:
+            validate_calibration(
+                packet.get("axis"), packet.get("calibration", {}).get("sha256"),
+                result.get("calibration_results"),
+            )
+        except ValueError:
             return False
         receipt_path = (run_dir / receipt_rel).resolve()
         receipt_root = (run_dir / "reviews" / "receipts").resolve()
@@ -675,16 +963,22 @@ def validate_reviews(repo, run_dir, state, head_sha=None, require_risk=None,
         return (
             receipt.get("status") == "passed"
             and receipt.get("exit_code") == 0
+            and receipt_paths_valid(receipt)
             and receipt.get("ledger") == expected_ledger
             and receipt.get("packet_sha256") == object_sha(packet)
             and receipt.get("ledger_findings_sha256")
             == object_sha(ledger.get("findings", []))
             and receipt.get("review_contract_sha256")
             == packet.get("review_contract_sha256")
+            and receipt.get("calibration_sha256")
+            == packet.get("calibration", {}).get("sha256")
             and receipt.get("review_head_sha") == packet.get("head_sha")
             and receipt.get("reviewer") == attestation.get("reviewer")
             and receipt.get("session_id") == attestation.get("session_id")
             and receipt.get("execution") == packet.get("review_execution")
+            and receipt.get("runner") == packet.get("runner")
+            and isinstance(receipt.get("trajectory"), dict)
+            and receipt_trajectory_valid(receipt)
             and attestation.get("execution") == packet.get("review_execution")
             and receipt.get("result_sha256") == object_sha(saved_result)
             and attestation.get("result_sha256") == receipt.get("result_sha256")
@@ -706,12 +1000,18 @@ def validate_reviews(repo, run_dir, state, head_sha=None, require_risk=None,
             receipt = load_json(receipt_path)
             if (receipt.get("status") != "needs-fix"
                     or receipt.get("exit_code") != 0
+                    or not receipt_paths_valid(receipt)
                     or receipt.get("ledger") != expected_ledger
                     or receipt.get("packet_sha256") != packet_sha
                     or receipt.get("review_contract_sha256")
                     != packet.get("review_contract_sha256")
+                    or receipt.get("calibration_sha256")
+                    != packet.get("calibration", {}).get("sha256")
                     or receipt.get("review_head_sha") != packet.get("head_sha")
-                    or receipt.get("execution") != packet.get("review_execution")):
+                    or receipt.get("execution") != packet.get("review_execution")
+                    or receipt.get("runner") != packet.get("runner")
+                    or not isinstance(receipt.get("trajectory"), dict)
+                    or not receipt_trajectory_valid(receipt)):
                 continue
             result_path = (run_dir / receipt.get("result", "")).resolve()
             if (result_path.parent != (run_dir / "reviews" / "results").resolve()
@@ -721,8 +1021,16 @@ def validate_reviews(repo, run_dir, state, head_sha=None, require_risk=None,
             result_findings = [item for item in result.get("findings", [])
                                if isinstance(item, dict)]
             ids = [item.get("id") for item in result_findings]
+            try:
+                validate_calibration(
+                    packet.get("axis"), packet.get("calibration", {}).get("sha256"),
+                    result.get("calibration_results"),
+                )
+            except ValueError:
+                continue
             if (result.get("axis") != packet.get("axis")
                     or result.get("verdict") != "needs-fix" or not ids
+                    or result.get("trajectory_verdict") not in {"pass", "needs-fix"}
                     or receipt.get("result_sha256") != object_sha(result)):
                 continue
             attempt = next((item for item in attempts
@@ -1135,6 +1443,49 @@ def decision_records(run_dir, state):
     return records
 
 
+def hard_to_reverse_subject(repo, run_dir, state):
+    head = integration_head(repo, state)
+    tasks = []
+    for task_id in sorted(state.get("tasks", {})):
+        task = load_json(run_dir / "tasks" / f"{task_id}.json")
+        policy = task.get("policy", {})
+        if policy.get("require_user_finish_decision"):
+            tasks.append({
+                "id": task_id,
+                "status": task.get("status"),
+                "policy_sha256": object_sha256(policy),
+                "merge_commit": task.get("merge_commit"),
+            })
+    payload = {
+        "run_id": state.get("run_id"), "head_sha": head, "tasks": tasks,
+    }
+    return {
+        "kind": "hard-to-reverse-run",
+        "sha256": object_sha256(payload),
+    }, payload
+
+
+def require_hard_to_reverse_authorization(repo, run_dir, state):
+    if not state.get("hard_to_reverse"):
+        return
+    subject, _payload = hard_to_reverse_subject(repo, run_dir, state)
+    matches = []
+    for record in decision_records(run_dir, state).values():
+        scope = record.get("scope", {})
+        if (record.get("authority") == "user"
+                and scope.get("kind") == "action"
+                and scope.get("targets") == ["finish"]
+                and record.get("subject") == subject
+                and record.get("status") == "resolved"
+                and record.get("resolution", {}).get("outcome") == "allow"):
+            matches.append(record["id"])
+    if not matches:
+        raise SystemExit(
+            "error: hard-to-reverse run requires an allowed user finish decision "
+            "bound to the current reversibility-subject"
+        )
+
+
 def publication_decision_digest(records):
     payload = json.dumps(records, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(payload).hexdigest()
@@ -1322,7 +1673,9 @@ def summarize_wave_policies(records):
         item = waves.setdefault(wave, {
             "tasks": [], "execution_tier": "economy",
             "review_intensity": "compact", "require_risk_review": False,
-            "risk_flags": [],
+            "risk_flags": [], "reversibility": "contained-reversible",
+            "integration_lane": "shadow",
+            "require_user_finish_decision": False,
         })
         item["tasks"].append(task["id"])
         policy = task["policy"]
@@ -1332,6 +1685,13 @@ def summarize_wave_policies(records):
         if intensity_order[policy["review_intensity"]] > intensity_order[item["review_intensity"]]:
             item["review_intensity"] = policy["review_intensity"]
         item["require_risk_review"] |= policy["require_risk_review"]
+        if (REVERSIBILITY_ORDER[policy["reversibility"]]
+                > REVERSIBILITY_ORDER[item["reversibility"]]):
+            item["reversibility"] = policy["reversibility"]
+            item["integration_lane"] = policy["integration_lane"]
+        item["require_user_finish_decision"] |= policy[
+            "require_user_finish_decision"
+        ]
         item["risk_flags"] = sorted(set(item["risk_flags"])
                                     | set(policy["effective_risk_flags"]))
     for item in waves.values():
@@ -1435,6 +1795,34 @@ def validate_integration_provenance(repo, run_dir, state, head_sha):
 
 
 def cmd_init(args, repo, run_dir):
+    try:
+        model_profiles = {
+            "economy": execution_profile(
+                args.model_economy, MODEL_PROFILES["economy"]["thinking"]
+            ),
+            "standard": execution_profile(
+                args.model_standard, MODEL_PROFILES["standard"]["thinking"]
+            ),
+            "deep": execution_profile(
+                args.model_deep, MODEL_PROFILES["deep"]["thinking"]
+            ),
+        }
+        review_model_profiles = {
+            "economy": execution_profile(
+                args.review_model_economy,
+                REVIEW_MODEL_PROFILES["economy"]["thinking"],
+            ),
+            "standard": execution_profile(
+                args.review_model_standard,
+                REVIEW_MODEL_PROFILES["standard"]["thinking"],
+            ),
+            "deep": execution_profile(
+                args.review_model_deep,
+                REVIEW_MODEL_PROFILES["deep"]["thinking"],
+            ),
+        }
+    except ValueError as exc:
+        raise SystemExit(f"error: {exc}")
     state_file = run_dir / "state.json"
     with locked(run_dir):
         if state_file.exists():
@@ -1459,7 +1847,7 @@ def cmd_init(args, repo, run_dir):
             except ArtifactError as exc:
                 raise SystemExit(f"error: {exc}")
         state = {
-            "schema_version": 5,
+            "schema_version": 6,
             "run_id": run_dir.name,
             "goal": args.goal,
             "base_branch": base_branch,
@@ -1480,14 +1868,9 @@ def cmd_init(args, repo, run_dir):
             },
             "risk_forced": args.require_risk,
             "risk_required": args.require_risk,
-            "model_profiles": {
-                "economy": {"model": args.model_economy,
-                            "thinking": MODEL_PROFILES["economy"]["thinking"]},
-                "standard": {"model": args.model_standard,
-                             "thinking": MODEL_PROFILES["standard"]["thinking"]},
-                "deep": {"model": args.model_deep,
-                         "thinking": MODEL_PROFILES["deep"]["thinking"]},
-            },
+            "hard_to_reverse": False,
+            "model_profiles": model_profiles,
+            "review_model_profiles": review_model_profiles,
             "shared_surfaces": list(dict.fromkeys([*DEFAULT_SHARED_SURFACES,
                                                      *args.shared_surface])),
             "plan_file": args.plan_file,
@@ -1509,12 +1892,12 @@ def cmd_migrate_run(_args, _repo, run_dir):
         state_path = run_dir / "state.json"
         state = load_json(state_path)
         source_schema = state.get("schema_version")
-        if source_schema == 5:
-            print("already-v5")
+        if source_schema == 6:
+            print("already-v6")
             return
-        if source_schema not in {2, 3, 4} or state.get("finished"):
+        if source_schema not in {2, 3, 4, 5} or state.get("finished"):
             raise SystemExit(
-                "error: only unfinished schema-version-2/3/4 runs can migrate"
+                "error: only unfinished schema-version-2/3/4/5 runs can migrate"
             )
         records = []
         writes = {}
@@ -1535,9 +1918,12 @@ def cmd_migrate_run(_args, _repo, run_dir):
             if source_schema == 2 and not task.get("policy"):
                 task["work_kind"] = "integration"
                 task["risk_flags"] = []
-                task["policy"] = derive_task_policy(task)
                 task["tdd_required"] = False
                 task["diagnosis_required"] = False
+            task["policy"] = derive_task_policy(task)
+            task["reversibility"] = task["policy"]["reversibility"]
+            task["tdd_required"] = task["policy"]["tdd_required"]
+            task["diagnosis_required"] = task["policy"]["diagnosis_required"]
             task.setdefault("required_decisions", [])
             task.setdefault("handoff_required", False)
             task.setdefault("depends_on", [])
@@ -1556,7 +1942,7 @@ def cmd_migrate_run(_args, _repo, run_dir):
         validate_dependency_records(
             {task["id"]: task for task in records}, state
         )
-        state["schema_version"] = 5
+        state["schema_version"] = 6
         state.setdefault("decisions", {})
         for decision_id in state["decisions"]:
             decision_path = run_dir / "decisions" / f"{decision_id}.json"
@@ -1575,8 +1961,33 @@ def cmd_migrate_run(_args, _repo, run_dir):
                     writes[decision_path] = decision
         state.setdefault("gates", {}).setdefault("public_boundary", {"status": "pending"})
         state.pop("publication_seal", None)
-        state["risk_forced"] = bool(state.get("risk_required", False))
-        state["model_profiles"] = MODEL_PROFILES
+        state["risk_forced"] = (
+            bool(state.get("risk_forced", False)) if source_schema >= 5
+            else bool(state.get("risk_required", False))
+        )
+
+        def migrated_profiles(raw, defaults):
+            source = raw if isinstance(raw, dict) else {}
+            migrated = {}
+            for tier in ("economy", "standard", "deep"):
+                item = source.get(tier)
+                default = defaults[tier]
+                model = item.get("model") if isinstance(item, dict) else None
+                thinking = item.get("thinking") if isinstance(item, dict) else None
+                migrated[tier] = execution_profile(
+                    model if isinstance(model, str) and model else default["model"],
+                    thinking if thinking in {"low", "medium", "high", "xhigh"}
+                    else default["thinking"],
+                )
+            return migrated
+
+        state["model_profiles"] = migrated_profiles(
+            state.get("model_profiles"), MODEL_PROFILES
+        )
+        state["review_model_profiles"] = migrated_profiles(
+            state.get("review_model_profiles", state.get("model_profiles")),
+            REVIEW_MODEL_PROFILES,
+        )
         state["waves"] = summarize_wave_policies(records)
         if source_schema in {2, 3}:
             provenance_head, provenance = rebuild_legacy_integration_provenance(
@@ -1594,12 +2005,15 @@ def cmd_migrate_run(_args, _repo, run_dir):
         state["risk_required"] = state["risk_forced"] or any(
             item["require_risk_review"] for item in state["waves"].values()
         )
+        state["hard_to_reverse"] = any(
+            item["require_user_finish_decision"] for item in state["waves"].values()
+        )
         state["policy_migration_pending"] = sorted(replan)
         state["updated_at"] = now()
         writes[state_path] = state
         commit_transaction(
             run_dir, writes,
-            {"event": "run_migrated", "from_schema": source_schema, "to_schema": 5,
+            {"event": "run_migrated", "from_schema": source_schema, "to_schema": 6,
              "requires_replan": sorted(replan),
              "reopened_decisions": sorted(reopened_decisions)},
         )
@@ -1701,6 +2115,7 @@ def cmd_phase(args, _repo, run_dir):
             if unfinished:
                 raise SystemExit("error: unfinished tasks block finish: " + ", ".join(unfinished))
             require_no_decision_blockers(run_dir, state, "finish", action="finish")
+            require_hard_to_reverse_authorization(_repo, run_dir, state)
             handoff_blockers = []
             for task_id in state.get("tasks", {}):
                 task = load_json(run_dir / "tasks" / f"{task_id}.json")
@@ -1777,6 +2192,7 @@ def cmd_task_put(args, _repo, run_dir):
         raise SystemExit(f"error: {exc}")
     record["tdd_required"] = record["policy"]["tdd_required"]
     record["diagnosis_required"] = record["policy"]["diagnosis_required"]
+    record["reversibility"] = record["policy"]["reversibility"]
     validate_experiment_contract(record)
     validate_handoff(record)
     if record["tdd_required"]:
@@ -1902,6 +2318,8 @@ def cmd_task_put(args, _repo, run_dir):
                     > intensity_order[current_policy["review_intensity"]]
                     or record["policy"]["require_risk_review"]
                     and not current_policy["require_risk_review"]
+                    or REVERSIBILITY_ORDER[record["policy"]["reversibility"]]
+                    > REVERSIBILITY_ORDER[current_policy["reversibility"]]
                     or not set(record["policy"]["effective_risk_flags"]).issubset(
                         current_policy.get("risk_flags", []))):
                 raise SystemExit(
@@ -1973,6 +2391,10 @@ def cmd_task_put(args, _repo, run_dir):
         state["waves"] = rebuild_wave_policies(run_dir, state, record)
         state["risk_required"] = bool(state.get("risk_forced")) or any(
             item["require_risk_review"] for item in state["waves"].values()
+        )
+        state["hard_to_reverse"] = any(
+            item["require_user_finish_decision"]
+            for item in state["waves"].values()
         )
         state["policy_migration_pending"] = sorted(
             item for item in state.get("tasks", {})
@@ -2280,6 +2702,81 @@ def cmd_artifact_complete(args, _repo, run_dir):
                            {"event": "artifact_complete", "task": args.task,
                             "kind": args.kind, "result": args.result})
     print("artifact_complete")
+
+
+def cmd_learning_item_decision(args, _repo, run_dir):
+    if not safe_task_id(args.item) or not args.evidence.strip():
+        raise SystemExit("error: learning decision needs a safe item and evidence")
+    with locked(run_dir):
+        state = load_json(run_dir / "state.json")
+        if state.get("finished") or state.get("phase") != "LEARNING_EXPORT":
+            raise SystemExit(
+                "error: learning decisions are allowed only during LEARNING_EXPORT"
+            )
+        manifest_path = run_regular_file(
+            run_dir, "learning-outbox/manifest.json"
+        )
+        manifest = load_json(manifest_path)
+        items = manifest.get("items") if isinstance(manifest, dict) else None
+        if not isinstance(items, list):
+            raise SystemExit("error: learning manifest items must be a list")
+        matches = [item for item in items
+                   if isinstance(item, dict) and item.get("id") == args.item]
+        if len(matches) != 1:
+            raise SystemExit("error: learning item must identify exactly one proposal")
+        item = matches[0]
+        category = item.get("category")
+        if category not in {"knowledge", "lesson", "skill", "eval"}:
+            raise SystemExit("error: learning item has an unsupported category")
+        if item.get("status") != "proposed":
+            raise SystemExit("error: learning item is not an undecided proposal")
+        stamp = now()
+        decision = {
+            "authority": "coordinator", "outcome": args.outcome,
+            "evidence": args.evidence.strip(), "decided_at": stamp,
+        }
+        item["status"] = args.outcome
+        item["decision"] = decision
+        if category != "eval":
+            commit_transaction(
+                run_dir, {manifest_path: manifest},
+                {
+                    "event": "learning_item_decided", "item": args.item,
+                    "category": category, "outcome": args.outcome,
+                    "evidence": decision["evidence"],
+                    "item_sha256": object_sha256(item),
+                },
+            )
+            print(args.outcome)
+            return
+        case_relative = item.get("file")
+        if (not isinstance(case_relative, str)
+                or not re.fullmatch(
+                    r"eval-cases/[A-Za-z0-9][A-Za-z0-9._-]*\.json",
+                    case_relative,
+                )):
+            raise SystemExit("error: eval learning item has an unsafe case path")
+        case_path = run_regular_file(
+            run_dir, f"learning-outbox/{case_relative}"
+        )
+        case = validate_eval_case(load_json(case_path), run_dir)
+        if case_path.stem != case.get("id"):
+            raise SystemExit("error: eval case filename differs from its identity")
+        if case.get("status") != "candidate":
+            raise SystemExit("error: learning item is not an undecided eval candidate")
+        case["status"] = args.outcome
+        case["decision"] = decision
+        case_sha = object_sha256(case)
+        commit_transaction(
+            run_dir, {manifest_path: manifest, case_path: case},
+            {
+                "event": "learning_item_decided", "item": args.item,
+                "case_id": case["id"], "outcome": args.outcome,
+                "evidence": decision["evidence"], "case_sha256": case_sha,
+                "item_sha256": object_sha256(item),
+            },
+        )
+    print(args.outcome)
 
 
 def run_verification(command, cwd, env, log_path):
@@ -2901,7 +3398,8 @@ def validate_decision_input(record):
     if not isinstance(record, dict):
         raise SystemExit("error: decision gate must be a JSON object")
     required = {"schema_version", "id", "status", "question", "authority", "scope"}
-    if set(record) != required or record.get("schema_version") != 1:
+    if (frozenset(record) not in {frozenset(required), frozenset({*required, "subject"})}
+            or record.get("schema_version") != 1):
         raise SystemExit("error: new decision gate needs exact schema-version-1 fields")
     if (not safe_task_id(record.get("id")) or record.get("status") != "open"
             or not isinstance(record.get("question"), str) or not record["question"].strip()
@@ -2930,6 +3428,19 @@ def validate_decision_input(record):
             "error: action decision targets must be task-start/wave-start/merge/"
             "learning-export/finish/publish"
         )
+    subject = record.get("subject")
+    if subject is not None:
+        if (not isinstance(subject, dict)
+                or set(subject) != {"kind", "sha256"}
+                or subject.get("kind") != "hard-to-reverse-run"
+                or not isinstance(subject.get("sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", subject["sha256"]) is None
+                or record.get("authority") != "user"
+                or kind != "action" or targets != ["finish"]):
+            raise SystemExit(
+                "error: hard-to-reverse subject requires a user action decision "
+                "covering finish"
+            )
 
 
 def cmd_decision_put(args, _repo, run_dir):
@@ -2943,6 +3454,13 @@ def cmd_decision_put(args, _repo, run_dir):
             raise SystemExit("error: finished run is immutable")
         if state.get("publication_seal"):
             raise SystemExit("error: publication seal freezes decision gates")
+        if record.get("subject", {}).get("kind") == "hard-to-reverse-run":
+            expected, _payload = hard_to_reverse_subject(_repo, run_dir, state)
+            if record["subject"] != expected:
+                raise SystemExit(
+                    "error: hard-to-reverse decision subject is stale or belongs "
+                    "to a different run/head"
+                )
         decision_path = run_dir / "decisions" / f"{decision_id}.json"
         if decision_path.exists() or decision_id in state.setdefault("decisions", {}):
             raise SystemExit(f"error: decision {decision_id} already exists")
@@ -2953,6 +3471,8 @@ def cmd_decision_put(args, _repo, run_dir):
             "status": "open", "authority": record["authority"],
             "scope": record["scope"], "question": record["question"],
         }
+        if record.get("subject"):
+            state["decisions"][decision_id]["subject"] = record["subject"]
         state["updated_at"] = stamp
         commit_transaction(
             run_dir, {decision_path: record, state_path: state},
@@ -3082,6 +3602,15 @@ def cmd_decision_check(args, _repo, run_dir):
         elif args.expected_head:
             raise SystemExit("error: --expected-head requires --seal")
     print("sealed" if args.seal else "clear")
+
+
+def cmd_reversibility_subject(_args, repo, run_dir):
+    with locked(run_dir, allow_sealed=True):
+        state = load_json(run_dir / "state.json")
+        if not state.get("hard_to_reverse"):
+            raise SystemExit("error: run has no hard-to-reverse task policy")
+        subject, payload = hard_to_reverse_subject(repo, run_dir, state)
+    print(json.dumps({"subject": subject, **payload}, sort_keys=True))
 
 
 def cmd_boundary_check(_args, repo, run_dir):
@@ -3228,6 +3757,14 @@ def cmd_status(_args, repo, run_dir):
                 "outcome": item.get("resolution", {}).get("outcome"),
             }
         current_blockers = [blocking_now[key] for key in sorted(blocking_now)]
+        hard_authorization_pending = False
+        if state.get("hard_to_reverse") and phase in {
+            "LEARNING_EXPORT", "READY_TO_FINISH",
+        }:
+            try:
+                require_hard_to_reverse_authorization(repo, run_dir, state)
+            except SystemExit:
+                hard_authorization_pending = True
         if migration_replan_tasks and phase != "REPLANNING":
             next_action = "enter REPLANNING to restore migrated task dependencies"
         elif current_blockers:
@@ -3236,6 +3773,10 @@ def cmd_status(_args, repo, run_dir):
                 f"honor denied decision {first['id']}: {first['question']}"
                 if first["outcome"] == "deny"
                 else f"answer decision {first['id']}: {first['question']}"
+            )
+        elif hard_authorization_pending:
+            next_action = (
+                "create and allow a user finish decision from reversibility-subject"
             )
         elif phase == "WAVE_VALIDATING" and tasks["active"]:
             next_action = f"run mechanical task check for {tasks['active'][0]}"
@@ -3362,6 +3903,7 @@ def validate_ready_invariants(repo, run_dir, state, head):
     if gates.get("learning", {}).get("status") not in {"passed", "skipped"}:
         raise SystemExit("error: learning gate is not passed or explicitly skipped")
     require_no_decision_blockers(run_dir, state, "finish", action="finish")
+    require_hard_to_reverse_authorization(repo, run_dir, state)
     try:
         require_bound_drift(repo, run_dir, state)
     except ArtifactError as exc:
@@ -3466,6 +4008,12 @@ def parser():
     p.add_argument("--model-economy", default=MODEL_PROFILES["economy"]["model"])
     p.add_argument("--model-standard", default=MODEL_PROFILES["standard"]["model"])
     p.add_argument("--model-deep", default=MODEL_PROFILES["deep"]["model"])
+    p.add_argument("--review-model-economy",
+                   default=REVIEW_MODEL_PROFILES["economy"]["model"])
+    p.add_argument("--review-model-standard",
+                   default=REVIEW_MODEL_PROFILES["standard"]["model"])
+    p.add_argument("--review-model-deep",
+                   default=REVIEW_MODEL_PROFILES["deep"]["model"])
     p.add_argument("--shared-surface", action="append", default=[])
     p.set_defaults(func=cmd_init)
     sub.add_parser("migrate-run").set_defaults(func=cmd_migrate_run)
@@ -3502,6 +4050,11 @@ def parser():
     p.add_argument("--kind", required=True)
     p.add_argument("--result", required=True)
     p.set_defaults(func=cmd_artifact_complete)
+    p = sub.add_parser("learning-item-decision")
+    p.add_argument("item")
+    p.add_argument("--outcome", required=True, choices=["approved", "rejected"])
+    p.add_argument("--evidence", required=True)
+    p.set_defaults(func=cmd_learning_item_decision)
     p = sub.add_parser("verify-task")
     p.add_argument("task")
     p.set_defaults(func=cmd_verify_task)
@@ -3545,6 +4098,9 @@ def parser():
     p.add_argument("--seal", action="store_true")
     p.add_argument("--expected-head")
     p.set_defaults(func=cmd_decision_check)
+    sub.add_parser("reversibility-subject").set_defaults(
+        func=cmd_reversibility_subject
+    )
     sub.add_parser("boundary-check").set_defaults(func=cmd_boundary_check)
     p = sub.add_parser("event")
     p.add_argument("event")
@@ -3575,12 +4131,15 @@ def main():
     if state_path.is_file() and args.command not in {"migrate-run", "migrate-v2"}:
         existing_state = load_json(state_path)
         version = existing_state.get("schema_version")
-        if version != 5:
+        if version != 6:
             raise SystemExit(
                 f"error: run schema {version!r} is unsupported; run migrate-run first"
             )
         if (existing_state.get("publication_seal")
-                and args.command not in {"decision-check", "finish", "show", "status"}):
+                and args.command not in {
+                    "decision-check", "reversibility-subject",
+                    "finish", "show", "status",
+                }):
             raise SystemExit(
                 "error: publication seal freezes READY state and gate mutations"
             )

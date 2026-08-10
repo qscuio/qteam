@@ -7,6 +7,39 @@ Autoresearch while keeping exactly one orchestration authority.
 The core rule is simple: roles are created only for distinct permission,
 context, output, or lifecycle boundaries; reusable practices remain skills.
 
+## What changed in 0.11
+
+- Writable workers and reviewer runners now use Codex JSONL mode and retain a
+  compact trajectory summary: tool-call counts, failed/empty/duplicate-call
+  anomalies, token usage, execution identity, runner version, and a trace
+  digest. Raw commands, tool output, and private reasoning stay out of review
+  packets, so trajectory evidence does not turn quality review into a token-heavy
+  log replay.
+- Review execution is pinned separately from worker execution by model,
+  reasoning effort, provider, family, and Codex CLI version. Every review packet
+  includes two transparent axis-specific calibration canaries; these catch
+  inconsistent grading but are not secret/adversarial benchmarks. A receipt is
+  invalid if the judge cannot classify them correctly. Packets state whether generator and
+  judge families are actually independent instead of merely assuming they are.
+- Task facts now derive a reversibility class that a declaration may raise but
+  never lower: `contained-reversible`, `wide-reversible`, or
+  `hard-to-reverse`. The corresponding lane is frozen in task/wave policy;
+  hard-to-reverse delivery additionally requires an allowed user `finish`
+  decision bound to the exact integration head and hard-task policy snapshot.
+- Confirmed user corrections, trajectory anomalies, review findings, rollbacks,
+  and tool failures can become typed eval cases. Harvest and import verify the
+  referenced regular file, run identity, exact evidence hash, and coordinator
+  approval event before an approved case enters durable eval knowledge. The
+  distiller can create candidates but cannot approve them. This is trace-to-eval, not raw
+  session-memory accumulation.
+
+Approve a harvested eval explicitly before import:
+
+```bash
+.codex/bin/agent-team-state --run <run-id> learning-item-decision <item-id> \
+  --outcome approved --evidence '<bounded coordinator evidence>'
+```
+
 ## What changed in 0.10
 
 - Spec review now begins with a deterministic artifact preflight. Typed QTeam
@@ -262,7 +295,7 @@ bind each run to its mechanical dependency gate:
 .codex/bin/agent-team-artifact epic-complete-run --epic platform --run foundation
 ```
 
-To resume an unfinished legacy schema-version-2/3/4 run,
+To resume an unfinished legacy schema-version-2/3/4/5 run,
 migrate it atomically first:
 
 ```bash
@@ -277,8 +310,10 @@ until then.
 Register repository-specific shared surfaces at `init` with repeatable
 `--shared-surface <glob>`; any task allowed to touch one must be explicitly
 declared serial, and the runtime gate checks the actual changed paths.
-The run's model names can be configured with `--model-economy`,
-`--model-standard`, and `--model-deep`; task workers never override the derived
+The run's worker model names can be configured with `--model-economy`,
+`--model-standard`, and `--model-deep`; reviewer models are independently
+configured with `--review-model-economy`, `--review-model-standard`, and
+`--review-model-deep`. Workers and reviewers never override the frozen derived
 tier themselves.
 
 ## Execution model
@@ -337,7 +372,7 @@ Read-only reviewers return structured findings and closure decisions; the
 runner atomically records a valid `needs-fix` result with reviewer identity.
 Fix tasks address findings.
 Each reviewer also writes a bounded result such as
-`{"axis":"spec","verdict":"pass","findings":[],"resolved_ids":[],"invalid_ids":[],"upheld_ids":[],"invalid_evidence":{}}`. Launch the reviewer through
+`{"axis":"spec","verdict":"pass","trajectory_verdict":"pass","calibration_results":{"cal-spec-01":"pass","cal-spec-02":"needs-fix"},"findings":[],"resolved_ids":[],"invalid_ids":[],"upheld_ids":[],"invalid_evidence":{}}`. Launch the reviewer through
 the read-only runner so the actual model, reasoning, packet digest, invocation,
 and output are captured:
 

@@ -2,10 +2,16 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://qteam.local/schemas/review-result.schema.json",
   "type": "object",
-  "required": ["axis", "verdict", "findings", "resolved_ids", "invalid_ids", "upheld_ids", "invalid_evidence"],
+  "required": ["axis", "verdict", "trajectory_verdict", "calibration_results", "findings", "resolved_ids", "invalid_ids", "upheld_ids", "invalid_evidence"],
   "properties": {
     "axis": {"enum": ["spec", "standards", "risk"]},
     "verdict": {"enum": ["pass", "needs-fix"]},
+    "trajectory_verdict": {"enum": ["pass", "needs-fix"]},
+    "calibration_results": {
+      "type": "object",
+      "minProperties": 2,
+      "additionalProperties": {"enum": ["pass", "needs-fix"]}
+    },
     "findings": {
       "type": "array",
       "uniqueItems": true,
@@ -38,7 +44,7 @@
   "allOf": [
     {
       "if": {"properties": {"verdict": {"const": "pass"}}},
-      "then": {"properties": {"findings": {"maxItems": 0}, "upheld_ids": {"maxItems": 0}}}
+      "then": {"properties": {"trajectory_verdict": {"const": "pass"}, "findings": {"maxItems": 0}, "upheld_ids": {"maxItems": 0}}}
     },
     {
       "if": {"properties": {"verdict": {"const": "needs-fix"}}},

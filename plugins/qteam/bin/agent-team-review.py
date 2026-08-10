@@ -2,10 +2,10 @@
 """Create immutable review packets and maintain machine-readable findings."""
 
 import argparse
-import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -23,7 +23,15 @@ from agent_team_policy import (
     REVIEW_INTENSITY_INSTRUCTIONS,
     review_contract_digest, safe_identifier,
 )
-from agent_team_artifact import ArtifactError, lint_documents
+from agent_team_artifact import (
+    ArtifactError, lint_documents, locked_regular, safe_regular,
+)
+from agent_team_eval import (
+    calibration_suite, codex_version, parse_codex_trace,
+    read_bounded_json_object, regular_output, run_regular_file,
+    trajectory_independence, validate_calibration,
+    validate_trajectory, wave_trajectory, wait_capped_process,
+)
 
 AXES = {"spec", "standards", "risk"}
 SEVERITIES = {"P0", "P1", "P2", "P3"}
@@ -58,15 +66,29 @@ def run_dir(repo, value):
 
 def read(path):
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        raise SystemExit(f"error: missing {path}")
-    except json.JSONDecodeError as exc:
-        raise SystemExit(f"error: invalid JSON in {path}: {exc}")
+        return read_bounded_json_object(path, f"review artifact {path.name}")
+    except ValueError as exc:
+        raise SystemExit(f"error: {exc}")
+
+
+def safe_directory(path, label, *, create=False):
+    directory = Path(path)
+    if directory.is_symlink():
+        raise SystemExit(f"error: {label} must not be a symlink")
+    if not directory.exists() and create:
+        parent = directory.parent
+        if (parent.is_symlink() or not parent.is_dir()
+                or parent.resolve() != parent.absolute()):
+            raise SystemExit(f"error: {label} parent is not a real directory")
+        directory.mkdir()
+    if (not directory.is_dir()
+            or directory.resolve() != directory.absolute()):
+        raise SystemExit(f"error: {label} must be a real directory")
+    return directory
 
 
 def write(path, value):
-    path.parent.mkdir(parents=True, exist_ok=True)
+    safe_directory(path.parent, "review artifact directory", create=True)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as out:
@@ -89,7 +111,7 @@ def snapshot_sources(repo, run, sources):
     """Freeze review inputs so a later edit cannot change what was reviewed."""
     records = []
     snapshot_dir = run / "reviews" / "sources"
-    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    safe_directory(snapshot_dir, "review source directory", create=True)
     for source in sources:
         source_path = ((repo / source).resolve() if not Path(source).is_absolute()
                        else Path(source).resolve())
@@ -124,16 +146,37 @@ def snapshot_sources(repo, run, sources):
 
 
 def review_result(path, expected_axis, require_pass=True):
-    result_path = Path(path).resolve()
-    if result_path.is_symlink() or not result_path.is_file():
+    raw_path = Path(path)
+    if raw_path.is_symlink():
+        raise SystemExit("error: --result must be a regular JSON file")
+    result_path = raw_path.resolve()
+    if not result_path.is_file():
         raise SystemExit("error: --result must be a regular JSON file")
     result = read(result_path)
     if not isinstance(result, dict):
         raise SystemExit("error: review result must be a JSON object")
+    result_fields = {
+        "axis", "verdict", "trajectory_verdict", "calibration_results",
+        "findings", "resolved_ids", "invalid_ids", "upheld_ids",
+        "invalid_evidence",
+    }
+    if set(result) != result_fields:
+        raise SystemExit("error: review result has unknown or missing fields")
     if result.get("axis") != expected_axis:
         raise SystemExit("error: review result axis does not match ledger")
     if result.get("verdict") not in {"pass", "needs-fix"}:
         raise SystemExit("error: review result verdict must be pass or needs-fix")
+    if result.get("trajectory_verdict") not in {"pass", "needs-fix"}:
+        raise SystemExit("error: review result trajectory_verdict must be pass or needs-fix")
+    if (result.get("verdict") == "pass"
+            and result.get("trajectory_verdict") != "pass"):
+        raise SystemExit("error: a passing review must pass the trajectory evidence")
+    calibration_results = result.get("calibration_results")
+    if (not isinstance(calibration_results, dict) or not calibration_results
+            or any(not safe_identity(key) for key in calibration_results)
+            or any(value not in {"pass", "needs-fix"}
+                   for value in calibration_results.values())):
+        raise SystemExit("error: review result needs bounded calibration_results")
     if require_pass and result.get("verdict") != "pass":
         raise SystemExit("error: review result verdict must be pass before completion")
     if not isinstance(result.get("findings"), list):
@@ -142,6 +185,12 @@ def review_result(path, expected_axis, require_pass=True):
            or not isinstance(item.get("id"), str) or not item["id"]
            for item in result["findings"]):
         raise SystemExit("error: every review result finding needs a non-empty id")
+    finding_fields = {
+        "id", "severity", "title", "review_evidence", "impact",
+        "fix_direction", "owner", "file", "line",
+    }
+    if any(set(item) - finding_fields for item in result["findings"]):
+        raise SystemExit("error: review result finding has unknown fields")
     finding_ids = [item["id"] for item in result["findings"]]
     if (len(finding_ids) != len(set(finding_ids))
             or any(not safe_identity(item) for item in finding_ids)):
@@ -205,6 +254,16 @@ def safe_identity(value):
     return safe_identifier(value)
 
 
+def receipt_paths_match_session(receipt):
+    session = receipt.get("session_id") if isinstance(receipt, dict) else None
+    return bool(safe_identity(session) and
+                receipt.get("result") == f"reviews/results/{session}.json" and
+                receipt.get("stdout_log")
+                == f"reviews/logs/{session}.stdout.log" and
+                receipt.get("stderr_log")
+                == f"reviews/logs/{session}.stderr.log")
+
+
 def validate_nonempty_finding_fields(finding, fields):
     invalid = [field for field in fields
                if not isinstance(finding.get(field), str) or not finding[field]]
@@ -241,20 +300,26 @@ def wave_policy_for(state, wave):
         "execution_tier": "standard", "review_intensity": "full",
         "require_risk_review": bool(state.get("risk_forced")),
         "risk_flags": [], "tasks": [],
+        "reversibility": "contained-reversible",
+        "integration_lane": "shadow",
+        "require_user_finish_decision": False,
     }
 
 
 def review_execution_for(state, wave_policy):
     tier = wave_policy.get("execution_tier")
-    profiles = state.get("model_profiles")
+    profiles = state.get("review_model_profiles")
     profile = profiles.get(tier) if isinstance(profiles, dict) else None
     if (tier not in {"economy", "standard", "deep"}
             or not isinstance(profile, dict)
             or not isinstance(profile.get("model"), str) or not profile["model"]
-            or profile.get("thinking") not in THINKING_LEVELS):
+            or profile.get("thinking") not in THINKING_LEVELS
+            or not isinstance(profile.get("provider"), str) or not profile["provider"]
+            or not isinstance(profile.get("family"), str) or not profile["family"]):
         raise SystemExit("error: run has an invalid model profile for review tier")
     return {"tier": tier, "model": profile["model"],
-            "thinking": profile["thinking"]}
+            "thinking": profile["thinking"],
+            "provider": profile["provider"], "family": profile["family"]}
 
 
 def packet_matches_policy(packet, state, wave_policy):
@@ -264,6 +329,10 @@ def packet_matches_policy(packet, state, wave_policy):
         and packet.get("review_intensity") == wave_policy.get("review_intensity")
         and packet.get("risk_flags") == wave_policy.get("risk_flags", [])
         and packet.get("review_execution") == expected_execution
+        and isinstance(packet.get("runner"), dict)
+        and packet.get("runner", {}).get("name") == "codex-cli"
+        and isinstance(packet.get("runner", {}).get("version"), str)
+        and bool(packet.get("runner", {}).get("version"))
         and packet.get("review_contract_sha256") == review_contract_digest(
             packet.get("axis"), wave_policy.get("review_intensity")
         )
@@ -272,7 +341,7 @@ def packet_matches_policy(packet, state, wave_policy):
 
 def validate_source_snapshots(run, packet):
     packet_schema = packet.get("schema_version")
-    if packet_schema not in {1, 2}:
+    if packet_schema not in {1, 2, 3}:
         raise SystemExit("error: unsupported review packet schema")
     source_root = (run / "reviews" / "sources").resolve()
     absolute = []
@@ -334,15 +403,39 @@ def validate_completed_review(run, path, ledger):
     if result_path.parent != result_root:
         raise SystemExit("error: completed review result escaped its directory")
     result, result_sha = review_result(result_path, packet.get("axis"))
+    if packet.get("schema_version") == 3:
+        try:
+            validate_calibration(
+                packet.get("axis"), packet.get("calibration", {}).get("sha256"),
+                result.get("calibration_results"),
+            )
+            trace_path = run_regular_file(run, receipt.get("stdout_log"))
+            validate_trajectory(
+                receipt.get("trajectory"), "review", receipt.get("session_id"),
+                receipt.get("execution"), trace_path,
+            )
+            if receipt.get("trajectory", {}).get("runner") != receipt.get("runner"):
+                raise ValueError("review trajectory runner differs from its receipt")
+            if receipt.get("trajectory", {}).get("disposition") != "pass":
+                raise ValueError("review trajectory requires escalation")
+        except ValueError as exc:
+            raise SystemExit(f"error: completed review evaluation failure: {exc}")
     if (receipt.get("status") != "passed" or receipt.get("exit_code") != 0
+            or not receipt_paths_match_session(receipt)
             or receipt.get("ledger") != str(path.relative_to(run))
             or receipt.get("packet_sha256") != object_sha256(packet)
             or receipt.get("ledger_findings_sha256")
             != object_sha256(ledger.get("findings", []))
             or receipt.get("review_contract_sha256")
             != packet.get("review_contract_sha256")
+            or (packet.get("schema_version") == 3
+                and receipt.get("calibration_sha256")
+                != packet.get("calibration", {}).get("sha256"))
             or receipt.get("review_head_sha") != packet.get("head_sha")
             or receipt.get("execution") != packet.get("review_execution")
+            or (packet.get("schema_version") == 3
+                and (receipt.get("runner") != packet.get("runner")
+                     or not isinstance(receipt.get("trajectory"), dict)))
             or receipt.get("reviewer") != attestation.get("reviewer")
             or receipt.get("session_id") != attestation.get("session_id")
             or receipt.get("result_sha256") != result_sha
@@ -368,24 +461,300 @@ def checked_ledger_path(repo, value):
 @contextmanager
 def review_lock(review_dir):
     run = review_dir.parent
-    review_dir.mkdir(parents=True, exist_ok=True)
+    if (review_dir.name != "reviews" or review_dir.is_symlink()
+            or (review_dir.exists() and not review_dir.is_dir())):
+        raise SystemExit("error: review root must be a real run directory")
+    safe_directory(review_dir, "review root", create=True)
     # Publication sealing and review commits share the run-state lock.  A review
     # may spend minutes in an external read-only reviewer without holding it, so
     # every artifact/ledger commit re-enters here and checks the seal atomically.
-    with (run / ".state.lock").open("a+", encoding="utf-8") as state_lock:
-        fcntl.flock(state_lock, fcntl.LOCK_EX)
-        state = read(run / "state.json")
-        if state.get("publication_seal"):
-            raise SystemExit(
-                "error: publication seal freezes review packets and findings"
+    try:
+        with locked_regular(run / ".state.lock", "run state lock"):
+            try:
+                safe_regular(run / "state.json", "run state", required=True)
+            except ArtifactError as exc:
+                raise SystemExit(f"error: {exc}")
+            state = read(run / "state.json")
+            if state.get("publication_seal"):
+                raise SystemExit(
+                    "error: publication seal freezes review packets and findings"
+                )
+            with locked_regular(review_dir / ".ledger.lock", "review ledger lock"):
+                recover_review_transaction(review_dir)
+                yield
+    except ArtifactError as exc:
+        raise SystemExit(f"error: {exc}")
+
+
+LEDGER_NAME = re.compile(
+    r"^wave-([1-9][0-9]*)-(spec|standards|risk)(?:-r([1-9][0-9]*))?\.json$"
+)
+
+
+def validate_ledger_transition(current, updated):
+    allowed = {
+        "packet", "findings", "completed_at", "review_attempts",
+        "completed_by", "attestation",
+    }
+    if (not isinstance(current, dict) or not isinstance(updated, dict)
+            or not set(current) <= allowed or not set(updated) <= allowed
+            or current.get("packet") != updated.get("packet")):
+        raise SystemExit(
+            "error: review closure transaction changed an immutable packet"
+        )
+    old_findings = current.get("findings")
+    new_findings = updated.get("findings")
+    if (not isinstance(old_findings, list) or not isinstance(new_findings, list)
+            or len(new_findings) < len(old_findings)):
+        raise SystemExit("error: review closure transaction removed findings")
+    mutable = {"status", "resolution", "evidence", "reviewer", "resolved_at"}
+    for old, new in zip(old_findings, new_findings):
+        if not isinstance(old, dict) or not isinstance(new, dict):
+            raise SystemExit("error: invalid finding in review transaction")
+        if any(old.get(key) != new.get(key)
+               for key in set(old) | set(new) if key not in mutable):
+            raise SystemExit("error: review transaction changed finding identity")
+        old_status = old.get("status")
+        new_status = new.get("status")
+        if old_status == new_status:
+            if old != new:
+                raise SystemExit("error: review transaction changed a stable finding")
+        elif not (old_status == "open" and new_status in {"resolved", "invalid"}
+                  and isinstance(new.get("resolution"), str)
+                  and new.get("resolution")
+                  and isinstance(new.get("evidence"), str)
+                  and new.get("evidence")
+                  and isinstance(new.get("reviewer"), str)
+                  and new.get("reviewer")
+                  and isinstance(new.get("resolved_at"), str)
+                  and new.get("resolved_at")):
+            raise SystemExit("error: invalid review finding state transition")
+    for finding in new_findings[len(old_findings):]:
+        if (not isinstance(finding, dict) or finding.get("status") != "open"
+                or not isinstance(finding.get("id"), str) or not finding["id"]):
+            raise SystemExit("error: invalid appended review finding")
+
+    old_attempts = current.get("review_attempts", [])
+    new_attempts = updated.get("review_attempts", [])
+    if (not isinstance(old_attempts, list) or not isinstance(new_attempts, list)
+            or len(new_attempts) not in {len(old_attempts), len(old_attempts) + 1}
+            or new_attempts[:len(old_attempts)] != old_attempts
+            or any(not isinstance(item, dict) for item in new_attempts)):
+        raise SystemExit("error: invalid review-attempt transition")
+    appended = new_findings[len(old_findings):]
+    if len(new_attempts) > len(old_attempts):
+        attempt = new_attempts[-1] if len(new_attempts) > len(old_attempts) else None
+        if (not isinstance(attempt, dict)
+                or attempt.get("status") != "needs-fix"
+                or attempt.get("finding_ids")
+                != [finding.get("id") for finding in appended]):
+            raise SystemExit("error: appended findings lack their bound review attempt")
+    elif appended:
+        raise SystemExit("error: appended findings lack their bound review attempt")
+
+    old_completed = current.get("completed_at")
+    new_completed = updated.get("completed_at")
+    if old_completed:
+        if updated != current:
+            raise SystemExit("error: completed review ledger is immutable")
+    elif new_completed is not None:
+        if (not isinstance(new_completed, str) or not new_completed
+                or not isinstance(updated.get("completed_by"), str)
+                or not updated["completed_by"]
+                or not isinstance(updated.get("attestation"), dict)):
+            raise SystemExit("error: invalid review completion transition")
+    elif ("completed_by" in updated or "attestation" in updated):
+        raise SystemExit("error: incomplete review cannot carry an attestation")
+
+
+def validate_receipt_transition(path, updated):
+    if not path.exists():
+        return
+    current = read(path)
+    if current == updated:
+        return
+    immutable = {
+        "schema_version", "ledger", "packet_sha256",
+        "ledger_findings_sha256", "review_contract_sha256",
+        "calibration_sha256", "review_head_sha", "reviewer", "session_id",
+        "execution", "runner", "result", "stdout_log", "stderr_log",
+        "started_at",
+    }
+    if (not isinstance(current, dict) or current.get("status") != "running"
+            or updated.get("status") != "needs-fix"
+            or updated.get("exit_code") != 0
+            or any(current.get(key) != updated.get(key) for key in immutable)
+            or not isinstance(updated.get("result_sha256"), str)
+            or not isinstance(updated.get("trajectory"), dict)
+            or not isinstance(updated.get("completed_at"), str)):
+        raise SystemExit(
+            "error: review closure transaction changed an existing receipt"
+        )
+
+
+def validate_review_transaction(review_dir, transaction):
+    if (not isinstance(transaction, dict)
+            or set(transaction) != {"schema_version", "txid", "writes"}
+            or transaction.get("schema_version") != 1
+            or not isinstance(transaction.get("txid"), str)
+            or re.fullmatch(r"[0-9a-f]{32}", transaction["txid"]) is None
+            or not isinstance(transaction.get("writes"), dict)
+            or not transaction["writes"]):
+        raise SystemExit("error: invalid review closure transaction")
+    for relative, value in transaction["writes"].items():
+        match = LEDGER_NAME.fullmatch(relative) if isinstance(relative, str) else None
+        receipt_match = (re.fullmatch(
+            r"receipts/((?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._-]*)\.json",
+            relative,
+        ) if isinstance(relative, str) else None)
+        if not isinstance(value, dict) or (not match and not receipt_match):
+            raise SystemExit("error: invalid review closure transaction write-set")
+        if receipt_match:
+            path = review_dir / relative
+            try:
+                safe_regular(path, "review transaction receipt")
+            except ArtifactError as exc:
+                raise SystemExit(f"error: {exc}")
+            ledger_relative = value.get("ledger")
+            if (value.get("schema_version") != 1
+                    or value.get("status") != "needs-fix"
+                    or not receipt_paths_match_session(value)
+                    or value.get("session_id") != receipt_match.group(1)
+                    or not isinstance(ledger_relative, str)
+                    or not ledger_relative.startswith("reviews/")
+                    or ledger_relative[len("reviews/"):]
+                    not in transaction["writes"]):
+                raise SystemExit("error: invalid review receipt in closure transaction")
+            validate_receipt_transition(path, value)
+            continue
+        path = review_dir / relative
+        try:
+            safe_regular(path, "review transaction ledger", required=True)
+        except ArtifactError as exc:
+            raise SystemExit(f"error: {exc}")
+        packet = value.get("packet")
+        findings = value.get("findings")
+        if (not isinstance(packet, dict) or not isinstance(findings, list)
+                or "completed_at" not in value
+                or packet.get("wave") != int(match.group(1))
+                or packet.get("axis") != match.group(2)
+                or packet.get("iteration", 1)
+                != (int(match.group(3)) if match.group(3) else 1)
+                or any(not isinstance(finding, dict) for finding in findings)):
+            raise SystemExit("error: invalid review ledger in closure transaction")
+        current = read(path)
+        validate_ledger_transition(current, value)
+        if value.get("completed_at"):
+            validate_completed_review(review_dir.parent, path, value)
+    receipt_writes = [
+        (relative, value) for relative, value in transaction["writes"].items()
+        if relative.startswith("receipts/")
+    ]
+    ledger_writes = [
+        (relative, value) for relative, value in transaction["writes"].items()
+        if LEDGER_NAME.fullmatch(relative)
+    ]
+    if receipt_writes:
+        if len(receipt_writes) != 1 or len(ledger_writes) != 1:
+            raise SystemExit("error: needs-fix transaction needs one ledger and receipt")
+        receipt_relative, receipt = receipt_writes[0]
+        ledger_relative, updated = ledger_writes[0]
+        if receipt.get("ledger") != f"reviews/{ledger_relative}":
+            raise SystemExit("error: review receipt is not bound to its ledger write")
+        current = read(review_dir / ledger_relative)
+        old_count = len(current.get("findings", []))
+        appended_ids = [item.get("id")
+                        for item in updated.get("findings", [])[old_count:]]
+        attempts = updated.get("review_attempts", [])
+        attempt = attempts[-1] if attempts else None
+        if current == updated and isinstance(attempt, dict):
+            appended_ids = attempt.get("finding_ids", [])
+        result_path = (review_dir.parent / receipt.get("result", "")).resolve()
+        if result_path.parent != (review_dir / "results").resolve():
+            raise SystemExit("error: needs-fix result escaped its directory")
+        result, result_sha = review_result(
+            result_path, updated.get("packet", {}).get("axis"),
+            require_pass=False,
+        )
+        try:
+            trace_path = run_regular_file(
+                review_dir.parent, receipt.get("stdout_log")
             )
-        with (review_dir / ".ledger.lock").open("a+", encoding="utf-8") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            recover_review_transaction(review_dir)
-            yield
+            validate_trajectory(
+                receipt.get("trajectory"), "review", receipt.get("session_id"),
+                receipt.get("execution"), trace_path,
+            )
+        except ValueError as exc:
+            raise SystemExit(f"error: invalid needs-fix trajectory: {exc}")
+        if (result.get("verdict") != "needs-fix"
+                or [item.get("id") for item in result.get("findings", [])]
+                != appended_ids
+                or receipt.get("result_sha256") != result_sha
+                or receipt.get("trajectory", {}).get("disposition") != "pass"
+                or receipt.get("trajectory", {}).get("runner")
+                != receipt.get("runner")
+                or receipt.get("execution")
+                != updated.get("packet", {}).get("review_execution")
+                or receipt.get("runner") != updated.get("packet", {}).get("runner")
+                or receipt.get("packet_sha256")
+                != object_sha256(updated.get("packet"))
+                or (current != updated
+                    and receipt.get("ledger_findings_sha256")
+                    != object_sha256(current.get("findings", [])))
+                or not isinstance(attempt, dict)
+                or attempt.get("session_id") != receipt.get("session_id")
+                or attempt.get("reviewer") != receipt.get("reviewer")
+                or attempt.get("result_sha256") != result_sha
+                or attempt.get("finding_ids") != appended_ids
+                or attempt.get("receipt") != f"reviews/{receipt_relative}"
+                or attempt.get("receipt_sha256") != json_file_sha256(receipt)):
+            raise SystemExit("error: needs-fix ledger/receipt binding is invalid")
+    else:
+        completed = []
+        for relative, updated in ledger_writes:
+            current = read(review_dir / relative)
+            if updated.get("completed_at"):
+                completed.append((relative, updated))
+        if len(completed) != 1:
+            raise SystemExit(
+                "error: closure transaction must complete exactly one ledger"
+            )
+        completed_relative, completed_ledger = completed[0]
+        packet = completed_ledger.get("packet", {})
+        result = completed_ledger.get("attestation", {}).get("result", {})
+        expected = {completed_relative}
+        closure_by_ledger = {}
+        for item in packet.get("closure_findings", []):
+            ledger = item.get("ledger")
+            if isinstance(ledger, str) and ledger.startswith("reviews/"):
+                closure_by_ledger.setdefault(ledger[len("reviews/"):], set()).add(
+                    item.get("id")
+                )
+        expected.update(closure_by_ledger)
+        if {relative for relative, _ in ledger_writes} != expected:
+            raise SystemExit("error: closure transaction write-set differs from packet")
+        resolved = set(result.get("resolved_ids", []))
+        invalid = set(result.get("invalid_ids", []))
+        for relative, ids in closure_by_ledger.items():
+            old = read(review_dir / relative)
+            new = transaction["writes"][relative]
+            changed = {
+                after.get("id") for before, after in zip(
+                    old.get("findings", []), new.get("findings", [])
+                ) if before != after
+            }
+            if not changed <= ids or any(
+                    item.get("status") != (
+                        "resolved" if item.get("id") in resolved else "invalid"
+                    )
+                    for item in new.get("findings", []) if item.get("id") in ids
+                ) or ids != (ids & (resolved | invalid)):
+                raise SystemExit("error: closure findings differ from frozen packet")
+    return transaction
 
 
 def apply_review_transaction(review_dir, transaction):
+    validate_review_transaction(review_dir, transaction)
     fault_after = os.environ.get("QTEAM_FAULT_AFTER_REVIEW_WRITES")
     fault_after = int(fault_after) if fault_after else None
     completed = 0
@@ -403,7 +772,12 @@ def recover_review_transaction(review_dir):
     intent = review_dir / ".closure-transaction.json"
     if not intent.exists():
         return
-    apply_review_transaction(review_dir, read(intent))
+    try:
+        safe_regular(intent, "review closure transaction", required=True)
+    except ArtifactError as exc:
+        raise SystemExit(f"error: {exc}")
+    transaction = validate_review_transaction(review_dir, read(intent))
+    apply_review_transaction(review_dir, transaction)
     intent.unlink()
     fd_dir = os.open(review_dir, os.O_RDONLY)
     try:
@@ -420,6 +794,11 @@ def commit_review_transaction(review_dir, writes):
                    for path, value in writes.items()},
     }
     intent = review_dir / ".closure-transaction.json"
+    try:
+        safe_regular(intent, "review closure transaction")
+    except ArtifactError as exc:
+        raise SystemExit(f"error: {exc}")
+    validate_review_transaction(review_dir, transaction)
     write(intent, transaction)
     apply_review_transaction(review_dir, transaction)
     intent.unlink()
@@ -542,8 +921,14 @@ def cmd_create(args, repo, run):
         spec_sources = snapshot_sources(repo, run, args.spec_source)
         standards_sources = snapshot_sources(repo, run, args.standards_source)
         digest_sources = snapshot_sources(repo, run, args.digest_source)
+    try:
+        trajectory = wave_trajectory(run, state, args.wave, base, head)
+        calibration = calibration_suite(args.axis)
+        runner_version = codex_version()
+    except ValueError as exc:
+        raise SystemExit(f"error: cannot freeze review evaluation evidence: {exc}")
     packet = {
-        "schema_version": 2,
+        "schema_version": 3,
         "run_id": run.name,
         "wave": args.wave,
         "axis": args.axis,
@@ -551,9 +936,20 @@ def cmd_create(args, repo, run):
         "scope": args.scope,
         "execution_tier": wave_policy["execution_tier"],
         "review_execution": execution,
+        "runner": {"name": "codex-cli", "version": runner_version},
+        "generator_families": sorted({
+            item.get("execution", {}).get("family")
+            for item in trajectory["worker_trajectories"]
+            if item.get("execution", {}).get("family")
+        }),
+        "judge_independence": (
+            trajectory_independence(trajectory, execution["family"])
+        ),
         "review_contract_sha256": review_contract_digest(
             args.axis, wave_policy["review_intensity"]
         ),
+        "calibration": calibration,
+        "trajectory": trajectory,
         "review_intensity": wave_policy["review_intensity"],
         "risk_flags": wave_policy.get("risk_flags", []),
         "closure_findings": closure_findings,
@@ -576,8 +972,31 @@ def cmd_create(args, repo, run):
             old = read(path)
             old_packet = old.get("packet", {})
             stable_keys = [key for key in packet if key != "created_at"]
-            if any(old_packet.get(key) != packet[key] for key in stable_keys):
-                raise SystemExit(f"error: review packet already exists with different immutable inputs: {path}")
+            changed = {
+                key for key in stable_keys
+                if old_packet.get(key) != packet[key]
+            }
+            if changed:
+                receipts = []
+                for receipt_path in (run / "reviews" / "receipts").glob("*.json"):
+                    try:
+                        candidate = read(receipt_path)
+                    except (SystemExit, AttributeError):
+                        receipts.append(receipt_path)
+                        continue
+                    if candidate.get("ledger") == str(path.relative_to(run)):
+                        receipts.append(receipt_path)
+                inactive = (
+                    not old.get("findings") and not old.get("review_attempts")
+                    and not old.get("completed_at") and not receipts
+                )
+                if not (args.refresh_runner and changed == {"runner"} and inactive):
+                    raise SystemExit(
+                        "error: review packet already exists with different "
+                        f"immutable inputs: {path}"
+                    )
+                old["packet"] = packet
+                write(path, old)
             print(path)
             return
         write(path, {"packet": packet, "findings": [], "completed_at": None})
@@ -600,6 +1019,37 @@ def cmd_run(args, repo, _run):
         policy = wave_policy_for(state, packet.get("wave"))
         if not packet_matches_policy(packet, state, policy):
             raise SystemExit("error: review packet no longer matches run wave policy")
+        try:
+            packet_trajectory = packet.get("trajectory")
+            if not isinstance(packet_trajectory, dict):
+                raise ValueError("review packet trajectory must be an object")
+            expected_trajectory = wave_trajectory(
+                run, state, packet["wave"], packet["base_sha"], packet["head_sha"],
+                task_ids=packet_trajectory.get("tasks"),
+            )
+            expected_calibration = calibration_suite(packet["axis"])
+            runner_version = codex_version()
+        except ValueError as exc:
+            raise SystemExit(f"error: invalid review evaluation evidence: {exc}")
+        expected_families = sorted({
+            item.get("execution", {}).get("family")
+            for item in expected_trajectory["worker_trajectories"]
+            if item.get("execution", {}).get("family")
+        })
+        expected_independence = trajectory_independence(
+            expected_trajectory, packet["review_execution"]["family"]
+        )
+        if (packet.get("trajectory") != expected_trajectory
+                or packet.get("calibration") != expected_calibration
+                or packet.get("generator_families") != expected_families
+                or packet.get("judge_independence") != expected_independence):
+            raise SystemExit("error: review trajectory/calibration evidence is stale")
+        if packet.get("runner") != {
+                "name": "codex-cli", "version": runner_version}:
+            raise SystemExit(
+                "error: Codex runner version changed since packet creation; "
+                "refresh the unstarted packet"
+            )
         source_paths = validate_source_snapshots(run, packet)
         packet_sha = object_sha256(packet)
         findings_sha = object_sha256(ledger.get("findings", []))
@@ -619,19 +1069,23 @@ def cmd_run(args, repo, _run):
                 return
         if receipt.exists() or result.exists():
             raise SystemExit("error: reviewer session/result already exists")
-        result.parent.mkdir(parents=True, exist_ok=True)
-        stdout_log.parent.mkdir(parents=True, exist_ok=True)
+        safe_directory(result.parent, "review result directory", create=True)
+        safe_directory(stdout_log.parent, "review log directory", create=True)
+        started_at = now()
         write(receipt, {
             "schema_version": 1, "status": "running",
             "ledger": str(path.relative_to(run)), "packet_sha256": packet_sha,
             "ledger_findings_sha256": findings_sha,
             "review_contract_sha256": packet["review_contract_sha256"],
+            "calibration_sha256": packet["calibration"]["sha256"],
             "review_head_sha": packet["head_sha"],
             "reviewer": args.reviewer, "session_id": args.session_id,
-            "execution": execution, "result": str(result.relative_to(run)),
+            "execution": execution,
+            "runner": packet["runner"],
+            "result": str(result.relative_to(run)),
             "stdout_log": str(stdout_log.relative_to(run)),
             "stderr_log": str(stderr_log.relative_to(run)),
-            "started_at": now(),
+            "started_at": started_at,
         })
     closure_ids = [item["id"] for item in packet.get("closure_findings", [])]
     if packet.get("artifact_lint") is None:
@@ -653,6 +1107,13 @@ def cmd_run(args, repo, _run):
         f"{REVIEW_INTENSITY_INSTRUCTIONS[packet['review_intensity']]} "
         f"{REVIEW_FINDING_INSTRUCTIONS} "
         f"{lint_guidance}"
+        "The packet contains a compact trajectory report. Inspect its anomaly codes, "
+        "coverage, state-event digest, and worker summaries; do not request or restate "
+        "raw tool logs unless a concrete anomaly requires a finding. A passing review "
+        "must return trajectory_verdict=pass. "
+        "Classify each frozen calibration canary as pass or needs-fix and return "
+        "those labels in calibration_results. This is a consistency check, not a "
+        "secret or adversarial benchmark. "
         f"Read these frozen packet snapshots by absolute path: {source_paths}. "
         "Inspect the affected diff from this exact detached reviewed HEAD; obey "
         "review_intensity and risk_flags. Return JSON only. If defects exist, use "
@@ -660,8 +1121,12 @@ def cmd_run(args, repo, _run):
         "\"needs-fix\",\"findings\":[{\"id\":<stable-id>,\"severity\":<P0-P3>,"
         "\"title\":<title>,\"review_evidence\":<evidence>,\"impact\":<impact>,"
         "\"fix_direction\":<owned-fix>,\"owner\":<owner>}],\"resolved_ids\":[],"
+        "\"trajectory_verdict\":\"pass\","
+        "\"calibration_results\":{<case-id>:<pass-or-needs-fix>},"
         "\"invalid_ids\":[],\"upheld_ids\":[],\"invalid_evidence\":{}} "
-        "so the coordinator can record them. Use verdict pass with findings [] only "
+        "so the coordinator can record them. Change trajectory_verdict to needs-fix "
+        "only when trajectory evidence materially contributes to the defect. "
+        "Use verdict pass with findings [] only "
         "when the reviewed range has no unresolved valid defect. "
         f"{REVIEW_CLOSURE_INSTRUCTIONS} "
         f"Frozen closure set: {closure_ids}. "
@@ -674,6 +1139,9 @@ def cmd_run(args, repo, _run):
     env["QTEAM_REVIEW_INVALID_IDS"] = "[]"
     env["QTEAM_REVIEW_INVALID_EVIDENCE"] = "{}"
     env["QTEAM_REVIEW_UPHELD_IDS"] = "[]"
+    env["QTEAM_REVIEW_CALIBRATION_CASE_IDS"] = json.dumps(
+        [item["id"] for item in packet["calibration"]["cases"]]
+    )
     if packet.get("scope") == "dispute":
         env["QTEAM_REVIEW_RESOLVED_IDS"] = "[]"
         env["QTEAM_REVIEW_INVALID_IDS"] = json.dumps(closure_ids)
@@ -681,20 +1149,43 @@ def cmd_run(args, repo, _run):
             finding_id: "independently disproved by fresh dispute review"
             for finding_id in closure_ids
         })
+    completed = subprocess.CompletedProcess([], 127)
+    launch_error = None
     try:
         git(["worktree", "add", "--detach", str(checkout), packet["head_sha"]], repo)
         command = [
             "codex", "exec", "-C", str(checkout), "--sandbox", "read-only",
             "--model", execution["model"], "-c",
             f'model_reasoning_effort="{execution["thinking"]}"',
-            "--output-last-message", str(result), prompt,
+            "-c", f'model_provider="{execution["provider"]}"',
+            "--json", "--output-last-message", str(result), prompt,
         ]
-        with stdout_log.open("w", encoding="utf-8") as stdout, \
-                stderr_log.open("w", encoding="utf-8") as stderr:
-            completed = subprocess.run(
-                command, cwd=checkout, env=env, stdin=subprocess.DEVNULL,
-                stdout=stdout, stderr=stderr,
+        with regular_output(stdout_log, "review stdout") as stdout, \
+                regular_output(stderr_log, "review stderr") as stderr, \
+                regular_output(result, "review result", readwrite=True) as result_file:
+            command[command.index(str(result))] = (
+                f"/proc/self/fd/{result_file.fileno()}"
             )
+            child = subprocess.Popen(
+                command, cwd=checkout, env=env, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                pass_fds=(result_file.fileno(),), start_new_session=True,
+            )
+            return_code, overflow = wait_capped_process(
+                child, stdout, stderr, process_group=True
+            )
+            if overflow and return_code == 0:
+                return_code = 65
+            completed = subprocess.CompletedProcess(command, return_code)
+            if overflow:
+                launch_error = (
+                    "Codex runner output exceeded the retained trace limit"
+                )
+    except KeyboardInterrupt as exc:
+        completed = subprocess.CompletedProcess([], 130)
+        launch_error = f"reviewer interrupted: {type(exc).__name__}"
+    except (OSError, ValueError, SystemExit, subprocess.SubprocessError) as exc:
+        launch_error = f"{type(exc).__name__}: {exc}"
     finally:
         subprocess.run(
             ["git", "worktree", "remove", "--force", str(checkout)], cwd=repo,
@@ -709,23 +1200,37 @@ def cmd_run(args, repo, _run):
         "packet_sha256": packet_sha,
         "ledger_findings_sha256": findings_sha,
         "review_contract_sha256": packet["review_contract_sha256"],
+        "calibration_sha256": packet["calibration"]["sha256"],
         "review_head_sha": packet["head_sha"],
         "review_cwd": str(checkout),
         "reviewer": args.reviewer,
         "session_id": args.session_id,
         "execution": execution,
+        "runner": packet["runner"],
         "result": str(result.relative_to(run)),
         "stdout_log": str(stdout_log.relative_to(run)),
         "stderr_log": str(stderr_log.relative_to(run)),
+        "started_at": started_at,
         "exit_code": completed.returncode,
         "completed_at": now(),
     }
     receipt_committed = False
+    if launch_error:
+        receipt_value["validation_error"] = launch_error
     if completed.returncode == 0:
         try:
             reviewed_result, result_sha = review_result(
                 result, packet["axis"], require_pass=False
             )
+            validate_calibration(
+                packet["axis"], packet["calibration"]["sha256"],
+                reviewed_result["calibration_results"],
+            )
+            receipt_value["trajectory"] = parse_codex_trace(
+                stdout_log, "review", args.session_id, execution, runner_version
+            )
+            if receipt_value["trajectory"]["disposition"] != "pass":
+                raise ValueError("reviewer execution trajectory requires escalation")
             upheld = set(reviewed_result["upheld_ids"])
             closure_scope = packet.get("scope") in {"fix", "dispute"}
             if upheld:
@@ -742,7 +1247,7 @@ def cmd_run(args, repo, _run):
                 raise SystemExit("error: failed dispute must uphold the frozen finding set")
             if reviewed_result["verdict"] == "pass" and upheld:
                 raise SystemExit("error: pass review cannot contain upheld_ids")
-        except SystemExit as exc:
+        except (SystemExit, ValueError) as exc:
             receipt_value["status"] = "failed"
             receipt_value["exit_code"] = 65
             receipt_value["validation_error"] = str(exc)
@@ -883,14 +1388,20 @@ def cmd_complete(args, repo, _run):
         expected_execution = packet.get("review_execution")
         expected_result = (run / receipt.get("result", "")).resolve()
         if (receipt.get("status") != "passed" or receipt.get("exit_code") != 0
+                or not receipt_paths_match_session(receipt)
                 or receipt.get("ledger") != str(path.relative_to(run))
                 or receipt.get("packet_sha256") != object_sha256(packet)
                 or receipt.get("ledger_findings_sha256")
                 != object_sha256(ledger.get("findings", []))
                 or receipt.get("review_contract_sha256")
                 != packet.get("review_contract_sha256")
+                or (packet.get("schema_version") == 3
+                    and receipt.get("calibration_sha256")
+                    != packet.get("calibration", {}).get("sha256"))
                 or receipt.get("review_head_sha") != packet.get("head_sha")
                 or receipt.get("execution") != expected_execution
+                or (packet.get("schema_version") == 3
+                    and receipt.get("runner") != packet.get("runner"))
                 or not safe_identity(receipt.get("reviewer"))
                 or not safe_identity(receipt.get("session_id"))
                 or expected_result.parent != (run / "reviews" / "results").resolve()):
@@ -898,6 +1409,23 @@ def cmd_complete(args, repo, _run):
         result, result_sha = review_result(expected_result, packet["axis"])
         if result_sha != receipt.get("result_sha256"):
             raise SystemExit("error: review result differs from reviewer receipt")
+        if packet.get("schema_version") == 3:
+            try:
+                validate_calibration(
+                    packet["axis"], packet.get("calibration", {}).get("sha256"),
+                    result.get("calibration_results"),
+                )
+                trace_path = run_regular_file(run, receipt.get("stdout_log"))
+                validate_trajectory(
+                    receipt.get("trajectory"), "review",
+                    receipt.get("session_id"), receipt.get("execution"), trace_path,
+                )
+                if receipt.get("trajectory", {}).get("runner") != receipt.get("runner"):
+                    raise ValueError("review trajectory runner differs from its receipt")
+                if receipt.get("trajectory", {}).get("disposition") != "pass":
+                    raise ValueError("review trajectory requires escalation")
+            except ValueError as exc:
+                raise SystemExit(f"error: reviewer evaluation evidence is invalid: {exc}")
         closure = packet.get("closure_findings", [])
         if object_sha256(closure) != packet.get("closure_findings_sha256"):
             raise SystemExit("error: frozen closure finding set is corrupt")
@@ -1055,6 +1583,10 @@ def parser():
     p.add_argument("--spec-source", action="append", default=[])
     p.add_argument("--standards-source", action="append", default=[])
     p.add_argument("--digest-source", action="append", default=[])
+    p.add_argument(
+        "--refresh-runner", action="store_true",
+        help="refresh only an unstarted packet whose Codex runner changed",
+    )
     p.set_defaults(func=cmd_create)
     p = sub.add_parser("add")
     p.add_argument("--ledger", required=True)

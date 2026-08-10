@@ -13,12 +13,13 @@
     "stdout": {"type": "string"},
     "stderr": {"type": "string"},
     "validation_scope": {"type": "string", "minLength": 1, "maxLength": 1000},
-    "claim_boundary": {"type": "string", "minLength": 1, "maxLength": 1000}
+    "claim_boundary": {"type": "string", "minLength": 1, "maxLength": 1000},
+    "trajectory": {"$ref": "trajectory.schema.json"}
   },
   "allOf": [
     {
       "if": {"properties": {"exit_code": {"const": 0}}, "required": ["exit_code"]},
-      "then": {"required": ["validation_scope", "claim_boundary"]}
+      "then": {"required": ["validation_scope", "claim_boundary", "trajectory"]}
     }
   ],
   "additionalProperties": true

@@ -23,9 +23,9 @@ WORKER_PROMPTS = (
 )
 SCHEMAS = (
     "artifact-lint", "code-index", "decision-gate", "diagnosis", "epic",
-    "experiment", "finding", "handoff", "review-receipt", "review-result",
+    "eval-case", "experiment", "finding", "handoff", "review-receipt", "review-result",
     "run-state", "scenario-coverage", "spec-drift", "task-policy", "task",
-    "tdd-cycle", "verification", "worker-result",
+    "tdd-cycle", "trajectory", "verification", "worker-result",
 )
 PLUGIN_SKILLS = (
     "agent-team-dev", "brainstorming", "domain-modeling",
@@ -49,7 +49,7 @@ BINARIES = (
     "wake-agent-team", "agent-team-artifact", "agent-team-finish",
     "agent-team-check-task", "agent-team-doctor", "agent-team-state",
     "agent-team-worker", "agent-team-review", "agent_team_artifact.py",
-    "agent_team_policy.py", "import-agent-learning", "qteam-project-uninstall",
+    "agent_team_eval.py", "agent_team_policy.py", "import-agent-learning", "qteam-project-uninstall",
     "qteam_project.py",
 )
 
@@ -76,8 +76,15 @@ MOVED_PATHS = frozenset(
     + [f".agents/skills/{name}" for name in LEGACY_ORCHESTRATION_SKILLS]
     + [".codex/bin/__pycache__"]
 )
-V09_INSTALLED_PATHS = frozenset(
+V010_INSTALLED_PATHS = frozenset(
     INSTALLED_PATHS - {
+        ".codex/bin/agent_team_eval.py",
+        ".codex/schemas/eval-case.schema.json",
+        ".codex/schemas/trajectory.schema.json",
+    }
+)
+V09_INSTALLED_PATHS = frozenset(
+    V010_INSTALLED_PATHS - {
         ".codex/bin/agent-team-artifact",
         ".codex/bin/agent_team_artifact.py",
         ".codex/licenses/Smart-Ralph-MIT.txt",
@@ -288,6 +295,8 @@ def validate_manifest(root, manifest):
         supported_sets = (V07_INSTALLED_PATHS,)
     elif version_tuple < (0, 10, 0):
         supported_sets = (V09_INSTALLED_PATHS,)
+    elif version_tuple < (0, 11, 0):
+        supported_sets = (V010_INSTALLED_PATHS,)
     else:
         supported_sets = (INSTALLED_PATHS,)
     if installed_set not in supported_sets:

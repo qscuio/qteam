@@ -420,7 +420,7 @@ class EpicTests(ArtifactCase):
         state = self.repo / ".agents/runs/run-a/state.json"
         state.parent.mkdir(parents=True)
         state.write_text(json.dumps({
-            "schema_version": 5, "run_id": "run-a", "phase": "DONE",
+            "schema_version": 6, "run_id": "run-a", "phase": "DONE",
             "finished": True,
             "finished_head": self.git("rev-parse", "HEAD").stdout.strip(),
         }), encoding="utf-8")

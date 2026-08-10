@@ -55,7 +55,7 @@ Never edit `state.json`, `events.jsonl`, or task status by hand. Use
 `agent-team-state`; its locked atomic writes are the durable source of truth.
 Use its compact `status` packet for operator updates and resume instead of
 dumping the full state.
-If an unfinished run has schema version 2, 3, or 4, run `migrate-run` once. It
+If an unfinished run has schema version 2, 3, 4, or 5, run `migrate-run` once. It
 preserves durable provenance, assigns conservative policy where needed, and
 forces every unfinished task through `REPLANNING`/`task-put` so the coordinator
 must restore explicit dependencies before execution resumes.
@@ -96,7 +96,9 @@ DAG. Each machine task record includes:
 - `write_set`, `read_set`, `forbidden_paths`, and any explicitly serialized
   `allow_shared_surfaces`
 - namespaced TMPDIR/ports/database/compose/build resources
-- `work_kind` and factual `risk_flags` (never a hand-selected model)
+- `work_kind`, factual `risk_flags`, and an optional conservative
+  `reversibility` declaration (never a hand-selected model); derivation may
+  raise but never lower the effective reversibility class
 - for `work_kind: experiment`, the complete frozen `experiment` object; workers
   may not change its metric, guards, budget, or stopping rule
 - focused and integration cases, exact verification command, stop rule
@@ -203,10 +205,16 @@ compatibility, data loss, authorization, authentication, or public API risk.
 Reviewers use `qteam-review` and the JSON finding ledgers. Each returns a
 bounded JSON verdict. Launch every reviewer through `agent-team-review run`,
 which binds the actual read-only Codex process to the packet model, reasoning
-profile, digest, session ID, and result path. Complete the ledger only with the
-runner receipt. The gate rejects two mandatory axes that share an identity or
-invocation, fake waves, empty ranges for merged work, and packets that omit a
-wave merge commit.
+profile, provider/family, runner version, digest, session ID, and result path.
+The packet also freezes a redacted trajectory summary and axis-specific
+calibration canaries. They are transparent consistency checks, not secret or
+adversarial benchmarks. Complete the ledger only with the runner receipt; a
+judge that fails the canaries cannot attest the change. The gate
+rejects two mandatory axes that share an identity or invocation, fake waves,
+empty ranges for merged work, and packets that omit a wave merge commit.
+If Codex upgrades after packet creation but before any review attempt, recreate
+the same packet with `--refresh-runner`. Refresh is rejected once any receipt,
+finding, attempt, or completion exists.
 
 The packet-derived intensity controls context, not whether quality review
 happens. `compact` reads only the final diff, affected clauses/contracts, and
@@ -236,8 +244,22 @@ it writes only
 `.qteam-learning-outbox/` in its task worktree. After success, use
 `agent-team-worker harvest` to copy that symlink-free artifact into the run
 outbox. Keep reusable, deduplicated, verified, non-sensitive proposals; never
-overwrite canonical skills. From the qnote root, import approved items with
+overwrite canonical skills. A harvested eval remains a candidate until the
+coordinator records an explicit decision:
+
+```bash
+.codex/bin/agent-team-state --run <run-id> learning-item-decision <item-id> \
+  --outcome approved --evidence '<bounded coordinator evidence>'
+```
+
+Use `--outcome rejected` for unsupported candidates. From the qnote root,
+import approved items with
 `<target-repo>/.codex/bin/import-agent-learning <target-repo> <run-id>`.
+Confirmed corrections, trajectory anomalies, review findings, rollback events,
+and tool failures may additionally become typed `eval-cases/*.json`. Each case
+must name an agent/dependency/mixed attribution and bind a regular file inside
+the same run by exact SHA-256; harvest and import reject invented or stale
+evidence.
 
 Before final review, compare approved requirements, design, and tickets with
 the implementation. If there is drift, create a proposal shaped like
@@ -252,6 +274,17 @@ fresh. Finish mechanically repeats this bound check. The report is always
 `proposal-only`; edit approved artifacts only in an owned `REPLANNING` task.
 Never silently rewrite approved history. If no drift exists, no report is
 required; the mandatory spec review remains the semantic proof.
+
+If any task derives `hard-to-reverse`, obtain the current bound subject only
+after the reviewed integration head and task outcomes are stable:
+
+```bash
+.codex/bin/agent-team-state --run <run> reversibility-subject
+```
+
+Create a user-owned action decision covering `finish` with that exact subject,
+then resolve it explicitly. A later head, task outcome, or hard-task policy
+change makes the authorization stale and blocks `READY_TO_FINISH`.
 
 Record task/final verification through `verify-task` / `verify-final`; review
 status only through `agent-team-review check`; and learning through

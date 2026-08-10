@@ -43,7 +43,7 @@
       "type": "object",
       "required": ["kind", "sha256"],
       "properties": {
-        "kind": {"const": "spec-drift-change"},
+        "kind": {"enum": ["spec-drift-change", "hard-to-reverse-run"]},
         "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
       },
       "additionalProperties": false

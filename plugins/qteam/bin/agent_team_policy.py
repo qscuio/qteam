@@ -5,8 +5,10 @@ import hashlib
 import re
 from pathlib import PurePosixPath
 
+from agent_team_eval import execution_profile
 
-POLICY_VERSION = 1
+
+POLICY_VERSION = 2
 WORK_KINDS = {
     "feature", "bugfix", "debug", "refactor", "test", "integration",
     "docs", "config", "generated", "learning", "experiment",
@@ -17,10 +19,17 @@ RISK_FLAGS = {
 }
 MODEL_TIERS = ("economy", "standard", "deep")
 MODEL_PROFILES = {
-    "economy": {"model": "gpt-5.6-terra", "thinking": "low"},
-    "standard": {"model": "gpt-5.6-terra", "thinking": "medium"},
-    "deep": {"model": "gpt-5.6-sol", "thinking": "high"},
+    "economy": execution_profile("gpt-5.6-terra", "low"),
+    "standard": execution_profile("gpt-5.6-terra", "medium"),
+    "deep": execution_profile("gpt-5.6-sol", "high"),
 }
+REVIEW_MODEL_PROFILES = {
+    tier: dict(profile) for tier, profile in MODEL_PROFILES.items()
+}
+REVERSIBILITY = (
+    "contained-reversible", "wide-reversible", "hard-to-reverse",
+)
+REVERSIBILITY_ORDER = {name: index for index, name in enumerate(REVERSIBILITY)}
 TIER_ORDER = {name: index for index, name in enumerate(MODEL_TIERS)}
 ROLE_MINIMUM = {
     "developer": "economy",
@@ -126,8 +135,40 @@ def derive_task_policy(task):
         raise ValueError("risk_flags must not contain duplicates")
     inferred = _path_risks(task.get("write_set", []))
     effective = set(declared) | inferred
+    broad_write_set = any(
+        any(character in pattern for character in "*?[")
+        for pattern in task.get("write_set", [])
+        if isinstance(pattern, str)
+    )
+    declared_reversibility = task.get("reversibility")
+    if declared_reversibility is not None and declared_reversibility not in REVERSIBILITY:
+        raise ValueError(
+            "reversibility must be one of: " + ", ".join(REVERSIBILITY)
+        )
+    if effective & {"migration", "data-loss"}:
+        inferred_reversibility = "hard-to-reverse"
+    elif (effective or broad_write_set or task.get("allow_shared_surfaces")
+          or len(task.get("write_set", [])) >= 4):
+        inferred_reversibility = "wide-reversible"
+    else:
+        inferred_reversibility = "contained-reversible"
+    reversibility = max(
+        (declared_reversibility or "contained-reversible", inferred_reversibility),
+        key=REVERSIBILITY_ORDER.__getitem__,
+    )
     reasons = []
-    if effective:
+    if (declared_reversibility is not None
+            and REVERSIBILITY_ORDER[declared_reversibility]
+            > REVERSIBILITY_ORDER[inferred_reversibility]):
+        reasons.append(
+            f"conservative reversibility declaration: {declared_reversibility}"
+        )
+    if reversibility == "hard-to-reverse":
+        tier = "deep"
+        reasons.append("hard-to-reverse change requires risk review and bound user finish approval")
+        if effective:
+            reasons.append("high-risk surface: " + ", ".join(sorted(effective)))
+    elif effective:
         tier = "deep"
         reasons.append("high-risk surface: " + ", ".join(sorted(effective)))
     elif work_kind in {"bugfix", "debug", "refactor", "integration", "experiment"}:
@@ -136,6 +177,9 @@ def derive_task_policy(task):
     elif task.get("allow_shared_surfaces"):
         tier = "standard"
         reasons.append("shared surface requires serial judgment")
+    elif broad_write_set:
+        tier = "standard"
+        reasons.append("broad recursive write set")
     elif len(task.get("write_set", [])) >= 4:
         tier = "standard"
         reasons.append("broad write set")
@@ -148,6 +192,18 @@ def derive_task_policy(task):
         "declared_risk_flags": sorted(set(declared)),
         "inferred_risk_flags": sorted(inferred),
         "effective_risk_flags": sorted(effective),
+        "declared_reversibility": declared_reversibility,
+        "inferred_reversibility": inferred_reversibility,
+        "reversibility": reversibility,
+        "blast_radius": (
+            "contained" if reversibility == "contained-reversible" else "wide"
+        ),
+        "integration_lane": {
+            "contained-reversible": "shadow",
+            "wide-reversible": "reviewed",
+            "hard-to-reverse": "human-only",
+        }[reversibility],
+        "require_user_finish_decision": reversibility == "hard-to-reverse",
         "execution_tier": tier,
         "review_intensity": {
             "economy": "compact", "standard": "full", "deep": "risk"
@@ -167,11 +223,15 @@ def effective_execution(policy, role, model_profiles=None):
     profile = profiles.get(tier) if isinstance(profiles, dict) else None
     if (not isinstance(profile, dict)
             or not isinstance(profile.get("model"), str) or not profile["model"]
-            or profile.get("thinking") not in {"low", "medium", "high", "xhigh"}):
+            or profile.get("thinking") not in {"low", "medium", "high", "xhigh"}
+            or not isinstance(profile.get("provider"), str) or not profile["provider"]
+            or not isinstance(profile.get("family"), str) or not profile["family"]):
         raise ValueError(f"missing or invalid model profile for tier {tier}")
     return {
         "tier": tier,
         "model": profile["model"],
         "thinking": profile["thinking"],
+        "provider": profile["provider"],
+        "family": profile["family"],
         "reason": (f"task={requested}; role={role} minimum={minimum}"),
     }

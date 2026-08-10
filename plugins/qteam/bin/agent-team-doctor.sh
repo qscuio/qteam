@@ -29,13 +29,14 @@ for b in wake-agent-team agent-team-artifact agent-team-finish agent-team-check-
 done
 [[ -f ".codex/bin/agent_team_policy.py" ]] || fail "missing policy module: agent_team_policy.py"
 [[ -f ".codex/bin/agent_team_artifact.py" ]] || fail "missing artifact module: agent_team_artifact.py"
+[[ -f ".codex/bin/agent_team_eval.py" ]] || fail "missing evaluation module: agent_team_eval.py"
 [[ -f ".codex/bin/qteam_project.py" ]] || fail "missing project manifest module: qteam_project.py"
 
 for role in developer debugger frontend-debugger system-debugger test-writer \
             integration-tester fixer knowledge-distiller; do
   [[ -f ".codex/worker-prompts/$role.md" ]] || fail "missing worker prompt: $role"
 done
-for schema in run-state task task-policy tdd-cycle diagnosis experiment decision-gate handoff scenario-coverage worker-result verification finding review-result review-receipt artifact-lint code-index epic spec-drift; do
+for schema in run-state task task-policy tdd-cycle trajectory eval-case diagnosis experiment decision-gate handoff scenario-coverage worker-result verification finding review-result review-receipt artifact-lint code-index epic spec-drift; do
   [[ -f ".codex/schemas/$schema.schema.json" ]] || fail "missing schema: $schema"
 done
 SCHEMA_OK=1

@@ -2,6 +2,7 @@ import json
 import hashlib
 import importlib.util
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -20,6 +21,7 @@ CHECK = PLUGIN / "bin/agent-team-check-task.py"
 REVIEW = PLUGIN / "bin/agent-team-review.py"
 ARTIFACT = PLUGIN / "bin/agent_team_artifact.py"
 POLICY = PLUGIN / "bin/agent_team_policy.py"
+EVAL = PLUGIN / "bin/agent_team_eval.py"
 FINISH = PLUGIN / "bin/agent-team-finish.py"
 IMPORT = PLUGIN / "bin/import-agent-learning.py"
 WAKE = PLUGIN / "bin/wake-agent-team.sh"
@@ -79,7 +81,7 @@ class RepoCase(unittest.TestCase):
                   test_seams=None, diagnosis_command=None, failure_pattern=None,
                   base_commit=None, wave=1, parallel_group="wave-1",
                   finding_ids=None, experiment=None, required_decisions=None,
-                  handoff=None, depends_on=None):
+                  handoff=None, depends_on=None, reversibility=None):
         branch = f"agent/{run.name}/{task}"
         worktree = run / "worktrees" / task
         worktree.parent.mkdir(parents=True, exist_ok=True)
@@ -98,6 +100,8 @@ class RepoCase(unittest.TestCase):
             "work_kind": work_kind or ("learning" if artifact_kind else "test"),
             "risk_flags": risk_flags or [],
         }
+        if reversibility is not None:
+            record["reversibility"] = reversibility
         if test_seams is not None:
             record["test_seams"] = test_seams
             first = test_seams[0]["id"]
@@ -155,16 +159,28 @@ class RepoCase(unittest.TestCase):
             "import json, os, sys\n"
             "from pathlib import Path\n"
             "args=sys.argv[1:]\n"
+            "if '--version' in args:\n"
+            "    print(os.environ.get('FAKE_CODEX_VERSION','codex-cli test-review'))\n"
+            "    raise SystemExit(0)\n"
             "out=Path(args[args.index('--output-last-message')+1])\n"
             "payload=os.environ.get('FAKE_REVIEW_RESULT')\n"
             "if payload is None:\n"
+            "    ids=json.loads(os.environ['QTEAM_REVIEW_CALIBRATION_CASE_IDS'])\n"
             "    payload=json.dumps({'axis':os.environ['QTEAM_REVIEW_AXIS'],"
-            "'verdict':'pass','findings':[],"
+            "'verdict':'pass','trajectory_verdict':'pass',"
+            "'calibration_results':{ids[0]:'pass',ids[1]:'needs-fix'},"
+            "'findings':[],"
             "'resolved_ids':json.loads(os.environ['QTEAM_REVIEW_RESOLVED_IDS']),"
             "'invalid_ids':json.loads(os.environ['QTEAM_REVIEW_INVALID_IDS']),"
             "'upheld_ids':json.loads(os.environ['QTEAM_REVIEW_UPHELD_IDS']),"
             "'invalid_evidence':json.loads(os.environ['QTEAM_REVIEW_INVALID_EVIDENCE'])})\n"
             "out.write_text(payload)\n"
+            "print(json.dumps({'type':'thread.started','thread_id':'test-review'}))\n"
+            "print(json.dumps({'type':'turn.started'}))\n"
+            "for index in range(int(os.environ.get('FAKE_REVIEW_FAILED_CALLS','0'))):\n"
+            " print(json.dumps({'type':'item.completed','item':{'type':'command_execution','command':'false '+str(index),'exit_code':1,'aggregated_output':'failed'}}))\n"
+            "print(json.dumps({'type':'item.completed','item':{'id':'final','type':'agent_message','text':payload}}))\n"
+            "print(json.dumps({'type':'turn.completed','usage':{'input_tokens':1,'output_tokens':1}}))\n"
             "trace=os.environ.get('FAKE_REVIEW_TRACE')\n"
             "if trace: Path(trace).write_text(json.dumps({'args':args,'cwd':os.getcwd()}))\n",
             encoding="utf-8",
@@ -173,10 +189,19 @@ class RepoCase(unittest.TestCase):
         trace = Path(self.tmp.name) / f"review-{session_id}.trace.json"
         env = os.environ.copy()
         env["PATH"] = f"{fake_bin}:{env['PATH']}"
+        packet_runner = json.loads(Path(ledger).read_text(encoding="utf-8"))[
+            "packet"
+        ]["runner"]["version"]
+        env["FAKE_CODEX_VERSION"] = packet_runner
         env["FAKE_REVIEW_TRACE"] = str(trace)
         if run_env_extra:
             env.update(run_env_extra)
         if result_payload is not None:
+            result_payload.setdefault("trajectory_verdict", "pass")
+            ids = [f"cal-{axis}-01", f"cal-{axis}-02"]
+            result_payload.setdefault(
+                "calibration_results", {ids[0]: "pass", ids[1]: "needs-fix"}
+            )
             env["FAKE_REVIEW_RESULT"] = json.dumps(result_payload)
         launched = self.run_tool(
             REVIEW, "run", "--ledger", str(ledger), "--reviewer", reviewer,
@@ -224,6 +249,17 @@ class RepoCase(unittest.TestCase):
 
 
 class StateTests(RepoCase):
+    def test_init_rejects_empty_model_before_creating_run(self):
+        run = self.repo / ".agents/runs/empty-model"
+        rejected = self.run_tool(
+            STATE, "--run", str(run), "init", "--goal", "invalid model",
+            "--model-economy", "",
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("model must be a non-empty string", rejected.stderr)
+        self.assertNotIn("Traceback", rejected.stderr)
+        self.assertFalse(run.exists())
+
     def test_state_wal_lock_and_events_reject_symlinks(self):
         run = self.init_run()
         outside_events = Path(self.tmp.name) / "outside-events.jsonl"
@@ -1122,7 +1158,7 @@ class StateTests(RepoCase):
         migrated = self.run_tool(STATE, "--run", str(run), "migrate-v2")
         self.assertEqual(migrated.returncode, 0, migrated.stderr)
         state = json.loads(state_path.read_text(encoding="utf-8"))
-        self.assertEqual(state["schema_version"], 5)
+        self.assertEqual(state["schema_version"], 6)
         self.assertEqual(state["policy_migration_pending"], ["T01", "T02"])
         for task_id in ("T01", "T02"):
             task = json.loads((run / f"tasks/{task_id}.json").read_text(
@@ -1197,7 +1233,7 @@ class StateTests(RepoCase):
         self.assertEqual(migrated.returncode, 0, migrated.stderr)
         current = json.loads(state_path.read_text(encoding="utf-8"))
         migrated_task = json.loads(task_path.read_text(encoding="utf-8"))
-        self.assertEqual(current["schema_version"], 5)
+        self.assertEqual(current["schema_version"], 6)
         self.assertEqual(current["policy_migration_pending"], ["T01"])
         self.assertFalse(migrated_task["handoff_required"])
         self.assertEqual(migrated_task["required_decisions"], [])
@@ -1223,7 +1259,7 @@ class StateTests(RepoCase):
         self.assertEqual(migrated.returncode, 0, migrated.stderr)
         current = json.loads(state_path.read_text(encoding="utf-8"))
         migrated_task = json.loads(task_path.read_text(encoding="utf-8"))
-        self.assertEqual(current["schema_version"], 5)
+        self.assertEqual(current["schema_version"], 6)
         self.assertEqual(current["policy_migration_pending"], ["T01"])
         self.assertEqual(migrated_task["depends_on"], [])
         self.assertTrue(migrated_task["policy_migration"]["requires_replan"])
@@ -1312,7 +1348,7 @@ class StateTests(RepoCase):
         migrated = self.run_tool(STATE, "--run", str(run), "migrate-run")
         self.assertEqual(migrated.returncode, 0, migrated.stderr)
         current = json.loads(state_path.read_text(encoding="utf-8"))
-        self.assertEqual(current["schema_version"], 5)
+        self.assertEqual(current["schema_version"], 6)
         self.assertNotIn("publication_seal", current)
 
     def test_v3_untyped_resolved_decision_reopens_instead_of_assuming_allow(self):
@@ -1438,11 +1474,260 @@ class StateTests(RepoCase):
                          ["T01"])
 
 
+class EvaluationContractTests(RepoCase):
+    def load_eval_module(self):
+        spec = importlib.util.spec_from_file_location("qteam_eval_test", EVAL)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_cross_family_claim_requires_complete_worker_visibility(self):
+        module = self.load_eval_module()
+        partial = {
+            "tasks": ["T01", "T02"],
+            "worker_trajectories": [{
+                "execution": {"family": "generator-family"},
+            }],
+            "tool_visibility_unavailable": ["T02"],
+        }
+        self.assertEqual(
+            module.trajectory_independence(partial, "judge-family"),
+            "identity-only",
+        )
+        complete = {
+            **partial,
+            "worker_trajectories": [
+                {"execution": {"family": "generator-family"}},
+                {"execution": {"family": "other-generator-family"}},
+            ],
+            "tool_visibility_unavailable": [],
+        }
+        self.assertEqual(
+            module.trajectory_independence(complete, "judge-family"),
+            "cross-family",
+        )
+        complete["worker_trajectories"][1]["execution"]["family"] = "judge-family"
+        self.assertEqual(
+            module.trajectory_independence(complete, "judge-family"),
+            "identity-only",
+        )
+
+    def test_passing_review_schema_requires_passing_trajectory(self):
+        schema = json.loads(
+            (PLUGIN / "schemas/review-result.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        passing = next(
+            rule for rule in schema["allOf"]
+            if rule["if"]["properties"]["verdict"].get("const") == "pass"
+        )
+        self.assertEqual(
+            passing["then"]["properties"]["trajectory_verdict"],
+            {"const": "pass"},
+        )
+
+    def test_learning_manifest_rejects_malformed_optional_types(self):
+        module = self.load_eval_module()
+        base = {
+            "schema_version": 1, "run_id": "R1", "project": "repo",
+            "items": [{
+                "id": "K1", "title": "Knowledge", "category": "knowledge",
+                "status": "proposed",
+            }],
+        }
+        with self.assertRaisesRegex(ValueError, "typed run/project/items"):
+            module.validate_learning_manifest({**base, "source_commits": 1})
+        with self.assertRaisesRegex(ValueError, "typed run/project/items"):
+            module.validate_learning_manifest({**base, "source_commits": [{}]})
+        malformed_skill = json.loads(json.dumps(base))
+        malformed_skill["items"][0].update({
+            "category": "skill", "skill_name": 1,
+        })
+        with self.assertRaisesRegex(ValueError, "id/title/category/status"):
+            module.validate_learning_manifest(malformed_skill)
+
+    def test_trajectory_summary_redacts_payloads_and_surfaces_repeated_calls(self):
+        module = self.load_eval_module()
+        trace = self.repo / "private-trace.jsonl"
+        secret = "do-not-copy-this-token"
+        events = [
+            {"type": "thread.started", "thread_id": "trace-test"},
+            {"type": "turn.started"},
+            {"type": "item.completed", "item": {
+                "type": "command_execution", "command": f"tool --token {secret}",
+                "aggregated_output": secret, "exit_code": 0,
+            }},
+            {"type": "item.completed", "item": {
+                "type": "command_execution", "command": "test -f README.md",
+                "aggregated_output": "", "exit_code": 0,
+            }},
+            {"type": "item.completed", "item": {
+                "type": "file_change", "changes": [{"path": "one.py"}],
+            }},
+            {"type": "item.completed", "item": {
+                "type": "file_change", "changes": [{"path": "two.py"}],
+            }},
+            {"type": "item.completed", "item": {
+                "type": "command_execution", "command": f"tool --token {secret}",
+                "aggregated_output": secret, "exit_code": 0,
+            }},
+            {"type": "item.completed", "item": {
+                "type": "agent_message", "text": "bounded result",
+            }},
+            {"type": "turn.completed", "usage": {
+                "input_tokens": 12, "output_tokens": 3,
+            }},
+        ]
+        trace.write_text(
+            "".join(json.dumps(event) + "\n" for event in events),
+            encoding="utf-8",
+        )
+        execution = {
+            "tier": "economy",
+            **module.execution_profile("gpt-5.6-terra", "low"),
+        }
+        summary = module.parse_codex_trace(
+            trace, "worker", "T01", execution, "codex-cli test",
+        )
+        module.validate_trajectory(
+            summary, "worker", "T01", execution, trace
+        )
+        serialized = json.dumps(summary, sort_keys=True)
+        self.assertNotIn(secret, serialized)
+        self.assertEqual(summary["counts"]["duplicate_calls"], 1)
+        self.assertEqual(summary["counts"]["empty_result_calls"], 0)
+        self.assertEqual(summary["counts"]["tool_calls"], 3)
+        self.assertEqual(summary["disposition"], "pass")
+        self.assertEqual(summary["counts"]["input_tokens"], 12)
+        forged = json.loads(json.dumps(summary))
+        forged["counts"]["tool_calls"] = 0
+        forged["counts"]["command_calls"] = 0
+        forged["counts"]["duplicate_calls"] = 0
+        forged["anomalies"] = []
+        with self.assertRaisesRegex(ValueError, "summary does not match"):
+            module.validate_trajectory(
+                forged, "worker", "T01", execution, trace
+            )
+
+    def test_calibration_and_eval_evidence_fail_closed(self):
+        module = self.load_eval_module()
+        suite = module.calibration_suite("standards")
+        with self.assertRaisesRegex(ValueError, "failed.*calibration"):
+            module.validate_calibration(
+                "standards", suite["sha256"],
+                {"cal-standards-01": "pass", "cal-standards-02": "pass"},
+            )
+
+        run = self.repo / ".agents/runs/eval-run"
+        evidence = run / "workers/T01.result.json"
+        evidence.parent.mkdir(parents=True)
+        evidence.write_text('{"status":"failed"}\n', encoding="utf-8")
+        case = {
+            "schema_version": 1, "id": "eval-tool-failure", "status": "approved",
+            "decision": {
+                "authority": "coordinator", "outcome": "approved",
+                "evidence": "confirmed by the frozen worker failure",
+                "decided_at": "2026-08-10T00:00:00+00:00",
+            },
+            "source": {
+                "kind": "tool-failure", "run_id": "eval-run",
+                "evidence": "workers/T01.result.json",
+                "sha256": hashlib.sha256(evidence.read_bytes()).hexdigest(),
+            },
+            "observation": "The runner accepted an empty result.",
+            "attribution": "agent", "capability": "tool result validation",
+            "expected_outcome": "Reject empty successful tool results.",
+            "validation_scope": "the frozen worker result",
+            "claim_boundary": "does not cover unrelated tools",
+        }
+        self.assertEqual(module.validate_eval_case(case, run), case)
+        case["source"]["sha256"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "digest does not match"):
+            module.validate_eval_case(case, run)
+
+    def test_trace_and_event_readers_fail_closed_on_unbounded_or_typed_input(self):
+        module = self.load_eval_module()
+        oversized = self.repo / "oversized.jsonl"
+        oversized.write_bytes(b"x" * (4 * 1024 * 1024 + 1) + b"\n")
+        with self.assertRaisesRegex(ValueError, "bounded JSONL size"):
+            module.parse_codex_trace(
+                oversized, "worker", "T01",
+                {"tier": "economy", **module.execution_profile(
+                    "gpt-5.6-terra", "low"
+                )},
+                "codex-cli test",
+            )
+        event_log = self.repo / "events.jsonl"
+        event_log.write_bytes(b"\xff\n")
+        with self.assertRaisesRegex(ValueError, "event encoding"):
+            module.read_event_log(event_log)
+        array = self.repo / "worker-result.json"
+        array.write_text("[]\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "must be a JSON object"):
+            module.read_bounded_json_object(array, "worker result")
+        schema = json.loads((PLUGIN / "schemas/eval-case.schema.json").read_text(
+            encoding="utf-8"
+        ))
+        pattern = schema["properties"]["source"]["properties"]["evidence"][
+            "pattern"
+        ]
+        for invalid in (".", "./a", "a/./b", "a//b", "a/", "../a"):
+            self.assertIsNone(re.fullmatch(pattern, invalid), invalid)
+        deeply_nested = self.repo / "deep.jsonl"
+        deeply_nested.write_text("[" * 2000 + "0" + "]" * 2000 + "\n",
+                                 encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "invalid Codex JSONL"):
+            module.parse_codex_trace(
+                deeply_nested, "worker", "T01",
+                {"tier": "economy", **module.execution_profile(
+                    "gpt-5.6-terra", "low"
+                )},
+                "codex-cli test",
+            )
+        capped_stdout = self.repo / "capped.stdout"
+        capped_stderr = self.repo / "capped.stderr"
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.stdout.write('x'*8192)"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        with module.regular_output(capped_stdout, "test stdout") as stdout, \
+                module.regular_output(capped_stderr, "test stderr") as stderr:
+            _code, overflow = module.wait_capped_process(
+                process, stdout, stderr, limit=1024
+            )
+        self.assertTrue(overflow)
+        self.assertLessEqual(capped_stdout.stat().st_size, 1024)
+
+        stubborn_stdout = self.repo / "stubborn.stdout"
+        stubborn_stderr = self.repo / "stubborn.stderr"
+        stubborn = subprocess.Popen(
+            [sys.executable, "-c", (
+                "import signal,sys,time;"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+                "sys.stdout.write('x'*8192);sys.stdout.flush();time.sleep(30)"
+            )],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        started = time.monotonic()
+        with module.regular_output(stubborn_stdout, "stubborn stdout") as stdout, \
+                module.regular_output(stubborn_stderr, "stubborn stderr") as stderr:
+            _code, overflow = module.wait_capped_process(
+                stubborn, stdout, stderr, limit=1024
+            )
+        self.assertTrue(overflow)
+        self.assertLess(time.monotonic() - started, 5)
+
+
 class PolicyTests(RepoCase):
     def test_review_contract_digest_covers_closure_semantics(self):
         spec = importlib.util.spec_from_file_location("qteam_policy_test", POLICY)
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        sys.path.insert(0, str(POLICY.parent))
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            sys.path.pop(0)
         original = module.review_contract_digest("spec", "full")
         module.REVIEW_CLOSURE_INSTRUCTIONS += " Contract revision."
         self.assertNotEqual(
@@ -1461,6 +1746,45 @@ class PolicyTests(RepoCase):
             task = json.loads((run / f"tasks/T0{index}.json").read_text(
                 encoding="utf-8"))
             self.assertEqual(task["policy"]["execution_tier"], "economy")
+
+    def test_recursive_write_glob_raises_reversibility_and_review_scope(self):
+        run = self.init_run("broad-glob")
+        self.make_task(
+            run, task="T01", work_kind="docs", write_set=["docs/**"]
+        )
+        task = json.loads((run / "tasks/T01.json").read_text(encoding="utf-8"))
+        self.assertEqual(task["reversibility"], "wide-reversible")
+        self.assertEqual(task["policy"]["integration_lane"], "reviewed")
+        self.assertEqual(task["policy"]["execution_tier"], "standard")
+        self.assertEqual(task["policy"]["review_intensity"], "full")
+        self.make_task(
+            run, task="T02", work_kind="docs", write_set=["src/**/*.py"]
+        )
+        nested = json.loads((run / "tasks/T02.json").read_text(encoding="utf-8"))
+        self.assertEqual(nested["reversibility"], "wide-reversible")
+        self.assertEqual(nested["policy"]["integration_lane"], "reviewed")
+        for task_id, pattern in (("T04", "src/*"),
+                                 ("T05", "src/[ab].py")):
+            self.make_task(
+                run, task=task_id, work_kind="docs", write_set=[pattern]
+            )
+            wildcard = json.loads((run / f"tasks/{task_id}.json").read_text(
+                encoding="utf-8"
+            ))
+            self.assertEqual(wildcard["reversibility"], "wide-reversible")
+        sys.path.insert(0, str(POLICY.parent))
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "qteam_wildcard_policy_test", POLICY
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            root_wildcard = module.derive_task_policy({
+                "work_kind": "docs", "risk_flags": [], "write_set": ["*"],
+            })
+        finally:
+            sys.path.pop(0)
+        self.assertEqual(root_wildcard["reversibility"], "wide-reversible")
 
     def test_task_facts_derive_model_and_review_policy(self):
         run = self.init_run()
@@ -1481,6 +1805,125 @@ class PolicyTests(RepoCase):
         self.assertFalse(refactor["tdd_required"])
         self.assertTrue(state["risk_required"])
         self.assertTrue(state["waves"]["1"]["require_risk_review"])
+
+    def test_reversibility_is_inferred_and_cannot_be_declared_downward(self):
+        run = self.init_run("reversible-run")
+        self.make_task(
+            run, task="T01", work_kind="config", risk_flags=["migration"],
+            reversibility="contained-reversible",
+        )
+        task = json.loads((run / "tasks/T01.json").read_text(encoding="utf-8"))
+        state = json.loads((run / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(task["policy"]["declared_reversibility"],
+                         "contained-reversible")
+        self.assertEqual(task["reversibility"], "hard-to-reverse")
+        self.assertEqual(task["policy"]["integration_lane"], "human-only")
+        self.assertTrue(task["policy"]["require_user_finish_decision"])
+        self.assertTrue(state["hard_to_reverse"])
+
+        integration = "agent/reversible-run/integration"
+        integration_worktree = run / "worktrees/integration"
+        self.run_git(
+            "worktree", "add", "-b", integration,
+            str(integration_worktree), "HEAD",
+        )
+        subject_result = self.run_tool(
+            STATE, "--run", str(run), "reversibility-subject"
+        )
+        self.assertEqual(subject_result.returncode, 0, subject_result.stderr)
+        subject = json.loads(subject_result.stdout)["subject"]
+        decision = {
+            "schema_version": 1, "id": "D-HARD", "status": "open",
+            "question": "May this exact hard-to-reverse run finish?",
+            "authority": "user",
+            "scope": {"kind": "action", "targets": ["finish"]},
+            "subject": {"kind": "hard-to-reverse-run", "sha256": "0" * 64},
+        }
+        source = self.repo / "hard-decision.json"
+        source.write_text(json.dumps(decision), encoding="utf-8")
+        stale = self.run_tool(
+            STATE, "--run", str(run), "decision-put", "--file", str(source)
+        )
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertIn("subject is stale", stale.stderr)
+        decision["subject"] = subject
+        source.write_text(json.dumps(decision), encoding="utf-8")
+        accepted = self.run_tool(
+            STATE, "--run", str(run), "decision-put", "--file", str(source)
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        resolved = self.run_tool(
+            STATE, "--run", str(run), "decision-resolve", "D-HARD",
+            "--outcome", "allow", "--choice", "finish exact subject",
+            "--evidence", "user approved this frozen run",
+        )
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        for phase in ("SPEC_READY", "PLAN_READY", "LEARNING_EXPORT"):
+            self.run_tool(STATE, "--run", str(run), "phase", phase, check=True)
+        (integration_worktree / "late.txt").write_text("late\n", encoding="utf-8")
+        self.run_git("add", "late.txt", cwd=integration_worktree)
+        self.run_git("commit", "-m", "advance hard-to-reverse head",
+                     cwd=integration_worktree)
+        integration_head = self.run_git(
+            "rev-parse", "HEAD", cwd=integration_worktree
+        ).stdout.strip()
+        task_path = run / "tasks/T01.json"
+        task = json.loads(task_path.read_text(encoding="utf-8"))
+        task["status"] = "merged"
+        task["merge_commit"] = integration_head
+        task_path.write_text(json.dumps(task), encoding="utf-8")
+        state_path = run / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["tasks"]["T01"]["status"] = "merged"
+        for gate in ("final_verification", "reviews", "learning", "public_boundary"):
+            state["gates"][gate] = {"status": "passed"}
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        stale_after_change = self.run_tool(
+            STATE, "--run", str(run), "phase", "READY_TO_FINISH"
+        )
+        self.assertNotEqual(stale_after_change.returncode, 0)
+        self.assertIn("hard-to-reverse", stale_after_change.stderr)
+
+        decision["id"] = "D-MIXED"
+        decision["scope"]["targets"] = ["finish", "publish"]
+        decision["subject"] = json.loads(self.run_tool(
+            STATE, "--run", str(run), "reversibility-subject", check=True
+        ).stdout)["subject"]
+        source.write_text(json.dumps(decision), encoding="utf-8")
+        mixed = self.run_tool(
+            STATE, "--run", str(run), "decision-put", "--file", str(source)
+        )
+        self.assertNotEqual(mixed.returncode, 0)
+        self.assertIn("user action decision", mixed.stderr)
+
+        decision["id"] = "D-HARD-FRESH"
+        decision["scope"]["targets"] = ["finish"]
+        decision["subject"] = json.loads(self.run_tool(
+            STATE, "--run", str(run), "reversibility-subject", check=True
+        ).stdout)["subject"]
+        source.write_text(json.dumps(decision), encoding="utf-8")
+        self.run_tool(
+            STATE, "--run", str(run), "decision-put", "--file", str(source),
+            check=True,
+        )
+        self.run_tool(
+            STATE, "--run", str(run), "decision-resolve", "D-HARD-FRESH",
+            "--outcome", "allow", "--choice", "finish refreshed subject",
+            "--evidence", "user approved the refreshed subject", check=True,
+        )
+        sys.path.insert(0, str(PLUGIN / "bin"))
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "qteam_reversibility_authorization_test", STATE
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            current_state = json.loads(state_path.read_text(encoding="utf-8"))
+            module.require_hard_to_reverse_authorization(
+                self.repo, run, current_state
+            )
+        finally:
+            sys.path.pop(0)
 
     def test_experiment_is_standard_without_implicit_tdd(self):
         run = self.init_run()
@@ -1595,7 +2038,121 @@ class PolicyTests(RepoCase):
         self.assertIn("exact test_paths", result.stderr)
 
 
+    def test_coordinator_decision_binds_harvested_eval_candidate(self):
+        run = self.init_run("eval-decision")
+        for phase in ("SPEC_READY", "PLAN_READY", "LEARNING_EXPORT"):
+            self.run_tool(STATE, "--run", str(run), "phase", phase, check=True)
+        evidence = run / "evidence/tool-failure.json"
+        evidence.parent.mkdir(parents=True)
+        evidence.write_text('{"confirmed":true}\n', encoding="utf-8")
+        outbox = run / "learning-outbox"
+        cases = outbox / "eval-cases"
+        cases.mkdir(parents=True)
+        case = {
+            "schema_version": 1, "id": "tool-empty-result",
+            "status": "candidate", "source": {
+                "kind": "tool-failure", "run_id": run.name,
+                "evidence": "evidence/tool-failure.json",
+                "sha256": hashlib.sha256(evidence.read_bytes()).hexdigest(),
+            },
+            "observation": "A tool returned an unusable success payload.",
+            "attribution": "agent", "capability": "result validation",
+            "expected_outcome": "Reject unusable success payloads.",
+            "validation_scope": "the frozen tool failure",
+            "claim_boundary": "does not cover unrelated tools",
+        }
+        case_path = cases / f"{case['id']}.json"
+        case_path.write_text(json.dumps(case), encoding="utf-8")
+        manifest = {
+            "schema_version": 1, "run_id": run.name, "project": "repo",
+            "source_commits": [], "items": [{
+                "id": "E1", "title": "Empty tool result", "category": "eval",
+                "file": f"eval-cases/{case['id']}.json", "status": "proposed",
+                "validation_scope": case["validation_scope"],
+                "claim_boundary": case["claim_boundary"],
+            }],
+        }
+        manifest_path = outbox / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        decided = self.run_tool(
+            STATE, "--run", str(run), "learning-item-decision", "E1",
+            "--outcome", "approved", "--evidence", "reviewed by coordinator",
+        )
+        self.assertEqual(decided.returncode, 0, decided.stderr)
+        approved = json.loads(case_path.read_text(encoding="utf-8"))
+        self.assertEqual(approved["status"], "approved")
+        self.assertEqual(approved["decision"]["authority"], "coordinator")
+        approved_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(approved_manifest["items"][0]["decision"],
+                         approved["decision"])
+        events = [json.loads(line) for line in
+                  (run / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+        decision_event = next(item for item in events
+                              if item.get("event") == "learning_item_decided")
+        encoded = json.dumps(approved, sort_keys=True,
+                             separators=(",", ":")).encode()
+        self.assertEqual(decision_event["case_sha256"],
+                         hashlib.sha256(encoded).hexdigest())
+
+    def test_coordinator_decision_supports_non_eval_learning_items(self):
+        run = self.init_run("knowledge-decision")
+        for phase in ("SPEC_READY", "PLAN_READY", "LEARNING_EXPORT"):
+            self.run_tool(STATE, "--run", str(run), "phase", phase, check=True)
+        outbox = run / "learning-outbox"
+        outbox.mkdir(parents=True)
+        manifest_path = outbox / "manifest.json"
+        manifest_path.write_text(json.dumps({
+            "schema_version": 1, "run_id": run.name, "project": "repo",
+            "source_commits": [], "items": [{
+                "id": "K1", "title": "Durable knowledge",
+                "category": "knowledge", "file": "knowledge.md",
+                "section": "Durable knowledge", "status": "proposed",
+                "validation_scope": "the tested repository behavior",
+                "claim_boundary": "does not cover unrelated repositories",
+            }],
+        }), encoding="utf-8")
+
+        decided = self.run_tool(
+            STATE, "--run", str(run), "learning-item-decision", "K1",
+            "--outcome", "approved", "--evidence", "coordinator checked source",
+        )
+        self.assertEqual(decided.returncode, 0, decided.stderr)
+        item = json.loads(manifest_path.read_text(encoding="utf-8"))["items"][0]
+        self.assertEqual(item["status"], "approved")
+        events = [
+            json.loads(line)
+            for line in (run / "events.jsonl").read_text(
+                encoding="utf-8"
+            ).splitlines()
+        ]
+        event = next(
+            record for record in events
+            if record.get("event") == "learning_item_decided"
+            and record.get("item") == "K1"
+        )
+        self.assertEqual(event["category"], "knowledge")
+        encoded = json.dumps(item, sort_keys=True, separators=(",", ":")).encode()
+        self.assertEqual(event["item_sha256"], hashlib.sha256(encoded).hexdigest())
+
+
 class WorkerTests(RepoCase):
+    def test_worker_rejects_symlinked_workers_root_before_writing(self):
+        run = self.init_run("worker-root-symlink")
+        self.make_task(run)
+        self.start_wave(run)
+        workers = run / "workers"
+        if workers.exists():
+            shutil.rmtree(workers)
+        outside = Path(self.tmp.name) / "outside-workers"
+        outside.mkdir()
+        workers.symlink_to(outside, target_is_directory=True)
+        rejected = self.run_tool(
+            WORKER, "spawn", "--run", str(run), "--task", "T01",
+            "--role", "developer",
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertFalse(list(outside.iterdir()))
+
     def test_schema_gate_runs_before_any_writable_worker_process(self):
         run = self.init_run()
         self.make_task(run)
@@ -1682,7 +2239,15 @@ class WorkerTests(RepoCase):
         fake_bin.mkdir()
         fake = fake_bin / "codex"
         fake.write_text(
-            "#!/usr/bin/env python3\nprint('digest without required fields')\n",
+            "#!/usr/bin/env python3\n"
+            "import json, sys\nfrom pathlib import Path\n"
+            "if '--version' in sys.argv:\n print('codex-cli test-worker'); raise SystemExit\n"
+            "args=sys.argv[1:]; msg='digest without required fields'\n"
+            "Path(args[args.index('--output-last-message')+1]).write_text(msg)\n"
+            "print(json.dumps({'type':'thread.started','thread_id':'worker'}))\n"
+            "print(json.dumps({'type':'turn.started'}))\n"
+            "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':msg}}))\n"
+            "print(json.dumps({'type':'turn.completed','usage':{}}))\n",
             encoding="utf-8",
         )
         fake.chmod(0o755)
@@ -1721,9 +2286,13 @@ class WorkerTests(RepoCase):
         fake.write_text(
             "#!/usr/bin/env python3\n"
             "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "if '--version' in sys.argv:\n print('codex-cli test-worker'); raise SystemExit\n"
             "json.dump({'cwd': os.getcwd(), 'args': sys.argv[1:]}, open(os.environ['FAKE_CODEX_TRACE'], 'w'))\n"
-            "print('Validation scope: fake worker execution')\n"
-            "print('Claim boundary: fake does not validate production behavior')\n",
+            "args=sys.argv[1:]; msg='Validation scope: fake worker execution\\nClaim boundary: fake does not validate production behavior'\n"
+            "Path(args[args.index('--output-last-message')+1]).write_text(msg)\n"
+            "print(json.dumps({'type':'thread.started','thread_id':'worker'}))\nprint(json.dumps({'type':'turn.started'}))\n"
+            "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':msg}}))\nprint(json.dumps({'type':'turn.completed','usage':{}}))\n",
             encoding="utf-8",
         )
         fake.chmod(0o755)
@@ -1746,6 +2315,7 @@ class WorkerTests(RepoCase):
         self.assertEqual(seen["args"][4], "workspace-write")
         self.assertEqual(seen["args"][5:7], ["--model", "gpt-5.6-terra"])
         self.assertIn('model_reasoning_effort="low"', seen["args"])
+        self.assertIn('model_provider="openai"', seen["args"])
         record = json.loads((run / "workers/T01.json").read_text(encoding="utf-8"))
         result = json.loads((run / "workers/T01.result.json").read_text(encoding="utf-8"))
         self.assertEqual(record["cwd"], str(worktree))
@@ -1763,9 +2333,13 @@ class WorkerTests(RepoCase):
         fake.write_text(
             "#!/usr/bin/env python3\n"
             "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "if '--version' in sys.argv:\n print('codex-cli test-worker'); raise SystemExit\n"
             "json.dump({'args': sys.argv[1:]}, open(os.environ['FAKE_CODEX_TRACE'], 'w'))\n"
-            "print('Validation scope: fake worker execution')\n"
-            "print('Claim boundary: fake does not validate production behavior')\n",
+            "args=sys.argv[1:]; msg='Validation scope: fake worker execution\\nClaim boundary: fake does not validate production behavior'\n"
+            "Path(args[args.index('--output-last-message')+1]).write_text(msg)\n"
+            "print(json.dumps({'type':'thread.started','thread_id':'worker'}))\nprint(json.dumps({'type':'turn.started'}))\n"
+            "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':msg}}))\nprint(json.dumps({'type':'turn.completed','usage':{}}))\n",
             encoding="utf-8",
         )
         fake.chmod(0o755)
@@ -1788,9 +2362,12 @@ class WorkerTests(RepoCase):
         fake_bin.mkdir()
         fake = fake_bin / "codex"
         fake.write_text(
-            "#!/usr/bin/env python3\nimport time\ntime.sleep(0.8)\n"
-            "print('Validation scope: fake worker execution')\n"
-            "print('Claim boundary: fake does not validate production behavior')\n",
+            "#!/usr/bin/env python3\nimport json, sys, time\nfrom pathlib import Path\n"
+            "if '--version' in sys.argv:\n print('codex-cli test-worker'); raise SystemExit\n"
+            "time.sleep(0.8)\nargs=sys.argv[1:]; msg='Validation scope: fake worker execution\\nClaim boundary: fake does not validate production behavior'\n"
+            "Path(args[args.index('--output-last-message')+1]).write_text(msg)\n"
+            "print(json.dumps({'type':'thread.started','thread_id':'worker'}))\nprint(json.dumps({'type':'turn.started'}))\n"
+            "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':msg}}))\nprint(json.dumps({'type':'turn.completed','usage':{}}))\n",
             encoding="utf-8",
         )
         fake.chmod(0o755)
@@ -1818,7 +2395,8 @@ class WorkerTests(RepoCase):
         fake = fake_bin / "codex"
         fake.write_text(
             "#!/usr/bin/env python3\n"
-            "import signal, time\n"
+            "import signal, sys, time\n"
+            "if '--version' in sys.argv:\n print('codex-cli test-worker'); raise SystemExit\n"
             "signal.signal(signal.SIGTERM, lambda *_: None)\n"
             "while True: time.sleep(0.1)\n", encoding="utf-8")
         fake.chmod(0o755)
@@ -1846,6 +2424,7 @@ class WorkerTests(RepoCase):
         fake.write_text(
             "#!/usr/bin/env python3\n"
             "import signal, sys, time\n"
+            "if '--version' in sys.argv:\n print('codex-cli test-worker'); raise SystemExit\n"
             "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n"
             "while True: time.sleep(0.1)\n",
             encoding="utf-8",
@@ -1880,13 +2459,35 @@ class WorkerTests(RepoCase):
         self.run_tool(STATE, "--run", str(run), "phase", "LEARNING_EXPORT", check=True)
         fake_bin = Path(self.tmp.name) / "bin-harvest"
         fake_bin.mkdir()
+        evidence = run / "evidence/eval-source.txt"
+        evidence.parent.mkdir(parents=True)
+        evidence.write_text("confirmed tool failure\n", encoding="utf-8")
+        eval_case = {
+            "schema_version": 1, "id": "eval-confirmed-tool-failure",
+            "status": "candidate", "source": {
+                "kind": "tool-failure", "run_id": run.name,
+                "evidence": "evidence/eval-source.txt",
+                "sha256": hashlib.sha256(evidence.read_bytes()).hexdigest(),
+            },
+            "observation": "A successful tool call returned no usable result.",
+            "attribution": "agent", "capability": "tool result validation",
+            "expected_outcome": "Escalate an empty successful tool result.",
+            "validation_scope": "the frozen tool-failure evidence",
+            "claim_boundary": "does not cover other tool adapters",
+        }
         fake = fake_bin / "codex"
         fake.write_text(
             "#!/usr/bin/env python3\n"
-            "from pathlib import Path\n"
-            "p=Path('.qteam-learning-outbox'); p.mkdir(); (p/'manifest.json').write_text('{}')\n"
-            "print('Validation scope: fake learning outbox')\n"
-            "print('Claim boundary: fake does not validate durable knowledge')\n",
+            "import json, sys\nfrom pathlib import Path\n"
+            "if '--version' in sys.argv:\n print('codex-cli test-worker'); raise SystemExit\n"
+            "p=Path('.qteam-learning-outbox'); p.mkdir(); "
+            "(p/'manifest.json').write_text(json.dumps({'schema_version':1,'run_id':'test-run','project':'repo','items':[{'id':'E1','title':'Confirmed tool failure','category':'eval','file':'eval-cases/eval-confirmed-tool-failure.json','status':'proposed','validation_scope':'the frozen tool-failure evidence','claim_boundary':'does not cover other tool adapters'}]}))\n"
+            "e=p/'eval-cases'; e.mkdir(); "
+            f"(e/'eval-confirmed-tool-failure.json').write_text({json.dumps(json.dumps(eval_case))})\n"
+            "args=sys.argv[1:]; msg='Validation scope: fake learning outbox\\nClaim boundary: fake does not validate durable knowledge'\n"
+            "Path(args[args.index('--output-last-message')+1]).write_text(msg)\n"
+            "print(json.dumps({'type':'thread.started','thread_id':'worker'}))\nprint(json.dumps({'type':'turn.started'}))\n"
+            "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':msg}}))\nprint(json.dumps({'type':'turn.completed','usage':{}}))\n",
             encoding="utf-8")
         fake.chmod(0o755)
         env = os.environ.copy()
@@ -1895,9 +2496,31 @@ class WorkerTests(RepoCase):
                       "--role", "knowledge-distiller", env=env, check=True)
         self.run_tool(WORKER, "wait", "--run", str(run), "--task", "T01",
                       "--timeout", "10", env=env, check=True)
+        task_before_harvest = json.loads(
+            (run / "tasks/T01.json").read_text(encoding="utf-8")
+        )
+        worker_manifest_path = (
+            Path(task_before_harvest["worktree"])
+            / ".qteam-learning-outbox/manifest.json"
+        )
+        worker_manifest = json.loads(
+            worker_manifest_path.read_text(encoding="utf-8")
+        )
+        worker_manifest["items"][0]["status"] = "approved"
+        worker_manifest_path.write_text(json.dumps(worker_manifest), encoding="utf-8")
+        forged = self.run_tool(
+            WORKER, "harvest", "--run", str(run), "--task", "T01"
+        )
+        self.assertNotEqual(forged.returncode, 0)
+        self.assertIn("only proposed learning items", forged.stderr)
+        self.assertFalse((run / "learning-outbox").exists())
+        worker_manifest["items"][0]["status"] = "proposed"
+        worker_manifest_path.write_text(json.dumps(worker_manifest), encoding="utf-8")
         harvested = self.run_tool(WORKER, "harvest", "--run", str(run), "--task", "T01")
         self.assertEqual(harvested.returncode, 0, harvested.stderr)
         self.assertTrue((run / "learning-outbox/manifest.json").is_file())
+        self.assertTrue((run / "learning-outbox/eval-cases/"
+                         "eval-confirmed-tool-failure.json").is_file())
         task = json.loads((run / "tasks/T01.json").read_text(encoding="utf-8"))
         self.assertEqual(task["status"], "artifact_complete")
         self.assertFalse((Path(task["worktree"]) / ".qteam-learning-outbox").exists())
@@ -1922,9 +2545,12 @@ class WorkerTests(RepoCase):
         fake_bin.mkdir()
         fake = fake_bin / "codex"
         fake.write_text(
-            "#!/usr/bin/env python3\n"
-            "print('Validation scope: fake worker execution')\n"
-            "print('Claim boundary: fake does not validate production behavior')\n",
+            "#!/usr/bin/env python3\nimport json, sys\nfrom pathlib import Path\n"
+            "if '--version' in sys.argv:\n print('codex-cli test-worker'); raise SystemExit\n"
+            "args=sys.argv[1:]; msg='Validation scope: fake worker execution\\nClaim boundary: fake does not validate production behavior'\n"
+            "Path(args[args.index('--output-last-message')+1]).write_text(msg)\n"
+            "print(json.dumps({'type':'thread.started','thread_id':'worker'}))\nprint(json.dumps({'type':'turn.started'}))\n"
+            "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':msg}}))\nprint(json.dumps({'type':'turn.completed','usage':{}}))\n",
             encoding="utf-8",
         )
         fake.chmod(0o755)
@@ -2013,11 +2639,14 @@ class WorkerTests(RepoCase):
         fake = fake_bin / "codex"
         fake.write_text(
             "#!/usr/bin/env python3\n"
-            "from pathlib import Path\n"
+            "import json, sys\nfrom pathlib import Path\n"
+            "if '--version' in sys.argv:\n print('codex-cli test-worker'); raise SystemExit\n"
             "p=Path('real-outbox'); p.mkdir(); (p/'manifest.json').write_text('{}')\n"
             "Path('.qteam-learning-outbox').symlink_to(p, target_is_directory=True)\n"
-            "print('Validation scope: fake learning outbox')\n"
-            "print('Claim boundary: fake does not validate durable knowledge')\n",
+            "args=sys.argv[1:]; msg='Validation scope: fake learning outbox\\nClaim boundary: fake does not validate durable knowledge'\n"
+            "Path(args[args.index('--output-last-message')+1]).write_text(msg)\n"
+            "print(json.dumps({'type':'thread.started','thread_id':'worker'}))\nprint(json.dumps({'type':'turn.started'}))\n"
+            "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':msg}}))\nprint(json.dumps({'type':'turn.completed','usage':{}}))\n",
             encoding="utf-8")
         fake.chmod(0o755)
         env = os.environ.copy()
@@ -2485,6 +3114,72 @@ class GateTests(RepoCase):
 
 
 class ReviewTests(RepoCase):
+    def test_review_packets_pin_judge_profile_trajectory_and_calibration(self):
+        run = self.init_run(
+            "judge-run", "--review-model-standard", "gpt-5.6-sol"
+        )
+        self.run_tool(
+            REVIEW, "--run", str(run), "create", "--wave", "1",
+            "--axis", "spec", "--base", "HEAD", "--head", "HEAD",
+            "--spec-source", "README.md", check=True,
+        )
+        ledger_path = run / "reviews/wave-1-spec.json"
+        packet = json.loads(ledger_path.read_text(encoding="utf-8"))["packet"]
+        self.assertEqual(packet["schema_version"], 3)
+        self.assertEqual(packet["review_execution"]["model"], "gpt-5.6-sol")
+        self.assertEqual(packet["review_execution"]["provider"], "openai")
+        self.assertEqual(packet["calibration"]["axis"], "spec")
+        self.assertEqual(packet["trajectory"]["tasks"], [])
+        self.assertNotIn("stdout", json.dumps(packet["trajectory"]))
+        self.complete_review(
+            run, ledger_path, "spec", "spec-reviewer", "judge-session"
+        )
+        review_trace = json.loads((
+            Path(self.tmp.name) / "review-judge-session.trace.json"
+        ).read_text(encoding="utf-8"))
+        self.assertIn('model_provider="openai"', review_trace["args"])
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        receipt_path = run / ledger["attestation"]["receipt"]
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            receipt["runner"]["version"], packet["runner"]["version"]
+        )
+        self.assertEqual(
+            receipt["calibration_sha256"], packet["calibration"]["sha256"]
+        )
+        stdout_log = run / receipt["stdout_log"]
+        original_trace = stdout_log.read_bytes()
+        stdout_log.write_bytes(original_trace + b"{}\n")
+        tampered = self.run_tool(
+            REVIEW, "--run", str(run), "check", "--wave", "1", "--head", "HEAD"
+        )
+        self.assertNotEqual(tampered.returncode, 0)
+        self.assertIn("completed review evaluation failure",
+                      tampered.stdout + tampered.stderr)
+        stdout_log.write_bytes(original_trace)
+
+        self.run_tool(
+            REVIEW, "--run", str(run), "create", "--wave", "1",
+            "--axis", "standards", "--base", "HEAD", "--head", "HEAD",
+            "--standards-source", "README.md", check=True,
+        )
+        wrong = self.complete_review(
+            run, run / "reviews/wave-1-standards.json", "standards",
+            "standards-reviewer", "bad-calibration",
+            result_payload={
+                "axis": "standards", "verdict": "pass", "findings": [],
+                "resolved_ids": [], "invalid_ids": [], "upheld_ids": [],
+                "invalid_evidence": {},
+                "calibration_results": {
+                    "cal-standards-01": "pass",
+                    "cal-standards-02": "pass",
+                },
+            },
+            check=False,
+        )
+        self.assertNotEqual(wrong.returncode, 0)
+        self.assertIn("calibration", wrong.stderr)
+
     def test_review_commit_rechecks_publication_seal_inside_lock(self):
         run = self.init_run()
         self.run_tool(
@@ -2524,6 +3219,45 @@ class ReviewTests(RepoCase):
             module.cmd_add(args, self.repo, None)
         self.assertEqual(ledger.read_bytes(), before)
 
+    def test_unstarted_review_packet_can_refresh_runner_once(self):
+        run = self.init_run("runner-refresh")
+        args = (
+            REVIEW, "--run", str(run), "create", "--wave", "1",
+            "--axis", "spec", "--base", "HEAD", "--head", "HEAD",
+            "--spec-source", "README.md",
+        )
+        self.run_tool(*args, check=True)
+        ledger = run / "reviews/wave-1-spec.json"
+        original = json.loads(ledger.read_text(encoding="utf-8"))["packet"]["runner"]
+        fake_bin = Path(self.tmp.name) / "runner-refresh-bin"
+        fake_bin.mkdir()
+        fake = fake_bin / "codex"
+        fake.write_text(
+            "#!/usr/bin/env python3\nimport os, sys\n"
+            "if '--version' in sys.argv: print(os.environ['RUNNER_VERSION'])\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+        env = os.environ.copy()
+        env["PATH"] = f"{fake_bin}:{env['PATH']}"
+        env["RUNNER_VERSION"] = original["version"] + "-new"
+        stale = self.run_tool(*args, env=env)
+        self.assertNotEqual(stale.returncode, 0)
+        refreshed = self.run_tool(*args, "--refresh-runner", env=env)
+        self.assertEqual(refreshed.returncode, 0, refreshed.stderr)
+        packet = json.loads(ledger.read_text(encoding="utf-8"))["packet"]
+        self.assertEqual(packet["runner"]["version"], env["RUNNER_VERSION"])
+
+        receipts = run / "reviews/receipts"
+        receipts.mkdir()
+        (receipts / "attempt.json").write_text(json.dumps({
+            "ledger": "reviews/wave-1-spec.json", "status": "failed",
+        }), encoding="utf-8")
+        env["RUNNER_VERSION"] += "-later"
+        blocked = self.run_tool(*args, "--refresh-runner", env=env)
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn("immutable inputs", blocked.stderr)
+
     def test_review_rejects_wave_absent_from_derived_run_policy(self):
         run = self.init_run()
         self.make_task(run, work_kind="config", write_set=["src/auth/**"])
@@ -2553,6 +3287,68 @@ class ReviewTests(RepoCase):
         )
         self.assertNotEqual(malformed.returncode, 0)
         self.assertIn("non-empty id", malformed.stderr)
+
+    def test_reviewer_result_rejects_unbounded_extra_payload_fields(self):
+        run = self.init_run("review-redaction")
+        self.run_tool(
+            REVIEW, "--run", str(run), "create", "--wave", "1",
+            "--axis", "spec", "--base", "HEAD", "--head", "HEAD",
+            "--spec-source", "README.md", check=True,
+        )
+        ledger = run / "reviews/wave-1-spec.json"
+        blocked = self.complete_review(
+            run, ledger, "spec", "spec-reviewer", "extra-payload",
+            result_payload={
+                "axis": "spec", "verdict": "pass", "findings": [],
+                "resolved_ids": [], "invalid_ids": [], "upheld_ids": [],
+                "invalid_evidence": {}, "raw_tool_output": "TOP-SECRET-RAW",
+            }, check=False,
+        )
+        self.assertNotEqual(blocked.returncode, 0)
+        saved = json.loads(ledger.read_text(encoding="utf-8"))
+        self.assertNotIn("attestation", saved)
+
+    def test_deep_reviewer_json_fails_with_durable_receipt(self):
+        run = self.init_run("deep-review-result")
+        self.run_tool(
+            REVIEW, "--run", str(run), "create", "--wave", "1",
+            "--axis", "spec", "--base", "HEAD", "--head", "HEAD",
+            "--spec-source", "README.md", check=True,
+        )
+        ledger = run / "reviews/wave-1-spec.json"
+        blocked = self.complete_review(
+            run, ledger, "spec", "spec-reviewer", "deep-result",
+            check=False,
+            run_env_extra={
+                "FAKE_REVIEW_RESULT": "[" * 2000 + "0" + "]" * 2000,
+            },
+        )
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertNotIn("Traceback", blocked.stderr)
+        receipt = json.loads((
+            run / "reviews/receipts/deep-result.json"
+        ).read_text(encoding="utf-8"))
+        self.assertEqual(receipt["status"], "failed")
+        self.assertEqual(receipt["exit_code"], 65)
+
+    def test_reviewer_with_escalated_trajectory_cannot_attest(self):
+        run = self.init_run("review-escalation")
+        self.run_tool(
+            REVIEW, "--run", str(run), "create", "--wave", "1",
+            "--axis", "spec", "--base", "HEAD", "--head", "HEAD",
+            "--spec-source", "README.md", check=True,
+        )
+        ledger = run / "reviews/wave-1-spec.json"
+        blocked = self.complete_review(
+            run, ledger, "spec", "spec-reviewer", "escalated-review",
+            check=False, run_env_extra={"FAKE_REVIEW_FAILED_CALLS": "5"},
+        )
+        self.assertNotEqual(blocked.returncode, 0)
+        receipt = json.loads((
+            run / "reviews/receipts/escalated-review.json"
+        ).read_text(encoding="utf-8"))
+        self.assertEqual(receipt["status"], "failed")
+        self.assertEqual(receipt["trajectory"]["disposition"], "escalate")
 
     def test_reviewer_runner_rejects_finding_id_unusable_by_fix_tasks(self):
         run = self.init_run()
@@ -2713,6 +3509,91 @@ class ReviewTests(RepoCase):
         self.assertEqual([item["id"] for item in saved["findings"]], ["F-ATOMIC"])
         self.assertEqual(saved["review_attempts"][0]["session_id"],
                          "atomic-needs-fix")
+
+    def test_review_wal_rejects_unbound_finding_injection(self):
+        run = self.init_run("review-wal-forgery")
+        self.run_tool(
+            REVIEW, "--run", str(run), "create", "--wave", "1",
+            "--axis", "spec", "--base", "HEAD", "--head", "HEAD",
+            "--spec-source", "README.md", check=True,
+        )
+        ledger_path = run / "reviews/wave-1-spec.json"
+        original = json.loads(ledger_path.read_text(encoding="utf-8"))
+        forged = json.loads(json.dumps(original))
+        forged["findings"].append({"id": "FORGED", "status": "open"})
+        forged["review_attempts"] = [{
+            "status": "needs-fix", "finding_ids": ["FORGED"],
+        }]
+        intent = run / "reviews/.closure-transaction.json"
+        intent.write_text(json.dumps({
+            "schema_version": 1, "txid": "a" * 32,
+            "writes": {"wave-1-spec.json": forged},
+        }), encoding="utf-8")
+        rejected = self.run_tool(
+            REVIEW, "add", "--ledger", str(ledger_path), "--id", "F-REAL",
+            "--severity", "P1", "--title", "real", "--body", "evidence",
+            "--impact", "impact", "--fix-direction", "fix", "--owner", "fixer",
+            "--reviewer", "reviewer",
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertNotIn("Traceback", rejected.stderr)
+        self.assertEqual(json.loads(ledger_path.read_text(encoding="utf-8")), original)
+        self.assertTrue(intent.exists())
+
+    def test_review_wal_recovers_after_final_completion_write(self):
+        run = self.init_run("review-final-write-recovery")
+        self.run_tool(
+            REVIEW, "--run", str(run), "create", "--wave", "1",
+            "--axis", "spec", "--base", "HEAD", "--head", "HEAD",
+            "--spec-source", "README.md", check=True,
+        )
+        ledger = run / "reviews/wave-1-spec.json"
+        fault = os.environ.copy()
+        fault["QTEAM_FAULT_AFTER_REVIEW_WRITES"] = "1"
+        interrupted = self.complete_review(
+            run, ledger, "spec", "spec-reviewer", "final-write-crash",
+            check=False, complete_env=fault,
+        )
+        self.assertNotEqual(interrupted.returncode, 0)
+        receipt = run / "reviews/receipts/final-write-crash.json"
+        recovered = self.run_tool(
+            REVIEW, "complete", "--ledger", str(ledger),
+            "--receipt", str(receipt),
+        )
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertFalse((run / "reviews/.closure-transaction.json").exists())
+
+    def test_review_create_rejects_symlinked_nested_artifact_directory(self):
+        run = self.init_run("review-dir-symlink")
+        outside = Path(self.tmp.name) / "outside-review-sources"
+        outside.mkdir()
+        (run / "reviews").mkdir()
+        (run / "reviews/sources").symlink_to(outside, target_is_directory=True)
+        rejected = self.run_tool(
+            REVIEW, "--run", str(run), "create", "--wave", "1",
+            "--axis", "spec", "--base", "HEAD", "--head", "HEAD",
+            "--spec-source", "README.md",
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertFalse(list(outside.iterdir()))
+
+    def test_reviewer_rejects_non_object_packet_trajectory_without_traceback(self):
+        run = self.init_run("review-malformed-trajectory")
+        self.run_tool(
+            REVIEW, "--run", str(run), "create", "--wave", "1",
+            "--axis", "spec", "--base", "HEAD", "--head", "HEAD",
+            "--spec-source", "README.md", check=True,
+        )
+        ledger = run / "reviews/wave-1-spec.json"
+        value = json.loads(ledger.read_text(encoding="utf-8"))
+        value["packet"]["trajectory"] = []
+        ledger.write_text(json.dumps(value), encoding="utf-8")
+        rejected = self.run_tool(
+            REVIEW, "run", "--ledger", str(ledger), "--reviewer", "reviewer",
+            "--session-id", "malformed-trajectory",
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertNotIn("Traceback", rejected.stderr)
 
     def test_tampered_frozen_source_blocks_reviewer_run(self):
         run = self.init_run()
@@ -3718,6 +4599,76 @@ class FinishTests(RepoCase):
 
 
 class InvariantTests(RepoCase):
+    def test_schema6_wal_cannot_drop_security_and_execution_core(self):
+        run = self.init_run("v6-wal-core")
+        state_path = run / "state.json"
+        original = json.loads(state_path.read_text(encoding="utf-8"))
+        weakened = json.loads(json.dumps(original))
+        for field in (
+            "risk_forced", "hard_to_reverse", "waves", "model_profiles",
+            "review_model_profiles", "integration_provenance",
+            "integration_provenance_head",
+        ):
+            weakened.pop(field)
+        intent = {
+            "schema_version": 1, "txid": "bad-v6-core",
+            "writes": {"state.json": weakened},
+            "event": {"event": "tampered"},
+        }
+        intent_path = run / ".transaction.json"
+        intent_path.write_text(json.dumps(intent), encoding="utf-8")
+        rejected = self.run_tool(STATE, "--run", str(run), "show")
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertNotIn("Traceback", rejected.stderr)
+        self.assertEqual(json.loads(state_path.read_text(encoding="utf-8")), original)
+        self.assertTrue(intent_path.exists())
+
+    def test_forged_wal_cannot_jump_current_run_directly_to_done(self):
+        run = self.init_run("forged-done-wal")
+        state_path = run / "state.json"
+        original = json.loads(state_path.read_text(encoding="utf-8"))
+        forged = json.loads(json.dumps(original))
+        forged["phase"] = "DONE"
+        forged["finished"] = True
+        intent_path = run / ".transaction.json"
+        intent_path.write_text(json.dumps({
+            "schema_version": 1, "txid": "forged-finish",
+            "writes": {"state.json": forged},
+            "event": {"event": "phase", "from": "INIT", "to": "DONE"},
+        }), encoding="utf-8")
+        rejected = self.run_tool(STATE, "--run", str(run), "show")
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("legacy run transactions", rejected.stderr)
+        self.assertEqual(json.loads(state_path.read_text(encoding="utf-8")), original)
+        self.assertTrue(intent_path.exists())
+
+    def test_v5_migration_preserves_custom_profiles_and_risk_override(self):
+        run = self.init_run("v5-custom")
+        state_path = run / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["schema_version"] = 5
+        state["risk_required"] = True
+        state["risk_forced"] = False
+        state["model_profiles"] = {
+            "economy": {"model": "custom-e", "thinking": "low"},
+            "standard": {"model": "custom-s", "thinking": "high"},
+            "deep": {"model": "custom-d", "thinking": "xhigh"},
+        }
+        state.pop("review_model_profiles", None)
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        migrated = self.run_tool(STATE, "--run", str(run), "migrate-run")
+        self.assertEqual(migrated.returncode, 0, migrated.stderr)
+        updated = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertFalse(updated["risk_forced"])
+        self.assertEqual(
+            [updated["model_profiles"][tier]["model"]
+             for tier in ("economy", "standard", "deep")],
+            ["custom-e", "custom-s", "custom-d"],
+        )
+        self.assertEqual(updated["review_model_profiles"]["standard"]["model"],
+                         "custom-s")
+        self.assertEqual(updated["model_profiles"]["deep"]["provider"], "openai")
+
     def test_unsafe_task_id_and_done_mutation_are_rejected(self):
         run = self.init_run()
         unsafe = self.run_tool(STATE, "--run", str(run), "task-status",
@@ -3794,14 +4745,82 @@ class InvariantTests(RepoCase):
         run = self.init_run()
         state = json.loads((run / "state.json").read_text(encoding="utf-8"))
         state["goal"] = "recovered goal"
-        intent = {"schema_version": 1, "txid": "recovery-test",
+        intent = {"schema_version": 2, "txid": "recovery-test",
                   "writes": {"state.json": state},
                   "event": {"event": "recovered_test"}}
+        digest = hashlib.sha256(json.dumps(
+            intent, sort_keys=True, separators=(",", ":")
+        ).encode()).hexdigest()
+        with (run / "events.jsonl").open("a", encoding="utf-8") as events:
+            events.write(json.dumps({
+                "event": "transaction_prepared", "prepared_txid": "recovery-test",
+                "transaction_sha256": digest,
+            }) + "\n")
         (run / ".transaction.json").write_text(json.dumps(intent), encoding="utf-8")
         shown = self.run_tool(STATE, "--run", str(run), "show")
         self.assertEqual(shown.returncode, 0, shown.stderr)
         self.assertEqual(json.loads(shown.stdout)["goal"], "recovered goal")
         self.assertFalse((run / ".transaction.json").exists())
+
+    def test_truncated_final_event_is_repaired_before_public_command(self):
+        run = self.init_run()
+        with (run / "events.jsonl").open("ab") as events:
+            events.write(b"{")
+
+        advanced = self.run_tool(
+            STATE, "--run", str(run), "phase", "SPEC_READY"
+        )
+        self.assertEqual(advanced.returncode, 0, advanced.stderr)
+        self.assertFalse((run / ".transaction.json").exists())
+        records = [
+            json.loads(line)
+            for line in (run / "events.jsonl").read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if line.strip()
+        ]
+        self.assertTrue(all(isinstance(record, dict) for record in records))
+        self.assertEqual(
+            json.loads((run / "state.json").read_text(encoding="utf-8"))["phase"],
+            "SPEC_READY",
+        )
+
+    def test_completed_old_wal_cannot_replay_stale_state(self):
+        run = self.init_run()
+        old_state = json.loads((run / "state.json").read_text(encoding="utf-8"))
+        self.run_tool(
+            STATE, "--run", str(run), "phase", "SPEC_READY", check=True
+        )
+        current = (run / "state.json").read_bytes()
+        intent = {
+            "schema_version": 2,
+            "txid": "completed-old-transaction",
+            "writes": {"state.json": old_state},
+            "event": {
+                "event": "phase", "from": "INIT", "to": "SPEC_READY",
+            },
+        }
+        digest = hashlib.sha256(json.dumps(
+            intent, sort_keys=True, separators=(",", ":")
+        ).encode()).hexdigest()
+        with (run / "events.jsonl").open("a", encoding="utf-8") as events:
+            events.write(json.dumps({
+                "event": "transaction_prepared",
+                "prepared_txid": intent["txid"],
+                "transaction_sha256": digest,
+            }) + "\n")
+            events.write(json.dumps({
+                "event": "phase", "txid": intent["txid"],
+                "from": "INIT", "to": "SPEC_READY",
+            }) + "\n")
+        transaction_path = run / ".transaction.json"
+        transaction_path.write_text(json.dumps(intent), encoding="utf-8")
+
+        rejected = self.run_tool(STATE, "--run", str(run), "show")
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("cannot replay stale writes", rejected.stderr)
+        self.assertEqual((run / "state.json").read_bytes(), current)
+        self.assertTrue(transaction_path.exists())
 
     def test_malformed_wal_never_overwrites_valid_run_state(self):
         run = self.init_run()
@@ -3840,8 +4859,34 @@ class InvariantTests(RepoCase):
         migrated = self.run_tool(STATE, "--run", str(run), "migrate-v2")
         self.assertEqual(migrated.returncode, 0, migrated.stderr)
         current = json.loads(state_path.read_text(encoding="utf-8"))
-        self.assertEqual(current["schema_version"], 5)
+        self.assertEqual(current["schema_version"], 6)
         self.assertEqual(current["goal"], "recovered legacy goal")
+        self.assertFalse((run / ".transaction.json").exists())
+
+    def test_legacy_init_wal_recovers_when_state_file_is_missing(self):
+        run = self.init_run()
+        state_path = run / "state.json"
+        legacy = json.loads(state_path.read_text(encoding="utf-8"))
+        legacy["schema_version"] = 2
+        for field in (
+            "risk_forced", "model_profiles", "review_model_profiles", "runner",
+            "waves", "policy_migration_pending", "integration_provenance_head",
+            "integration_provenance", "hard_to_reverse",
+        ):
+            legacy.pop(field, None)
+        state_path.unlink()
+        intent = {
+            "schema_version": 1, "txid": "legacy-init-recovery",
+            "writes": {"state.json": legacy},
+            "event": {"event": "run_created"},
+        }
+        (run / ".transaction.json").write_text(
+            json.dumps(intent), encoding="utf-8"
+        )
+
+        shown = self.run_tool(STATE, "--run", str(run), "show")
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        self.assertEqual(json.loads(shown.stdout)["schema_version"], 2)
         self.assertFalse((run / ".transaction.json").exists())
 
     def test_reset_integration_cannot_hide_a_previously_merged_task(self):
@@ -3882,6 +4927,119 @@ class InvariantTests(RepoCase):
 
 
 class LearningImportTests(RepoCase):
+    def test_importer_rejects_run_id_traversal(self):
+        qnote = Path(self.tmp.name) / "qnote-traversal"
+        (qnote / "misc/ai/session-knowledge").mkdir(parents=True)
+        subprocess.run(["git", "init", "-b", "main"], cwd=qnote, check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        rejected = subprocess.run(
+            [sys.executable, str(IMPORT), str(self.repo), "../../escape"],
+            cwd=qnote, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(rejected.returncode, 2)
+        self.assertIn("safe direct-child identifier", rejected.stderr)
+
+    def test_importer_rejects_malformed_manifest_items_without_traceback(self):
+        run_id = "malformed-learning"
+        outbox = self.repo / ".agents/runs" / run_id / "learning-outbox"
+        outbox.mkdir(parents=True)
+        (outbox / "manifest.json").write_text(json.dumps({
+            "schema_version": 1, "run_id": run_id, "project": "repo",
+            "items": [[]],
+        }), encoding="utf-8")
+        qnote = Path(self.tmp.name) / "qnote-malformed"
+        (qnote / "misc/ai/session-knowledge").mkdir(parents=True)
+        subprocess.run(["git", "init", "-b", "main"], cwd=qnote, check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        rejected = subprocess.run(
+            [sys.executable, str(IMPORT), str(self.repo), run_id], cwd=qnote,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(rejected.returncode, 2)
+        self.assertIn("invalid learning manifest", rejected.stderr)
+        self.assertNotIn("Traceback", rejected.stderr)
+
+    def test_importer_only_promotes_eval_cases_bound_to_frozen_run_evidence(self):
+        run_id = "eval-import"
+        run = self.repo / ".agents/runs" / run_id
+        outbox = run / "learning-outbox"
+        cases = outbox / "eval-cases"
+        cases.mkdir(parents=True)
+        evidence = run / "reviews/wave-1-standards.json"
+        evidence.parent.mkdir(parents=True)
+        evidence.write_text('{"finding":"confirmed"}\n', encoding="utf-8")
+        case = {
+            "schema_version": 1, "id": "review-finding-empty-success",
+            "status": "approved", "source": {
+                "kind": "review-finding", "run_id": run_id,
+                "evidence": "reviews/wave-1-standards.json",
+                "sha256": hashlib.sha256(evidence.read_bytes()).hexdigest(),
+            },
+            "observation": "The implementation accepted an empty success result.",
+            "attribution": "agent", "capability": "result validation",
+            "expected_outcome": "Reject the empty success result.",
+            "validation_scope": "the confirmed review finding",
+            "claim_boundary": "does not cover unrelated result formats",
+            "decision": {
+                "authority": "coordinator", "outcome": "approved",
+                "evidence": "coordinator confirmed the review finding",
+                "decided_at": "2026-08-10T00:00:00+00:00",
+            },
+        }
+        case_path = cases / f"{case['id']}.json"
+        case_path.write_text(json.dumps(case), encoding="utf-8")
+        manifest = {
+            "schema_version": 1, "run_id": run_id, "project": "repo",
+            "source_commits": [], "items": [{
+                "id": "E1", "title": "Empty success regression",
+                "category": "eval", "file": f"eval-cases/{case['id']}.json",
+                "status": "approved",
+                "decision": case["decision"],
+                "validation_scope": "the confirmed review finding",
+                "claim_boundary": "does not cover unrelated result formats",
+            }],
+        }
+        (outbox / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        case_sha = hashlib.sha256(json.dumps(
+            case, sort_keys=True, separators=(",", ":")
+        ).encode()).hexdigest()
+        item_sha = hashlib.sha256(json.dumps(
+            manifest["items"][0], sort_keys=True, separators=(",", ":")
+        ).encode()).hexdigest()
+        (run / "events.jsonl").write_text(json.dumps({
+            "event": "learning_item_decided", "item": "E1",
+            "case_id": case["id"], "outcome": "approved",
+            "evidence": case["decision"]["evidence"],
+            "case_sha256": case_sha, "item_sha256": item_sha,
+        }) + "\n", encoding="utf-8")
+        qnote = Path(self.tmp.name) / "qnote-eval"
+        (qnote / "misc/ai/session-knowledge").mkdir(parents=True)
+        subprocess.run(["git", "init", "-b", "main"], cwd=qnote, check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        imported = subprocess.run(
+            [sys.executable, str(IMPORT), str(self.repo), run_id], cwd=qnote,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(imported.returncode, 0, imported.stderr)
+        destination = qnote / "misc/ai/session-knowledge/evals" / (
+            "repo-review-finding-empty-success-"
+            + hashlib.sha256(case["id"].encode()).hexdigest()[:12] + ".md"
+        )
+        self.assertIn(
+            '"expected_outcome": "Reject the empty success result."',
+            destination.read_text(encoding="utf-8"),
+        )
+
+        evidence.write_text('{"finding":"tampered"}\n', encoding="utf-8")
+        destination.unlink()
+        rejected = subprocess.run(
+            [sys.executable, str(IMPORT), str(self.repo), run_id], cwd=qnote,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(rejected.returncode, 0, rejected.stderr)
+        self.assertIn("evidence digest does not match", rejected.stdout)
+        self.assertFalse(destination.exists())
+
     def test_importer_requires_and_preserves_validation_claim_boundaries(self):
         run_id = "R1"
         outbox = self.repo / ".agents/runs" / run_id / "learning-outbox"
@@ -3921,6 +5079,29 @@ class LearningImportTests(RepoCase):
             "claim_boundary": "does not establish behavior for other integrations",
         })
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        unapproved = subprocess.run(
+            [sys.executable, str(IMPORT), str(self.repo), run_id], cwd=qnote,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(unapproved.returncode, 0, unapproved.stderr)
+        self.assertIn("missing bound coordinator approval", unapproved.stdout)
+        self.assertFalse(destination.exists())
+
+        decision = {
+            "authority": "coordinator", "outcome": "approved",
+            "evidence": "coordinator verified the frozen source",
+            "decided_at": "2026-08-10T00:00:00+00:00",
+        }
+        manifest["items"][0]["decision"] = decision
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        item_sha = hashlib.sha256(json.dumps(
+            manifest["items"][0], sort_keys=True, separators=(",", ":")
+        ).encode()).hexdigest()
+        (outbox.parent / "events.jsonl").write_text(json.dumps({
+            "event": "learning_item_decided", "item": "K1",
+            "category": "knowledge", "outcome": "approved",
+            "evidence": decision["evidence"], "item_sha256": item_sha,
+        }) + "\n", encoding="utf-8")
         imported = subprocess.run(
             [sys.executable, str(IMPORT), str(self.repo), run_id], cwd=qnote,
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -3985,6 +5166,7 @@ class InstallerTests(RepoCase):
         self.assertTrue((self.repo / ".codex/bin/agent-team-artifact").is_file())
         self.assertTrue((self.repo / ".codex/bin/agent_team_artifact.py").is_file())
         self.assertTrue((self.repo / ".codex/bin/agent_team_policy.py").is_file())
+        self.assertTrue((self.repo / ".codex/bin/agent_team_eval.py").is_file())
         self.assertTrue((self.repo / ".codex/bin/import-agent-learning").is_file())
         self.assertTrue((self.repo /
                          ".codex/schemas/review-receipt.schema.json").is_file())
@@ -3996,6 +5178,10 @@ class InstallerTests(RepoCase):
                          ".codex/schemas/handoff.schema.json").is_file())
         self.assertTrue((self.repo /
                          ".codex/schemas/scenario-coverage.schema.json").is_file())
+        self.assertTrue((self.repo /
+                         ".codex/schemas/trajectory.schema.json").is_file())
+        self.assertTrue((self.repo /
+                         ".codex/schemas/eval-case.schema.json").is_file())
         self.assertTrue((self.repo /
                          ".codex/schemas/artifact-lint.schema.json").is_file())
         self.assertTrue((self.repo / ".codex/schemas/epic.schema.json").is_file())
@@ -4491,6 +5677,9 @@ class PluginTests(RepoCase):
                 experiment_schema = ".codex/schemas/experiment.schema.json"
                 previous_paths = {
                     autoresearch_license, experiment_schema,
+                    ".codex/bin/agent_team_eval.py",
+                    ".codex/schemas/eval-case.schema.json",
+                    ".codex/schemas/trajectory.schema.json",
                     ".codex/licenses/LoopX-MIT.txt",
                     ".codex/licenses/Smart-Ralph-MIT.txt",
                     ".codex/bin/agent-team-artifact",
@@ -4555,6 +5744,9 @@ class PluginTests(RepoCase):
         manifest_path = self.repo / ".codex/qteam-project.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         additions = {
+            ".codex/bin/agent_team_eval.py",
+            ".codex/schemas/eval-case.schema.json",
+            ".codex/schemas/trajectory.schema.json",
             ".codex/licenses/LoopX-MIT.txt",
             ".codex/licenses/Smart-Ralph-MIT.txt",
             ".codex/bin/agent-team-artifact",
@@ -4655,7 +5847,10 @@ class InteractionContractTests(unittest.TestCase):
         self.assertIn("LoopX", notices)
         self.assertIn("does not import LoopX's token/quota economy", notices)
         self.assertIn("Copyright (c) 2026 LoopX contributors", license_text)
-        for schema in ("decision-gate", "handoff", "scenario-coverage"):
+        for schema in (
+            "decision-gate", "handoff", "scenario-coverage", "trajectory",
+            "eval-case",
+        ):
             self.assertTrue((PLUGIN / f"schemas/{schema}.schema.json").is_file())
 
     def test_published_schemas_encode_runtime_decision_handoff_scenario_rules(self):
@@ -4719,7 +5914,7 @@ class InteractionContractTests(unittest.TestCase):
         run_state = json.loads((
             PLUGIN / "schemas/run-state.schema.json"
         ).read_text(encoding="utf-8"))
-        self.assertEqual(run_state["properties"]["schema_version"]["const"], 5)
+        self.assertEqual(run_state["properties"]["schema_version"]["const"], 6)
 
 
 class ExplorationSkillTests(unittest.TestCase):

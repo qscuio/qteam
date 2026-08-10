@@ -11,6 +11,7 @@ verifies the manifest and its source commits, and imports APPROVED items only:
   knowledge → misc/ai/session-knowledge/knowledge/   (or item's destination)
   lessons   → misc/ai/session-knowledge/lessons/     (or item's destination)
   skills    → skills/proposals/<skill-name>/         (never a canonical skill)
+  evals     → misc/ai/session-knowledge/evals/       (frozen evidence only)
 
 Existing files are never overwritten without --update; duplicate titles at the
 destination are reported and skipped. This is the only step that writes to
@@ -18,15 +19,22 @@ qnote; nothing inside a run can.
 """
 
 import argparse
+import hashlib
 import json
 import re
 import subprocess
 import sys
 from pathlib import Path
 
+from agent_team_eval import (
+    object_sha256, read_event_log, safe_identifier_value, validate_eval_case,
+    validate_learning_manifest,
+)
+
 KNOWLEDGE_DIR = "misc/ai/session-knowledge/knowledge"
 LESSONS_DIR = "misc/ai/session-knowledge/lessons"
 SKILL_PROPOSALS_DIR = "skills/proposals"
+EVALS_DIR = "misc/ai/session-knowledge/evals"
 SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
@@ -87,6 +95,8 @@ def main():
     ap.add_argument("--update", action="store_true",
                     help="allow updating an existing destination file")
     args = ap.parse_args()
+    if not safe_identifier_value(args.run_id):
+        fail("run-id must be a safe direct-child identifier")
 
     qnote = Path(subprocess.run(["git", "rev-parse", "--show-toplevel"],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -101,18 +111,21 @@ def main():
         fail(f"missing {manifest_file}")
     try:
         manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, RecursionError, UnicodeError) as e:
         fail(f"manifest.json is not valid JSON: {e}")
-
-    for key in ("schema_version", "run_id", "project", "items"):
-        if key not in manifest:
-            fail(f"manifest missing required key '{key}'")
-    if manifest["run_id"] != args.run_id:
-        fail(f"manifest run_id {manifest['run_id']!r} != requested {args.run_id!r}")
+    try:
+        validate_learning_manifest(manifest, args.run_id)
+    except ValueError as exc:
+        fail(f"invalid learning manifest: {exc}")
+    try:
+        decision_events = read_event_log(outbox.parent / "events.jsonl")
+        decision_event_error = None
+    except ValueError as exc:
+        decision_events = []
+        decision_event_error = str(exc)
     for sha in manifest.get("source_commits", []):
         if not commit_exists(target, sha):
             fail(f"source commit {sha} not found in {target} — refusing unverifiable outbox")
-
     imported, skipped = [], []
     for item in manifest["items"]:
         title = item.get("title", "(untitled)")
@@ -132,7 +145,34 @@ def main():
             skipped.append((title, f"missing or invalid single-line {invalid_boundary}"))
             continue
         category = item.get("category")
+        decision = item.get("decision")
+        if (not isinstance(decision, dict)
+                or decision.get("authority") != "coordinator"
+                or decision.get("outcome") != "approved"
+                or not isinstance(decision.get("evidence"), str)
+                or not decision["evidence"].strip()
+                or not isinstance(decision.get("decided_at"), str)
+                or not decision["decided_at"]):
+            skipped.append((title, "missing bound coordinator approval"))
+            continue
+        item_event = next((
+            event for event in decision_events
+            if event.get("event") == "learning_item_decided"
+            and event.get("item") == item.get("id")
+            and event.get("outcome") == "approved"
+            and event.get("evidence") == decision["evidence"]
+            and event.get("item_sha256") == object_sha256(item)
+            and (category == "eval" or event.get("category") == category)
+        ), None)
+        if decision_event_error or item_event is None:
+            detail = f": {decision_event_error}" if decision_event_error else ""
+            skipped.append((title, f"missing bound coordinator approval event{detail}"))
+            continue
         project = manifest["project"]
+        project_slug = slugify(str(project))
+        if not project_slug:
+            skipped.append((title, "project name does not form a safe destination"))
+            continue
 
         if category == "skill":
             name = item.get("skill_name") or slugify(title)
@@ -145,6 +185,44 @@ def main():
                 continue
             dst = safe_under(qnote, f"{SKILL_PROPOSALS_DIR}/{name}/{args.run_id}.md")
             content = src.read_text(encoding="utf-8")
+        elif category == "eval":
+            src = safe_under(outbox, item.get("file", ""))
+            if src is None or not src.is_file() or src.suffix != ".json":
+                skipped.append((title, "missing or unsafe eval-case JSON"))
+                continue
+            try:
+                case = validate_eval_case(
+                    json.loads(src.read_text(encoding="utf-8")), outbox.parent
+                )
+            except (json.JSONDecodeError, ValueError, RecursionError,
+                    UnicodeError) as exc:
+                skipped.append((title, f"invalid eval case: {exc}"))
+                continue
+            if case["status"] != "approved":
+                skipped.append((title, f"eval status={case['status']}"))
+                continue
+            case_decision = case.get("decision")
+            if (decision != case_decision
+                    or item_event.get("case_id") != case["id"]
+                    or item_event.get("case_sha256") != object_sha256(case)):
+                skipped.append((title, "missing bound coordinator approval event"))
+                continue
+            if src.name != f"{case['id']}.json":
+                skipped.append((title, "eval filename does not match case id"))
+                continue
+            if any(boundaries[field] != case[field]
+                   for field in ("validation_scope", "claim_boundary")):
+                skipped.append((title, "eval manifest boundaries differ from case"))
+                continue
+            identity = hashlib.sha256(case["id"].encode()).hexdigest()[:12]
+            dst = safe_under(qnote, (
+                f"{EVALS_DIR}/{project_slug}-{slugify(case['id'])}-{identity}.md"
+            ))
+            content = (
+                f"## {title}\n\n```json\n"
+                + json.dumps(case, indent=2, sort_keys=True)
+                + "\n```\n"
+            )
         elif category in ("knowledge", "lesson"):
             src = safe_under(outbox, item.get("file", f"{category}.md"))
             if src is None:
@@ -164,7 +242,7 @@ def main():
                     skipped.append((title, "title slugifies to empty — set intended_destination"))
                     continue
                 base = KNOWLEDGE_DIR if category == "knowledge" else LESSONS_DIR
-                dst = safe_under(qnote, f"{base}/{project}-{slug}.md")
+                dst = safe_under(qnote, f"{base}/{project_slug}-{slug}.md")
         else:
             skipped.append((title, f"unknown category {category!r}"))
             continue

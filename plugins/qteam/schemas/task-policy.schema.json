@@ -2,13 +2,19 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://qteam.local/schemas/task-policy.schema.json",
   "type": "object",
-  "required": ["policy_version", "work_kind", "declared_risk_flags", "inferred_risk_flags", "effective_risk_flags", "execution_tier", "review_intensity", "require_risk_review", "tdd_required", "diagnosis_required", "reasons"],
+  "required": ["policy_version", "work_kind", "declared_risk_flags", "inferred_risk_flags", "effective_risk_flags", "declared_reversibility", "inferred_reversibility", "reversibility", "blast_radius", "integration_lane", "require_user_finish_decision", "execution_tier", "review_intensity", "require_risk_review", "tdd_required", "diagnosis_required", "reasons"],
   "properties": {
-    "policy_version": {"const": 1},
+    "policy_version": {"const": 2},
     "work_kind": {"enum": ["feature", "bugfix", "debug", "refactor", "test", "integration", "docs", "config", "generated", "learning", "experiment"]},
     "declared_risk_flags": {"$ref": "#/$defs/riskFlags"},
     "inferred_risk_flags": {"$ref": "#/$defs/riskFlags"},
     "effective_risk_flags": {"$ref": "#/$defs/riskFlags"},
+    "declared_reversibility": {"type": ["string", "null"], "enum": ["contained-reversible", "wide-reversible", "hard-to-reverse", null]},
+    "inferred_reversibility": {"$ref": "#/$defs/reversibility"},
+    "reversibility": {"$ref": "#/$defs/reversibility"},
+    "blast_radius": {"enum": ["contained", "wide"]},
+    "integration_lane": {"enum": ["shadow", "reviewed", "human-only"]},
+    "require_user_finish_decision": {"type": "boolean"},
     "execution_tier": {"enum": ["economy", "standard", "deep"]},
     "review_intensity": {"enum": ["compact", "full", "risk"]},
     "require_risk_review": {"type": "boolean"},
@@ -22,6 +28,7 @@
       "type": "array",
       "uniqueItems": true,
       "items": {"enum": ["concurrency", "security", "migration", "data-loss", "authorization", "authentication", "compatibility", "public-api"]}
-    }
+    },
+    "reversibility": {"enum": ["contained-reversible", "wide-reversible", "hard-to-reverse"]}
   }
 }

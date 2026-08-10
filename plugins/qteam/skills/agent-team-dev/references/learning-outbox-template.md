@@ -60,9 +60,11 @@ the learning gate). The importer only takes `approved` items.
 
 - The distiller writes only under the outbox; it never edits source files and
   never claims to have updated qnote or a canonical skill.
-- The coordinator approves/rejects during the learning gate and records the
-  outcome in `state.json`; rejected items keep their entry (status `rejected`)
-  for audit.
+- The coordinator approves/rejects during the learning gate with
+  `agent-team-state learning-item-decision`. The command atomically binds the
+  manifest item and durable decision event; eval items additionally bind their
+  typed eval case. Rejected items keep their entry (status `rejected`) for
+  audit.
 - Skill changes are always proposals: the importer lands them under qnote
   `skills/proposals/<skill-name>/`, never over a canonical `SKILL.md`.
 - No secrets, no private reasoning traces, no raw noisy logs, no one-off trivia.

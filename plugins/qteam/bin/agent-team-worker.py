@@ -7,7 +7,6 @@ worktree, uses argv execution (never a shell), and persists its own lifecycle.
 """
 
 import argparse
-import fcntl
 import json
 import os
 import signal
@@ -24,6 +23,11 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 
 from agent_team_policy import effective_execution, safe_identifier
+from agent_team_artifact import ArtifactError, locked_regular, safe_regular
+from agent_team_eval import (
+    codex_version, parse_codex_trace, regular_output, validate_eval_case,
+    validate_learning_manifest, wait_capped_process,
+)
 
 
 ROLES = {
@@ -39,10 +43,14 @@ def safe_task_id(value):
 
 @contextmanager
 def worker_lock(workers):
+    if workers.is_symlink() or (workers.exists() and not workers.is_dir()):
+        raise SystemExit("error: workers root must be a real directory")
     workers.mkdir(parents=True, exist_ok=True)
-    with (workers / ".worker.lock").open("a+", encoding="utf-8") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        yield
+    try:
+        with locked_regular(workers / ".worker.lock", "worker lifecycle lock"):
+            yield
+    except ArtifactError as exc:
+        raise SystemExit(f"error: {exc}")
 
 
 def now():
@@ -73,7 +81,7 @@ def read_json(path):
         return json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         raise SystemExit(f"error: missing {path}")
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, UnicodeError, RecursionError) as exc:
         raise SystemExit(f"error: invalid JSON in {path}: {exc}")
 
 
@@ -95,6 +103,27 @@ def atomic_json(path, value):
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
+
+
+def atomic_text(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=path.parent
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            output.write(value)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def proc_start(pid):
@@ -228,6 +257,10 @@ def cmd_spawn(args, repo, run_dir):
     if task.get("id") != args.task:
         raise SystemExit("error: task record identity mismatch")
     state = read_json(run_dir / "state.json")
+    if state.get("schema_version") != 6:
+        raise SystemExit(
+            "error: run state schema is not current; run migrate-run first"
+        )
     allowed_phases = {
         "developer": {"WAVE_RUNNING", "FIXING"},
         "debugger": {"WAVE_RUNNING", "FIXING"},
@@ -249,6 +282,7 @@ def cmd_spawn(args, repo, run_dir):
     try:
         execution = effective_execution(task["policy"], args.role,
                                         state.get("model_profiles"))
+        runner_version = codex_version()
     except (KeyError, ValueError) as exc:
         raise SystemExit(f"error: invalid task execution policy: {exc}")
     worktree = validate_worktree(repo, task)
@@ -264,20 +298,26 @@ def cmd_spawn(args, repo, run_dir):
                 raise SystemExit(f"error: worker record already exists for {args.task}")
         extra = Path(args.prompt).read_text(encoding="utf-8") if args.prompt else args.message
         packet_path = workers / f"{args.task}.prompt.txt"
-        packet_path.write_text(build_packet(repo, run_dir, task, args.role, extra), encoding="utf-8")
+        atomic_text(packet_path, build_packet(
+            repo, run_dir, task, args.role, extra
+        ))
         stdout_path = workers / f"{args.task}.stdout.log"
         stderr_path = workers / f"{args.task}.stderr.log"
+        final_path = workers / f"{args.task}.final.txt"
         result_path.unlink(missing_ok=True)
+        final_path.unlink(missing_ok=True)
         token = uuid.uuid4().hex
         record = {
             "schema_version": 1, "task": args.task, "role": args.role,
             "backend": "codex-exec", "cwd": str(worktree),
             "execution": execution,
+            "runner": {"name": "codex-cli", "version": runner_version},
             "launch_token": token, "started_at": now(),
             "launch_owner_pid": os.getpid(),
             "launch_owner_start": proc_start(os.getpid()),
             "stdout": str(stdout_path.relative_to(run_dir)),
             "stderr": str(stderr_path.relative_to(run_dir)),
+            "last_message": str(final_path.relative_to(run_dir)),
             "result": str(result_path.relative_to(run_dir)), "state": "launching",
             "env": {key: str(value) for key, value in task.get("env", {}).items()
                     if key in TASK_ENV_KEYS},
@@ -291,6 +331,7 @@ def cmd_spawn(args, repo, run_dir):
                 [sys.executable, str(Path(__file__).resolve()), "_run",
                  "--record", str(record_path), "--result", str(result_path),
                  "--stdout", str(stdout_path), "--stderr", str(stderr_path),
+                 "--final", str(final_path),
                  "--cwd", str(worktree), "--prompt", str(packet_path),
                  "--model", execution["model"], "--thinking", execution["thinking"],
                  "--token", token, "--workers", str(workers)],
@@ -353,37 +394,74 @@ def cmd_internal_run(args):
     started = time.monotonic()
     cancelled = False
     child = None
+    try:
+        runner_version = codex_version()
+    except ValueError as exc:
+        runner_version = None
+        runner_error = str(exc)
+    else:
+        runner_error = None
     def on_term(_signum, _frame):
         nonlocal cancelled
         cancelled = True
         if child and child.poll() is None:
-            child.terminate()
+            try:
+                os.killpg(child.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
     signal.signal(signal.SIGTERM, on_term)
-    with open(args.stdout, "w", encoding="utf-8") as out, \
-         open(args.stderr, "w", encoding="utf-8") as err:
-        try:
+    err = None
+    try:
+        with regular_output(args.stdout, "worker stdout") as out, \
+             regular_output(args.stderr, "worker stderr") as err, \
+             regular_output(args.final, "worker final message", readwrite=True) as final:
+            if runner_error:
+                raise RuntimeError(runner_error)
+            if record.get("runner") != {
+                    "name": "codex-cli", "version": runner_version}:
+                raise RuntimeError(
+                    "Codex runner version changed after worker launch"
+                )
             child = subprocess.Popen(
                 ["codex", "exec", "-C", args.cwd, "--sandbox", "workspace-write",
                  "--model", args.model, "-c",
-                 f'model_reasoning_effort="{args.thinking}"', prompt],
-                cwd=args.cwd, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                 f'model_reasoning_effort="{args.thinking}"',
+                 "-c", f'model_provider="{record["execution"]["provider"]}"',
+                 "--json",
+                 "--output-last-message", f"/proc/self/fd/{final.fileno()}", prompt],
+                cwd=args.cwd, env=env, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                pass_fds=(final.fileno(),), start_new_session=True,
             )
             with worker_lock(Path(args.workers)):
                 latest = read_json(record_path)
                 latest["child_pid"] = child.pid
                 latest["child_start"] = proc_start(child.pid)
                 atomic_json(record_path, latest)
-            code, error = child.wait(), None
+            code, overflow = wait_capped_process(
+                child, out, err, process_group=True
+            )
+            error = (
+                "Codex runner output exceeded the retained trace limit"
+                if overflow else None
+            )
+            if overflow and code == 0:
+                code = 65
             digest = {}
             if code == 0 and not cancelled:
                 try:
-                    digest = parse_worker_digest(args.stdout)
+                    digest = parse_worker_digest(args.final)
+                    digest["trajectory"] = parse_codex_trace(
+                        args.stdout, "worker", task, record["execution"],
+                        runner_version,
+                    )
                 except (OSError, ValueError) as exc:
                     code, error = 65, str(exc)
                     print(error, file=err)
-        except Exception as exc:  # persisted infrastructure failure, never hidden
-            code, error = 127, f"{type(exc).__name__}: {exc}"
-            digest = {}
+    except Exception as exc:  # persisted infrastructure failure, never hidden
+        code, error = 127, f"{type(exc).__name__}: {exc}"
+        digest = {}
+        if err is not None and not err.closed:
             print(error, file=err)
     result = {
         "schema_version": 1, "task": task,
@@ -486,24 +564,36 @@ def cmd_cancel(args, _repo, run_dir):
                     proc_start(record.get("pid")) == record.get("proc_start"))
     child_valid = (isinstance(record.get("child_pid"), int) and
                    proc_start(record["child_pid"]) == record.get("child_start"))
-    if not leader_valid and not child_valid:
+    groups = []
+    if leader_valid:
+        groups.append(pgid)
+    if child_valid:
+        groups.append(record["child_pid"])
+    if not groups:
         raise SystemExit("error: recorded process identities are stale; refusing to signal reused PGID")
-    try:
-        os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
+    for group in dict.fromkeys(groups):
+        try:
+            os.killpg(group, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
-        try:
-            os.killpg(pgid, 0)
-        except ProcessLookupError:
+        alive = []
+        for group in dict.fromkeys(groups):
+            try:
+                os.killpg(group, 0)
+                alive.append(group)
+            except ProcessLookupError:
+                pass
+        if not alive:
             break
         time.sleep(0.05)
     else:
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        for group in alive:
+            try:
+                os.killpg(group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
     result_path = run_dir / record["result"]
     if not result_path.exists():
         cancelled = cancelled_result(record, args.task)
@@ -530,6 +620,40 @@ def cmd_harvest(args, _repo, run_dir):
         for path in source.rglob("*"):
             if path.is_symlink():
                 raise SystemExit(f"error: outbox symlinks are forbidden: {path}")
+        eval_root = source / "eval-cases"
+        if eval_root.exists() and not eval_root.is_dir():
+            raise SystemExit("error: learning eval-cases must be a directory")
+        if eval_root.is_dir():
+            for path in sorted(eval_root.iterdir()):
+                if not path.is_file() or path.suffix != ".json":
+                    raise SystemExit(
+                        "error: learning eval-cases accepts only JSON files"
+                    )
+                try:
+                    case = validate_eval_case(read_json(path), run_dir)
+                except (SystemExit, ValueError) as exc:
+                    raise SystemExit(f"error: invalid eval case {path.name}: {exc}")
+                if path.stem != case["id"]:
+                    raise SystemExit(
+                        f"error: eval case filename must match id {case['id']}"
+                    )
+                if case["status"] != "candidate":
+                    raise SystemExit(
+                        "error: knowledge workers may harvest only candidate eval cases"
+                    )
+        manifest_path = source / "manifest.json"
+        try:
+            worker_manifest = read_json(manifest_path)
+            validate_learning_manifest(worker_manifest, run_dir.name)
+        except (SystemExit, ValueError) as exc:
+            raise SystemExit(f"error: invalid learning manifest: {exc}")
+        if any(
+            item.get("status") != "proposed" or "decision" in item
+            for item in worker_manifest["items"]
+        ):
+            raise SystemExit(
+                "error: knowledge workers may harvest only proposed learning items"
+            )
     if target.is_symlink():
         raise SystemExit("error: run learning-outbox target is a symlink")
     if target.is_dir():
@@ -598,7 +722,7 @@ def parser():
             p.add_argument("--timeout", type=float)
         p.set_defaults(func=func)
     p = sub.add_parser("_run", help=argparse.SUPPRESS)
-    for flag in ("record", "result", "stdout", "stderr", "cwd", "prompt", "token",
+    for flag in ("record", "result", "stdout", "stderr", "final", "cwd", "prompt", "token",
                  "workers", "model", "thinking"):
         p.add_argument(f"--{flag}", required=True)
     return ap

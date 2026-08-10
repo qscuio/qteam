@@ -177,6 +177,7 @@ def installed_payloads(plugin_root, version, source_commit, stamp):
         "agent-team-worker": "bin/agent-team-worker.py",
         "agent-team-review": "bin/agent-team-review.py",
         "agent_team_artifact.py": "bin/agent_team_artifact.py",
+        "agent_team_eval.py": "bin/agent_team_eval.py",
         "agent_team_policy.py": "bin/agent_team_policy.py",
         "import-agent-learning": "bin/import-agent-learning.py",
         "qteam-project-uninstall": "scripts/project-uninstall.py",

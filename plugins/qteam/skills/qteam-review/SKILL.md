@@ -10,7 +10,8 @@ The coordinator first creates a packet with `.codex/bin/agent-team-review
 --spec-source <path>` (use `--standards-source` for standards/risk). The
 packet freezes base SHA, head SHA, merge base, three-dot diff range, commit
 list, content-addressed snapshots of spec/standards sources, derived execution
-tier, review intensity, and the deterministic artifact-lint report. A typed
+tier, review intensity, a redacted trajectory summary, frozen judge-calibration
+cases, and the deterministic artifact-lint report. A typed
 spec with lint errors is rejected before a reviewer launches. Legacy sources
 remain reviewable with an explicit untyped-source warning.
 
@@ -38,22 +39,25 @@ HEAD and no finding remains open.
 The coordinator must launch each independent reviewer through
 `agent-team-review run --ledger ... --reviewer ... --session-id ...`. The
 runner invokes `codex exec` with the packet's immutable model/thinking profile,
-read-only sandbox, packet digest, and result path, then records a launch/result
-receipt. Do not launch a reviewer separately and self-report its model.
+provider/family identity, read-only sandbox, packet digest, and result path,
+then records the actual Codex CLI version and a launch/result receipt. Do not
+launch a reviewer separately and self-report its model. The receipt is rejected
+unless the reviewer consistently classifies the transparent calibration canaries
+correctly.
 
 Each independent reviewer writes one bounded JSON result. Use `needs-fix` with
 stable finding IDs and evidence when defects exist; that receipt cannot
 complete a ledger. The runner records those findings atomically; the coordinator
 assigns fixes and launches a fresh re-review iteration. A needs-fix result is:
 
-```json
-{"axis":"standards","verdict":"needs-fix","findings":[{"id":"F-123","severity":"P1","title":"Lost error","review_evidence":"The changed call drops EIO at foo.c:42","impact":"The operation reports success after data loss","fix_direction":"propagate and test EIO","owner":"fixer"}],"resolved_ids":[],"invalid_ids":[],"upheld_ids":[],"invalid_evidence":{}}
+```jsonc
+{"axis":"standards","verdict":"needs-fix","trajectory_verdict":"pass","calibration_results":{"<frozen-case-id>":"<independent-classification>"},"findings":[{"id":"F-123","severity":"P1","title":"Lost error","review_evidence":"The changed call drops EIO at foo.c:42","impact":"The operation reports success after data loss","fix_direction":"propagate and test EIO","owner":"fixer"}],"resolved_ids":[],"invalid_ids":[],"upheld_ids":[],"invalid_evidence":{}}
 ```
 
 A clean fix re-review returns:
 
-```json
-{"axis":"standards","verdict":"pass","findings":[],"resolved_ids":["F-123"],"invalid_ids":[],"upheld_ids":[],"invalid_evidence":{}}
+```jsonc
+{"axis":"standards","verdict":"pass","trajectory_verdict":"pass","calibration_results":{"<frozen-case-id>":"<independent-classification>"},"findings":[],"resolved_ids":["F-123"],"invalid_ids":[],"upheld_ids":[],"invalid_evidence":{}}
 ```
 
 For an initial clean review all three closure arrays—`resolved_ids`,
@@ -93,10 +97,15 @@ name alone cannot pass the gate.
   covered by completed mandatory ledgers.
 - Start from diffstat, commit list, and bounded task digests; expand context
   only for an evidenced risk. Output findings only, with no plan/code recap.
+- Inspect compact trajectory anomaly codes and counts, never raw worker logs or
+  private reasoning. Use `trajectory_verdict=needs-fix` only when the evidence
+  changes the code-quality/spec judgment; do not turn visibility metadata into
+  an unbounded process audit.
 - Do not repeat artifact-lint checks that already passed. Inspect its bounded
   warnings plus semantic behavior and risk; the absence of a typed marker alone
   is not a review finding.
-- Model choice follows the packet tier: `economy` uses the run's economy
-  profile, `standard` its standard profile, and `deep` its deep profile. The
+- Model choice follows the packet tier: `economy` uses the run's reviewer
+  economy profile, `standard` its reviewer standard profile, and `deep` its
+  reviewer deep profile. The
   runner passes that model/thinking setting when spawning each fresh read-only
   reviewer; reviewers never self-escalate.

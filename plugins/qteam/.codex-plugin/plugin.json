@@ -1,7 +1,7 @@
 {
   "name": "qteam",
-  "version": "0.10.0",
-  "description": "Durable multi-agent delivery with artifact preflight, cross-run epic dependencies, freshness-bound research, scoped decisions, isolated workers, adaptive review, TDD, diagnosis, and safe finish gates.",
+  "version": "0.11.0",
+  "description": "Durable multi-agent delivery with trajectory evidence, calibrated review, reversibility gates, artifact preflight, cross-run dependencies, isolated workers, TDD, diagnosis, and safe finish.",
   "author": {
     "name": "qscuio",
     "url": "https://github.com/qscuio"
@@ -23,7 +23,7 @@
   "interface": {
     "displayName": "QTeam",
     "shortDescription": "Durable, gated multi-agent software delivery",
-    "longDescription": "Discover evidence-backed solution paths, validate typed artifacts cheaply, then run software work through cross-run epic and task dependencies, scoped human decisions, isolated task worktrees, scenario-complete TDD, deterministic review policy, durable evidence, and safe finish gates.",
+    "longDescription": "Discover evidence-backed solution paths, then deliver through isolated worktrees, typed trajectory evidence, calibrated mandatory review, reversibility-aware decisions, cross-run dependencies, scenario-complete TDD, deterministic policy, and safe finish gates.",
     "developerName": "qscuio",
     "category": "Developer Tools",
     "capabilities": [

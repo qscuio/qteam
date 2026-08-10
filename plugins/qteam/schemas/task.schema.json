@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://qteam.local/schemas/task.schema.json",
   "type": "object",
-  "required": ["id", "status", "branch", "worktree", "wave", "depends_on", "base_commit", "parallel_group", "write_set", "forbidden_paths", "verification", "work_kind", "risk_flags", "policy", "tdd_required", "diagnosis_required"],
+  "required": ["id", "status", "branch", "worktree", "wave", "depends_on", "base_commit", "parallel_group", "write_set", "forbidden_paths", "verification", "work_kind", "risk_flags", "reversibility", "policy", "tdd_required", "diagnosis_required"],
   "properties": {
     "id": {"type": "string", "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"},
     "status": {"enum": ["pending", "running", "blocked", "completed", "failed", "superseded", "merged", "artifact_complete"]},
@@ -13,6 +13,7 @@
       "uniqueItems": true,
       "items": {"enum": ["concurrency", "security", "migration", "data-loss", "authorization", "authentication", "compatibility", "public-api"]}
     },
+    "reversibility": {"enum": ["contained-reversible", "wide-reversible", "hard-to-reverse"]},
     "policy": {"$ref": "task-policy.schema.json"},
     "tdd_required": {"type": "boolean"},
     "diagnosis_required": {"type": "boolean"},

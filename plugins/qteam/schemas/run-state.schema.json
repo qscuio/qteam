@@ -2,9 +2,9 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://qteam.local/schemas/run-state.schema.json",
   "type": "object",
-  "required": ["schema_version", "run_id", "goal", "base_branch", "base_commit", "integration_branch", "integration_provenance_head", "integration_provenance", "phase", "tasks", "waves", "gates", "risk_forced", "risk_required", "model_profiles", "shared_surfaces", "finished"],
+  "required": ["schema_version", "run_id", "goal", "base_branch", "base_commit", "integration_branch", "integration_provenance_head", "integration_provenance", "phase", "tasks", "waves", "gates", "risk_forced", "risk_required", "hard_to_reverse", "model_profiles", "review_model_profiles", "shared_surfaces", "finished"],
   "properties": {
-    "schema_version": {"const": 5},
+    "schema_version": {"const": 6},
     "run_id": {"type": "string", "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"},
     "goal": {"type": "string", "minLength": 1},
     "base_branch": {"type": "string", "minLength": 1},
@@ -35,12 +35,15 @@
       "patternProperties": {
         "^[1-9][0-9]*$": {
           "type": "object",
-          "required": ["tasks", "execution_tier", "review_intensity", "require_risk_review", "risk_flags"],
+          "required": ["tasks", "execution_tier", "review_intensity", "require_risk_review", "risk_flags", "reversibility", "integration_lane", "require_user_finish_decision"],
           "properties": {
             "tasks": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}},
             "execution_tier": {"enum": ["economy", "standard", "deep"]},
             "review_intensity": {"enum": ["compact", "full", "risk"]},
             "require_risk_review": {"type": "boolean"},
+            "reversibility": {"enum": ["contained-reversible", "wide-reversible", "hard-to-reverse"]},
+            "integration_lane": {"enum": ["shadow", "reviewed", "human-only"]},
+            "require_user_finish_decision": {"type": "boolean"},
             "risk_flags": {
               "type": "array", "uniqueItems": true,
               "items": {"enum": ["concurrency", "security", "migration", "data-loss", "authorization", "authentication", "compatibility", "public-api"]}
@@ -53,7 +56,18 @@
     },
     "risk_required": {"type": "boolean"},
     "risk_forced": {"type": "boolean"},
+    "hard_to_reverse": {"type": "boolean"},
     "model_profiles": {
+      "type": "object",
+      "required": ["economy", "standard", "deep"],
+      "additionalProperties": false,
+      "properties": {
+        "economy": {"$ref": "#/$defs/modelProfile"},
+        "standard": {"$ref": "#/$defs/modelProfile"},
+        "deep": {"$ref": "#/$defs/modelProfile"}
+      }
+    },
+    "review_model_profiles": {
       "type": "object",
       "required": ["economy", "standard", "deep"],
       "additionalProperties": false,
@@ -131,10 +145,12 @@
   "$defs": {
     "modelProfile": {
       "type": "object",
-      "required": ["model", "thinking"],
+      "required": ["model", "thinking", "provider", "family"],
       "properties": {
         "model": {"type": "string", "minLength": 1},
-        "thinking": {"enum": ["low", "medium", "high", "xhigh"]}
+        "thinking": {"enum": ["low", "medium", "high", "xhigh"]},
+        "provider": {"type": "string", "minLength": 1},
+        "family": {"type": "string", "minLength": 1}
       },
       "additionalProperties": false
     }
