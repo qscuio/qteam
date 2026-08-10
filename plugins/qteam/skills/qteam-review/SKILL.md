@@ -10,7 +10,9 @@ The coordinator first creates a packet with `.codex/bin/agent-team-review
 --spec-source <path>` (use `--standards-source` for standards/risk). The
 packet freezes base SHA, head SHA, merge base, three-dot diff range, commit
 list, content-addressed snapshots of spec/standards sources, derived execution
-tier, and review intensity.
+tier, review intensity, and the deterministic artifact-lint report. A typed
+spec with lint errors is rejected before a reviewer launches. Legacy sources
+remain reviewable with an explicit untyped-source warning.
 
 Run exactly one independent axis per reviewer. Both `spec` and `standards` are
 mandatory on every gate:
@@ -91,6 +93,9 @@ name alone cannot pass the gate.
   covered by completed mandatory ledgers.
 - Start from diffstat, commit list, and bounded task digests; expand context
   only for an evidenced risk. Output findings only, with no plan/code recap.
+- Do not repeat artifact-lint checks that already passed. Inspect its bounded
+  warnings plus semantic behavior and risk; the absence of a typed marker alone
+  is not a review finding.
 - Model choice follows the packet tier: `economy` uses the run's economy
   profile, `standard` its standard profile, and `deep` its deep profile. The
   runner passes that model/thinking setting when spawning each fresh read-only

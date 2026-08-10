@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qteam.local/schemas/epic.schema.json",
+  "type": "object",
+  "required": ["schema_version", "epic_id", "goal", "base_commit", "runs", "contracts", "revision", "created_at", "updated_at"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "epic_id": {"$ref": "#/$defs/id"},
+    "goal": {"type": "string", "minLength": 1},
+    "base_commit": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+    "revision": {"type": "integer", "minimum": 1},
+    "created_at": {"type": "string", "minLength": 1},
+    "updated_at": {"type": "string", "minLength": 1},
+    "runs": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/run"}
+    },
+    "contracts": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/contract"}
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "id": {"type": "string", "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"},
+    "run": {
+      "type": "object",
+      "required": ["id", "title", "spec", "depends_on", "contracts", "status"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "title": {"type": "string", "minLength": 1},
+        "spec": {"type": "string", "minLength": 1},
+        "depends_on": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
+        "contracts": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
+        "status": {"enum": ["planned", "active", "done"]},
+        "start_base_commit": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+        "started_at": {"type": "string", "minLength": 1},
+        "plan_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "run_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "dependency_heads": {
+          "type": "object",
+          "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"}
+        },
+        "finished_head": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+        "completed_at": {"type": "string", "minLength": 1},
+        "run_state_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {"properties": {"status": {"const": "planned"}}},
+          "then": {
+            "not": {"anyOf": [
+              {"required": ["start_base_commit"]}, {"required": ["started_at"]},
+              {"required": ["plan_sha256"]}, {"required": ["run_sha256"]},
+              {"required": ["dependency_heads"]}, {"required": ["finished_head"]},
+              {"required": ["completed_at"]}, {"required": ["run_state_sha256"]}
+            ]}
+          }
+        },
+        {
+          "if": {"properties": {"status": {"const": "active"}}},
+          "then": {
+            "required": ["start_base_commit", "started_at", "plan_sha256", "run_sha256", "dependency_heads"],
+            "not": {"anyOf": [
+              {"required": ["finished_head"]}, {"required": ["completed_at"]},
+              {"required": ["run_state_sha256"]}
+            ]}
+          }
+        },
+        {
+          "if": {"properties": {"status": {"const": "done"}}},
+          "then": {
+            "required": ["start_base_commit", "started_at", "plan_sha256", "run_sha256", "dependency_heads", "finished_head", "completed_at", "run_state_sha256"]
+          }
+        }
+      ]
+    },
+    "contract": {
+      "type": "object",
+      "required": ["id", "owner_run", "consumers", "summary"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "owner_run": {"$ref": "#/$defs/id"},
+        "consumers": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
+        "summary": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    }
+  }
+}

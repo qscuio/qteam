@@ -18,6 +18,14 @@ locks, build files, generated surfaces, and global fixtures are serial.
 The human-readable slices and machine task records are QTeam inputs. Do not
 start workers or publish tracker tickets independently.
 
+Begin the human-readable ticket artifact with
+`<!-- qteam-artifact: tickets-v1 -->`. Give every slice a stable `T*` ID and
+explicit `depends_on`, `Requirements`, `Done when`, and `Verify` fields. Before
+`PLAN_READY`, run `.codex/bin/agent-team-artifact lint --kind tickets --file
+<tickets>`. These fields are checked independently for every task. This cheap
+gate catches structural and dependency-reference defects before an LLM
+reviewer sees the wave.
+
 For a mechanically measurable candidate, emit `work_kind: experiment` and an
 exact `experiment` object containing `goal`, `metric` (`name`, `direction`,
 `command`, numeric observed `baseline` or `null`, and `minimum_delta`),

@@ -22,9 +22,10 @@ WORKER_PROMPTS = (
     "knowledge-distiller", "system-debugger", "test-writer",
 )
 SCHEMAS = (
-    "decision-gate", "diagnosis", "experiment", "finding", "handoff",
-    "review-receipt", "review-result", "run-state", "scenario-coverage",
-    "task-policy", "task", "tdd-cycle", "verification", "worker-result",
+    "artifact-lint", "code-index", "decision-gate", "diagnosis", "epic",
+    "experiment", "finding", "handoff", "review-receipt", "review-result",
+    "run-state", "scenario-coverage", "spec-drift", "task-policy", "task",
+    "tdd-cycle", "verification", "worker-result",
 )
 PLUGIN_SKILLS = (
     "agent-team-dev", "brainstorming", "domain-modeling",
@@ -45,10 +46,11 @@ LEGACY_ORCHESTRATION_SKILLS = (
     "dispatching-parallel-agents",
 )
 BINARIES = (
-    "wake-agent-team", "agent-team-finish", "agent-team-check-task",
-    "agent-team-doctor", "agent-team-state", "agent-team-worker",
-    "agent-team-review", "agent_team_policy.py", "import-agent-learning",
-    "qteam-project-uninstall", "qteam_project.py",
+    "wake-agent-team", "agent-team-artifact", "agent-team-finish",
+    "agent-team-check-task", "agent-team-doctor", "agent-team-state",
+    "agent-team-worker", "agent-team-review", "agent_team_artifact.py",
+    "agent_team_policy.py", "import-agent-learning", "qteam-project-uninstall",
+    "qteam_project.py",
 )
 
 INSTALLED_PATHS = frozenset(
@@ -63,6 +65,7 @@ INSTALLED_PATHS = frozenset(
         ".codex/licenses/Superpowers-MIT.txt",
         ".codex/licenses/Autoresearch-MIT.txt",
         ".codex/licenses/LoopX-MIT.txt",
+        ".codex/licenses/Smart-Ralph-MIT.txt",
         ".codex/agent-team-template.version",
     ]
 )
@@ -73,8 +76,19 @@ MOVED_PATHS = frozenset(
     + [f".agents/skills/{name}" for name in LEGACY_ORCHESTRATION_SKILLS]
     + [".codex/bin/__pycache__"]
 )
-V07_INSTALLED_PATHS = frozenset(
+V09_INSTALLED_PATHS = frozenset(
     INSTALLED_PATHS - {
+        ".codex/bin/agent-team-artifact",
+        ".codex/bin/agent_team_artifact.py",
+        ".codex/licenses/Smart-Ralph-MIT.txt",
+        ".codex/schemas/artifact-lint.schema.json",
+        ".codex/schemas/code-index.schema.json",
+        ".codex/schemas/epic.schema.json",
+        ".codex/schemas/spec-drift.schema.json",
+    }
+)
+V07_INSTALLED_PATHS = frozenset(
+    V09_INSTALLED_PATHS - {
         ".codex/licenses/LoopX-MIT.txt",
         ".codex/schemas/decision-gate.schema.json",
         ".codex/schemas/handoff.schema.json",
@@ -272,6 +286,8 @@ def validate_manifest(root, manifest):
         supported_sets = (V06_INSTALLED_PATHS, EARLY_V06_INSTALLED_PATHS)
     elif version_tuple < (0, 8, 0):
         supported_sets = (V07_INSTALLED_PATHS,)
+    elif version_tuple < (0, 10, 0):
+        supported_sets = (V09_INSTALLED_PATHS,)
     else:
         supported_sets = (INSTALLED_PATHS,)
     if installed_set not in supported_sets:
@@ -340,7 +356,7 @@ def validate_manifest(root, manifest):
 def _legacy_installed_mode(path):
     name = PurePosixPath(path).name
     if path.startswith(".codex/bin/") and name not in {
-        "agent_team_policy.py", "qteam_project.py",
+        "agent_team_artifact.py", "agent_team_policy.py", "qteam_project.py",
     }:
         return 0o755
     return 0o644

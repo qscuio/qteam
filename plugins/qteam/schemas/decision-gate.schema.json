@@ -39,6 +39,15 @@
       ],
       "additionalProperties": false
     },
+    "subject": {
+      "type": "object",
+      "required": ["kind", "sha256"],
+      "properties": {
+        "kind": {"const": "spec-drift-change"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
     "resolution": {
       "type": "object",
       "required": ["outcome", "choice", "evidence", "resolved_at"],

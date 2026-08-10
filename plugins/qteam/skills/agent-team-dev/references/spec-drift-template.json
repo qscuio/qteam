@@ -1,0 +1,14 @@
+{
+  "summary": "Implementation evidence that differs from an approved artifact.",
+  "changes": [
+    {
+      "id": "D1",
+      "layer": "design",
+      "original": "The approved statement or decision.",
+      "actual": "The behavior proved by the integrated implementation.",
+      "reason": "Evidence-backed reason for the difference.",
+      "proposal": "Exact documentation change proposed for approval.",
+      "decision_id": "spec-drift-D1"
+    }
+  ]
+}

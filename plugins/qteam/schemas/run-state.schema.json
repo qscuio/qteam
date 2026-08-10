@@ -65,6 +65,42 @@
     },
     "shared_surfaces": {"type": "array", "items": {"type": "string"}},
     "decisions": {"type": "object"},
+    "epic": {
+      "type": "object",
+      "required": ["id", "run", "manifest", "manifest_sha256", "plan_sha256", "run_sha256", "base_commit", "dependency_heads", "revision", "checked_at"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"},
+        "run": {"type": "string", "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"},
+        "manifest": {"type": "string", "minLength": 1},
+        "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "plan_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "run_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "base_commit": {"type": "string", "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"},
+        "dependency_heads": {
+          "type": "object",
+          "additionalProperties": {"type": "string", "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"}
+        },
+        "revision": {"type": "integer", "minimum": 1},
+        "checked_at": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "spec_drift": {
+      "type": "object",
+      "required": ["report", "report_sha256", "head_sha", "decision_ids", "sealed_at"],
+      "properties": {
+        "report": {"type": "string", "minLength": 1},
+        "report_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "head_sha": {"type": "string", "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"},
+        "decision_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"}
+        },
+        "sealed_at": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
     "publication_seal": {
       "type": "object",
       "required": ["status", "purpose", "head_sha", "decision_sha256", "authorization_sha256", "sealed_at"],

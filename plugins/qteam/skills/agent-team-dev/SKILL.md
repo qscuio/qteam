@@ -45,6 +45,12 @@ For a new non-trivial run:
   --plan-file docs/plans/<plan>.md
 ```
 
+For a run declared by `wayfinder` inside an epic, add `--epic <epic-id>`.
+Initialization mechanically refuses unknown runs, unfinished predecessors, or
+a base commit outside the epic lineage. After safe finish reaches durable
+`DONE`, run `.codex/bin/agent-team-artifact epic-complete-run --epic <epic-id>
+--run <run-id>` to unlock downstream runs.
+
 Never edit `state.json`, `events.jsonl`, or task status by hand. Use
 `agent-team-state`; its locked atomic writes are the durable source of truth.
 Use its compact `status` packet for operator updates and resume instead of
@@ -73,8 +79,11 @@ must restore explicit dependencies before execution resumes.
   base commit before modifications, then uses isolated workers and the normal
   mechanical and review gates.
 
-Move state through `SPEC_READY` and `PLAN_READY` only after those artifacts
-exist.
+Move state through `SPEC_READY` only after the typed spec passes
+`agent-team-artifact lint --kind spec`; move through `PLAN_READY` only after the
+typed ticket artifact passes `lint --kind tickets`. The later spec-review packet
+replays and freezes spec lint automatically, so a structurally invalid typed
+artifact cannot spend an LLM review call.
 
 ## Plan and task records
 
@@ -229,6 +238,20 @@ it writes only
 outbox. Keep reusable, deduplicated, verified, non-sensitive proposals; never
 overwrite canonical skills. From the qnote root, import approved items with
 `<target-repo>/.codex/bin/import-agent-learning <target-repo> <run-id>`.
+
+Before final review, compare approved requirements, design, and tickets with
+the implementation. If there is drift, create a proposal shaped like
+`references/spec-drift-template.json`. First open every `decision_id` as a
+user-owned action decision whose only target is `finish`. Seal the report to
+`.agents/runs/<run>/spec-drift.json` at the durable integration head with
+`agent-team-artifact drift-seal`; sealing attaches the exact change digest to
+each still-open decision. Only then resolve the decisions. Run `drift-check`
+after resolution; it passes only when every exact proposal is explicitly
+allowed and the run head, report, sources, and decision bindings are still
+fresh. Finish mechanically repeats this bound check. The report is always
+`proposal-only`; edit approved artifacts only in an owned `REPLANNING` task.
+Never silently rewrite approved history. If no drift exists, no report is
+required; the mandatory spec review remains the semantic proof.
 
 Record task/final verification through `verify-task` / `verify-final`; review
 status only through `agent-team-review check`; and learning through

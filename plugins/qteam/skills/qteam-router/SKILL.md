@@ -24,8 +24,10 @@ Route in this order:
    paths/ideas/knowledge beyond the stated options: use `qteam-explore`. It
    produces a bounded evidence brief; an explicit deep/broad request uses its
    full research-frontier rule. It never starts an implementation loop.
-4. Huge multi-session effort whose decision path is foggy: use `wayfinder`;
-   when the route is clear, hand off to `to-spec`.
+4. Huge multi-session effort whose decision path is foggy: use `wayfinder`.
+   When it decomposes into multiple independently executable specs, create one
+   QTeam epic manifest with cross-run dependencies and stable contracts. Hand
+   each unblocked run to `to-spec`; do not create an epic for a single run.
 5. Unclear new behavior: use `brainstorming`; invoke `grilling` only on an
    unresolved high-impact branch and `grill-with-docs` only when the domain
    vocabulary is changing.

@@ -1,0 +1,26 @@
+{
+  "contracts": [
+    {
+      "id": "public-contract-v1",
+      "owner_run": "run-foundation",
+      "consumers": ["run-consumer"],
+      "summary": "Observable behavior and compatibility boundary owned by the foundation run."
+    }
+  ],
+  "runs": [
+    {
+      "id": "run-foundation",
+      "title": "Establish the stable foundation",
+      "spec": "docs/specs/foundation.md",
+      "depends_on": [],
+      "contracts": ["public-contract-v1"]
+    },
+    {
+      "id": "run-consumer",
+      "title": "Deliver the dependent vertical slice",
+      "spec": "docs/specs/consumer.md",
+      "depends_on": ["run-foundation"],
+      "contracts": ["public-contract-v1"]
+    }
+  ]
+}

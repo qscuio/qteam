@@ -23,18 +23,19 @@ for a in "${AGENTS[@]}"; do
 done
 [[ -f ".codex/agents/${AGENTS[0]}.toml" ]] && ok "${#AGENTS[@]} agent TOMLs present (or failures listed above)"
 
-for b in wake-agent-team agent-team-finish agent-team-check-task agent-team-doctor \
+for b in wake-agent-team agent-team-artifact agent-team-finish agent-team-check-task agent-team-doctor \
          agent-team-state agent-team-worker agent-team-review qteam-project-uninstall; do
   if [[ ! -x ".codex/bin/$b" ]]; then fail "missing or non-executable .codex/bin/$b"; fi
 done
 [[ -f ".codex/bin/agent_team_policy.py" ]] || fail "missing policy module: agent_team_policy.py"
+[[ -f ".codex/bin/agent_team_artifact.py" ]] || fail "missing artifact module: agent_team_artifact.py"
 [[ -f ".codex/bin/qteam_project.py" ]] || fail "missing project manifest module: qteam_project.py"
 
 for role in developer debugger frontend-debugger system-debugger test-writer \
             integration-tester fixer knowledge-distiller; do
   [[ -f ".codex/worker-prompts/$role.md" ]] || fail "missing worker prompt: $role"
 done
-for schema in run-state task task-policy tdd-cycle diagnosis experiment decision-gate handoff scenario-coverage worker-result verification finding review-result review-receipt; do
+for schema in run-state task task-policy tdd-cycle diagnosis experiment decision-gate handoff scenario-coverage worker-result verification finding review-result review-receipt artifact-lint code-index epic spec-drift; do
   [[ -f ".codex/schemas/$schema.schema.json" ]] || fail "missing schema: $schema"
 done
 SCHEMA_OK=1

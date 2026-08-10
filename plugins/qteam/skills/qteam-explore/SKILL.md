@@ -130,3 +130,23 @@ or obtains a missing result by writing or benchmarking.
 When no mechanical acceptance signal exists, hand off the evidence brief to
 `brainstorming`, `wayfinder`, or the user decision instead of pretending the
 search converged.
+
+## Optional freshness-bound code index
+
+On a large legacy repository where repeated component discovery would dominate
+multiple runs, the existing `researcher` may prepare a component-index draft
+shaped like `references/code-index-template.json`. Do not build an index for a
+small or one-run repository. Seal every repository source to its Git blob at a
+frozen base commit:
+
+```bash
+.codex/bin/agent-team-artifact index-seal --file <draft.json> \
+  --output .agents/index/components.json --base <base-commit>
+.codex/bin/agent-team-artifact index-check \
+  --file .agents/index/components.json
+```
+
+Run `index-check` immediately before relying on the index. A stale result blocks
+use of the affected entries; refresh the evidence from source and reseal it.
+Never treat an LLM summary, timestamp, or old base commit as freshness proof.
+This is researcher evidence, not a new indexer role or orchestration loop.

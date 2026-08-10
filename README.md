@@ -7,6 +7,30 @@ Autoresearch while keeping exactly one orchestration authority.
 The core rule is simple: roles are created only for distinct permission,
 context, output, or lifecycle boundaries; reusable practices remain skills.
 
+## What changed in 0.10
+
+- Spec review now begins with a deterministic artifact preflight. Typed QTeam
+  specs fail fast on missing required sections, IDs, duplicate definitions, and
+  unsupported markers; legacy sources remain compatible with an explicit
+  warning. The immutable lint report is frozen into the review packet, and the
+  LLM reviewer is told not to repeat passing mechanical checks.
+- `wayfinder` can freeze a large destination as one durable epic manifest above
+  normal QTeam runs. The manifest validates the complete cross-run DAG and
+  stable owner/consumer contracts. `agent-team-state init --epic` mechanically
+  blocks a run until its predecessors are durably `DONE` and its starting commit
+  contains every predecessor's recorded finished head. A started plan is frozen.
+- Large legacy repositories may use a researcher-authored component index whose
+  source entries are sealed to a base commit and exact Git blobs. A stale source
+  blocks index use instead of feeding old summaries to later agents.
+- Post-implementation spec reconciliation is proposal-only. Drift reports bind
+  the durable integration head, source hashes, and user-owned `finish` decision
+  gates. Sealing binds each still-open decision to the exact proposed change;
+  approval happens afterward, and finish rechecks the registered report. A
+  report never silently rewrites approved requirements, design, or tickets.
+- These artifact workflow ideas are adapted from Smart Ralph without importing
+  its stop-hook execution loop, roles, mutable state authority, or POC-first test
+  deferral.
+
 ## What changed in 0.9
 
 - Task dependencies are now a mechanical execution contract. Every task record
@@ -165,7 +189,7 @@ runtime paths, then installs only:
 .codex/agents/             read-only roles only
 .codex/worker-prompts/     writable role contracts
 .codex/bin/                wake, state, worker, gate, review, finish, doctor
-.codex/schemas/            run/task/policy/TDD/diagnosis/worker/review schemas
+.codex/schemas/            run/task/artifact/epic/index/drift/review schemas
 ```
 
 QTeam and its bounded Superpowers/Matt-derived primitives come from the plugin;
@@ -212,6 +236,7 @@ Create and advance durable state through the command, never by editing JSON:
 
 ```bash
 .codex/bin/agent-team-state --run 20260801-auth init --goal "add auth"
+.codex/bin/agent-team-artifact lint --kind spec --file docs/plans/auth.md
 .codex/bin/agent-team-state --run 20260801-auth phase SPEC_READY
 .codex/bin/agent-team-state --run 20260801-auth task-put --file /tmp/T01.json
 .codex/bin/agent-team-state --run 20260801-auth verify-tdd-cycle T01 \
@@ -225,6 +250,16 @@ Create and advance durable state through the command, never by editing JSON:
   --command "pytest -q"
 .codex/bin/agent-team-state --run 20260801-auth boundary-check
 .codex/bin/agent-team-state --run 20260801-auth status
+```
+
+For a multi-run effort, let `wayfinder` create and validate the portfolio, then
+bind each run to its mechanical dependency gate:
+
+```bash
+.codex/bin/agent-team-artifact epic-init --epic platform --goal "ship platform"
+.codex/bin/agent-team-artifact epic-plan --epic platform --file /tmp/platform.json
+.codex/bin/agent-team-state --run foundation init --goal "foundation" --epic platform
+.codex/bin/agent-team-artifact epic-complete-run --epic platform --run foundation
 ```
 
 To resume an unfinished legacy schema-version-2/3/4 run,
@@ -373,6 +408,12 @@ orchestrator. It defines what counts as an acceptable change and genuinely
 done; QTeam supplies the enforcement mechanisms. Spec-compliance and
 code-quality review are always mandatory; the optional `risk` axis can only add
 coverage, never replace either one.
+
+Typed specs and tickets use cheap deterministic lint before semantic work.
+Mandatory quality review remains wave-level: the lint report narrows reviewer
+attention but never replaces either the spec or standards axis. Freshness-bound
+code indexes are optional researcher evidence for large legacy repositories;
+epic manifests and drift proposals remain artifacts under the same coordinator.
 
 Only the bounded Superpowers primitives `brainstorming`, `writing-plans`, and
 `verification-before-completion` are installed. Competing orchestration skills

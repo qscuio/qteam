@@ -6,7 +6,6 @@ task records directly. Writes are locked, atomic, and mirrored to events.jsonl.
 """
 
 import argparse
-import fcntl
 import fnmatch
 import hashlib
 import json
@@ -14,6 +13,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -26,6 +26,9 @@ sys.dont_write_bytecode = True
 
 from agent_team_policy import (
     MODEL_PROFILES, derive_task_policy, review_contract_digest, safe_identifier,
+)
+from agent_team_artifact import (
+    ArtifactError, epic_binding, locked_regular, require_bound_drift, safe_regular,
 )
 
 
@@ -363,22 +366,110 @@ def atomic_json(path, value):
             os.unlink(tmp)
 
 
+def state_regular(path, label, *, required=False):
+    try:
+        return safe_regular(path, label, required=required)
+    except ArtifactError as exc:
+        raise SystemExit(f"error: {exc}")
+
+
 def event_recorded(run_dir, txid):
-    path = run_dir / "events.jsonl"
+    path = state_regular(run_dir / "events.jsonl", "run event log")
     if not path.exists():
         return False
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         try:
-            if json.loads(line).get("txid") == txid:
+            record = json.loads(line)
+            if not isinstance(record, dict):
+                raise SystemExit("error: run event log entries must be JSON objects")
+            if record.get("txid") == txid:
                 return True
         except json.JSONDecodeError:
             continue
     return False
 
 
+def validate_transaction_write(run_dir, relative, value):
+    if not isinstance(relative, str) or not isinstance(value, dict):
+        raise SystemExit("error: run transaction writes must map paths to objects")
+    path = Path(relative)
+    if (path.is_absolute() or not path.parts
+            or any(part in {"", ".", ".."} for part in path.parts)):
+        raise SystemExit("error: invalid run transaction path")
+    if relative == "state.json":
+        required = {
+            "schema_version", "run_id", "goal", "base_branch", "base_commit",
+            "integration_branch", "phase", "current_wave", "tasks",
+            "decisions", "gates", "risk_required", "shared_surfaces",
+            "plan_file", "finished", "created_at", "updated_at",
+        }
+        if (not required.issubset(value)
+                or value.get("schema_version") not in {2, 3, 4, 5}
+                or value.get("run_id") != run_dir.name
+                or value.get("phase") not in PHASES
+                or not isinstance(value.get("finished"), bool)
+                or any(not isinstance(value.get(field), dict)
+                       for field in ("tasks", "decisions", "gates"))
+                or ("waves" in value and not isinstance(value["waves"], dict))
+                or ("integration_provenance" in value
+                    and not isinstance(value["integration_provenance"], list))):
+            raise SystemExit("error: invalid state.json in run transaction")
+        return
+    if len(path.parts) != 2 or path.suffix != ".json":
+        raise SystemExit("error: unsupported run transaction target")
+    category, filename = path.parts
+    record_id = filename[:-5]
+    if not safe_task_id(record_id) or value.get("id") != record_id:
+        raise SystemExit("error: run transaction record identity mismatch")
+    if category == "tasks":
+        required = {
+            "id", "status", "branch", "worktree", "base_commit", "wave",
+            "write_set",
+        }
+        if (not required.issubset(value)
+                or not isinstance(value.get("status"), str)
+                or not isinstance(value.get("wave"), int)
+                or isinstance(value.get("wave"), bool)
+                or not isinstance(value.get("write_set"), list)
+                or ("depends_on" in value
+                    and not isinstance(value["depends_on"], list))):
+            raise SystemExit("error: invalid task record in run transaction")
+        return
+    if category == "decisions":
+        required = {
+            "schema_version", "id", "status", "question", "authority", "scope",
+        }
+        if (not required.issubset(value) or value.get("schema_version") != 1
+                or value.get("status") not in {"open", "resolved", "superseded"}
+                or not isinstance(value.get("scope"), dict)):
+            raise SystemExit("error: invalid decision record in run transaction")
+        return
+    raise SystemExit("error: unsupported run transaction target")
+
+
+def validate_run_transaction(run_dir, transaction):
+    if (not isinstance(transaction, dict)
+            or set(transaction) != {"schema_version", "txid", "writes", "event"}
+            or transaction.get("schema_version") != 1
+            or not isinstance(transaction.get("txid"), str)
+            or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", transaction["txid"])
+            or not isinstance(transaction.get("writes"), dict)
+            or not transaction["writes"]
+            or not isinstance(transaction.get("event"), dict)
+            or not isinstance(transaction["event"].get("event"), str)
+            or not transaction["event"]["event"]):
+        raise SystemExit("error: invalid run transaction")
+    for relative, value in transaction["writes"].items():
+        validate_transaction_write(run_dir, relative, value)
+    return transaction
+
+
 def apply_transaction(run_dir, transaction):
+    transaction = validate_run_transaction(run_dir, transaction)
     for rel, value in transaction["writes"].items():
-        path = (run_dir / rel).resolve()
+        lexical = run_dir / rel
+        state_regular(lexical, "run transaction target")
+        path = lexical.resolve()
         if run_dir.resolve() not in path.parents:
             raise SystemExit("error: transaction path escaped run directory")
         atomic_json(path, value)
@@ -388,7 +479,7 @@ def apply_transaction(run_dir, transaction):
 
 
 def recover_transaction(run_dir):
-    intent = run_dir / ".transaction.json"
+    intent = state_regular(run_dir / ".transaction.json", "run transaction")
     if not intent.exists():
         return
     transaction = load_json(intent)
@@ -408,7 +499,9 @@ def commit_transaction(run_dir, writes, event):
                    for path, value in writes.items()},
         "event": event,
     }
-    intent = run_dir / ".transaction.json"
+    intent = state_regular(run_dir / ".transaction.json", "run transaction")
+    state_regular(run_dir / "events.jsonl", "run event log")
+    event_recorded(run_dir, transaction["txid"])
     atomic_json(intent, transaction)
     apply_transaction(run_dir, transaction)
     intent.unlink()
@@ -422,17 +515,22 @@ def commit_transaction(run_dir, writes, event):
 @contextmanager
 def locked(run_dir, *, allow_sealed=False):
     run_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = run_dir / ".state.lock"
-    with lock_path.open("a+", encoding="utf-8") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        recover_transaction(run_dir)
-        state_path = run_dir / "state.json"
-        if (state_path.is_file() and not allow_sealed
-                and load_json(state_path).get("publication_seal")):
-            raise SystemExit(
-                "error: publication seal freezes READY state and gate mutations"
-            )
-        yield
+    lock_path = state_regular(run_dir / ".state.lock", "run state lock")
+    try:
+        with locked_regular(lock_path, "run state lock"):
+            state_regular(run_dir / ".transaction.json", "run transaction")
+            state_regular(run_dir / "events.jsonl", "run event log")
+            event_recorded(run_dir, "")
+            state_path = state_regular(run_dir / "state.json", "run state")
+            recover_transaction(run_dir)
+            if (state_path.is_file() and not allow_sealed
+                    and load_json(state_path).get("publication_seal")):
+                raise SystemExit(
+                    "error: publication seal freezes READY state and gate mutations"
+                )
+            yield
+    except ArtifactError as exc:
+        raise SystemExit(f"error: {exc}")
 
 
 def load_json(path):
@@ -446,13 +544,20 @@ def load_json(path):
 
 def append_event(run_dir, event):
     event = {"ts": now(), **event}
-    path = run_dir / "events.jsonl"
-    needs_newline = path.exists() and path.stat().st_size > 0
-    if needs_newline:
-        with path.open("rb") as check:
-            check.seek(-1, os.SEEK_END)
-            needs_newline = check.read(1) != b"\n"
-    with path.open("a", encoding="utf-8") as out:
+    path = state_regular(run_dir / "events.jsonl", "run event log")
+    flags = os.O_RDWR | os.O_CREAT | os.O_APPEND
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise SystemExit(f"error: cannot safely append run event log: {exc}")
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise SystemExit("error: run event log is not a regular file")
+    size = os.fstat(descriptor).st_size
+    needs_newline = size > 0 and os.pread(descriptor, 1, size - 1) != b"\n"
+    with os.fdopen(descriptor, "a", encoding="utf-8") as out:
         if needs_newline:
             out.write("\n")
         out.write(json.dumps(event, sort_keys=True) + "\n")
@@ -1336,6 +1441,8 @@ def cmd_init(args, repo, run_dir):
             state = load_json(state_file)
             if state.get("finished"):
                 raise SystemExit("error: run already exists and is finished")
+            if args.epic and state.get("epic", {}).get("id") != args.epic:
+                raise SystemExit("error: existing run has a different epic binding")
             print(json.dumps(state, indent=2, sort_keys=True))
             return
         base_branch = args.base_branch or subprocess.check_output(
@@ -1345,6 +1452,12 @@ def cmd_init(args, repo, run_dir):
             ["git", "rev-parse", "HEAD"], cwd=repo, text=True
         ).strip()
         base_commit = git(["rev-parse", f"{base_commit}^{{commit}}"], repo).stdout.strip()
+        epic = None
+        if args.epic:
+            try:
+                epic = epic_binding(repo, args.epic, run_dir.name, base_commit)
+            except ArtifactError as exc:
+                raise SystemExit(f"error: {exc}")
         state = {
             "schema_version": 5,
             "run_id": run_dir.name,
@@ -1382,8 +1495,12 @@ def cmd_init(args, repo, run_dir):
             "created_at": now(),
             "updated_at": now(),
         }
-        commit_transaction(run_dir, {state_file: state},
-                           {"event": "run_created", "phase": "INIT"})
+        if epic:
+            state["epic"] = epic
+        event = {"event": "run_created", "phase": "INIT"}
+        if epic:
+            event["epic"] = epic["id"]
+        commit_transaction(run_dir, {state_file: state}, event)
     print(json.dumps(state, indent=2, sort_keys=True))
 
 
@@ -3245,6 +3362,10 @@ def validate_ready_invariants(repo, run_dir, state, head):
     if gates.get("learning", {}).get("status") not in {"passed", "skipped"}:
         raise SystemExit("error: learning gate is not passed or explicitly skipped")
     require_no_decision_blockers(run_dir, state, "finish", action="finish")
+    try:
+        require_bound_drift(repo, run_dir, state)
+    except ArtifactError as exc:
+        raise SystemExit(f"error: {exc}")
     unresolved_handoffs = []
     for task_id in state.get("tasks", {}):
         task = load_json(run_dir / "tasks" / f"{task_id}.json")
@@ -3340,6 +3461,7 @@ def parser():
     p.add_argument("--base-commit")
     p.add_argument("--integration-branch")
     p.add_argument("--plan-file")
+    p.add_argument("--epic", help="epic id whose dependency gate authorizes this run")
     p.add_argument("--require-risk", action="store_true")
     p.add_argument("--model-economy", default=MODEL_PROFILES["economy"]["model"])
     p.add_argument("--model-standard", default=MODEL_PROFILES["standard"]["model"])
@@ -3449,7 +3571,7 @@ def main():
     args = parser().parse_args()
     repo = git_root()
     run_dir = resolve_run(repo, args.run)
-    state_path = run_dir / "state.json"
+    state_path = state_regular(run_dir / "state.json", "run state")
     if state_path.is_file() and args.command not in {"migrate-run", "migrate-v2"}:
         existing_state = load_json(state_path)
         version = existing_state.get("schema_version")

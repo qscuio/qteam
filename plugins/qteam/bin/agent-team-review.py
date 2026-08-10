@@ -23,6 +23,7 @@ from agent_team_policy import (
     REVIEW_INTENSITY_INSTRUCTIONS,
     review_contract_digest, safe_identifier,
 )
+from agent_team_artifact import ArtifactError, lint_documents
 
 AXES = {"spec", "standards", "risk"}
 SEVERITIES = {"P0", "P1", "P2", "P3"}
@@ -270,6 +271,9 @@ def packet_matches_policy(packet, state, wave_policy):
 
 
 def validate_source_snapshots(run, packet):
+    packet_schema = packet.get("schema_version")
+    if packet_schema not in {1, 2}:
+        raise SystemExit("error: unsupported review packet schema")
     source_root = (run / "reviews" / "sources").resolve()
     absolute = []
     for field in ("spec_sources", "standards_sources", "digest_sources"):
@@ -288,7 +292,64 @@ def validate_source_snapshots(run, packet):
                     or hashlib.sha256(path.read_bytes()).hexdigest() != record["sha256"]):
                 raise SystemExit("error: review source snapshot integrity failure")
             absolute.append(str(path))
+    lint_report = packet.get("artifact_lint")
+    lint_digest = packet.get("artifact_lint_sha256")
+    if packet.get("axis") == "spec":
+        has_report = "artifact_lint" in packet
+        has_digest = "artifact_lint_sha256" in packet
+        if packet_schema == 1 and not has_report and not has_digest:
+            return absolute
+        if (has_report != has_digest or not isinstance(lint_report, dict)
+                or lint_report.get("status") not in {"pass", "pass-with-warnings"}
+                or lint_report.get("errors")
+                or object_sha256(lint_report) != lint_digest):
+            raise SystemExit("error: review packet artifact lint integrity failure")
+        expected_sources = [
+            {"source": record.get("source"), "sha256": record.get("sha256")}
+            for record in packet.get("spec_sources", [])
+        ]
+        if lint_report.get("sources") != expected_sources:
+            raise SystemExit("error: artifact lint does not cover frozen spec sources")
+    elif lint_report is not None or lint_digest is not None:
+        raise SystemExit("error: non-spec review packet cannot carry spec artifact lint")
     return absolute
+
+
+def validate_completed_review(run, path, ledger):
+    packet = ledger.get("packet", {})
+    validate_source_snapshots(run, packet)
+    attestation = ledger.get("attestation")
+    if not isinstance(attestation, dict):
+        raise SystemExit("error: completed review has no attestation")
+    receipt_path = (run / str(attestation.get("receipt", ""))).resolve()
+    receipt_root = (run / "reviews" / "receipts").resolve()
+    if (receipt_path.parent != receipt_root or receipt_path.is_symlink()
+            or not receipt_path.is_file()
+            or hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+            != attestation.get("receipt_sha256")):
+        raise SystemExit("error: completed review receipt integrity failure")
+    receipt = read(receipt_path)
+    result_path = (run / str(receipt.get("result", ""))).resolve()
+    result_root = (run / "reviews" / "results").resolve()
+    if result_path.parent != result_root:
+        raise SystemExit("error: completed review result escaped its directory")
+    result, result_sha = review_result(result_path, packet.get("axis"))
+    if (receipt.get("status") != "passed" or receipt.get("exit_code") != 0
+            or receipt.get("ledger") != str(path.relative_to(run))
+            or receipt.get("packet_sha256") != object_sha256(packet)
+            or receipt.get("ledger_findings_sha256")
+            != object_sha256(ledger.get("findings", []))
+            or receipt.get("review_contract_sha256")
+            != packet.get("review_contract_sha256")
+            or receipt.get("review_head_sha") != packet.get("head_sha")
+            or receipt.get("execution") != packet.get("review_execution")
+            or receipt.get("reviewer") != attestation.get("reviewer")
+            or receipt.get("session_id") != attestation.get("session_id")
+            or receipt.get("result_sha256") != result_sha
+            or attestation.get("result_sha256") != result_sha
+            or attestation.get("result") != result):
+        raise SystemExit("error: completed review attestation integrity failure")
+    return attestation
 
 
 def ledger_path(run, wave, axis, iteration=1):
@@ -386,6 +447,17 @@ def cmd_create(args, repo, run):
         source_path = (repo / source).resolve() if not Path(source).is_absolute() else Path(source).resolve()
         if repo not in source_path.parents or not source_path.is_file():
             raise SystemExit(f"error: digest source must be a repository file: {source}")
+    artifact_lint = None
+    artifact_lint_sha256 = None
+    if args.axis == "spec":
+        try:
+            artifact_lint = lint_documents("spec", args.spec_source, repo)
+        except ArtifactError as exc:
+            raise SystemExit(f"error: artifact lint failed: {exc}")
+        if artifact_lint["errors"]:
+            codes = ", ".join(sorted({item["code"] for item in artifact_lint["errors"]}))
+            raise SystemExit(f"error: artifact lint failed: {codes}")
+        artifact_lint_sha256 = object_sha256(artifact_lint)
     base = git(["rev-parse", args.base], repo)
     head = git(["rev-parse", args.head], repo)
     merge_base = git(["merge-base", base, head], repo)
@@ -471,7 +543,7 @@ def cmd_create(args, repo, run):
         standards_sources = snapshot_sources(repo, run, args.standards_source)
         digest_sources = snapshot_sources(repo, run, args.digest_source)
     packet = {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": run.name,
         "wave": args.wave,
         "axis": args.axis,
@@ -494,6 +566,8 @@ def cmd_create(args, repo, run):
         "spec_sources": spec_sources,
         "standards_sources": standards_sources,
         "digest_sources": digest_sources,
+        "artifact_lint": artifact_lint,
+        "artifact_lint_sha256": artifact_lint_sha256,
         "created_at": now(),
     }
     validate_source_snapshots(run, packet)
@@ -560,12 +634,25 @@ def cmd_run(args, repo, _run):
             "started_at": now(),
         })
     closure_ids = [item["id"] for item in packet.get("closure_findings", [])]
+    if packet.get("artifact_lint") is None:
+        lint_guidance = (
+            "This pre-0.10 packet has no deterministic artifact preflight; check "
+            "the frozen source structure semantically without widening review scope. "
+        )
+    else:
+        lint_guidance = (
+            "The packet's artifact_lint already covers deterministic structure and "
+            "traceability checks. Do not repeat passing mechanical checks; inspect only "
+            "its warnings plus semantic behavior, scope, acceptance, and risk relevant "
+            "to this axis. An untyped-source warning is context, not by itself a defect. "
+        )
     prompt = (
         "You are an independent, read-only QTeam reviewer. Do not edit files. "
         f"Review only axis {packet['axis']} at immutable range {packet['diff_range']}. "
         f"{REVIEW_AXIS_INSTRUCTIONS[packet['axis']]} "
         f"{REVIEW_INTENSITY_INSTRUCTIONS[packet['review_intensity']]} "
         f"{REVIEW_FINDING_INSTRUCTIONS} "
+        f"{lint_guidance}"
         f"Read these frozen packet snapshots by absolute path: {source_paths}. "
         "Inspect the affected diff from this exact detached reviewed HEAD; obey "
         "review_intensity and risk_flags. Return JSON only. If defects exist, use "
@@ -778,6 +865,7 @@ def cmd_complete(args, repo, _run):
     with review_lock(path.parent):
         ledger = read(path)
         if ledger.get("completed_at"):
+            validate_completed_review(path.parent.parent, path, ledger)
             print("complete")
             return
         open_items = [item["id"] for item in ledger["findings"] if item["status"] == "open"]
@@ -898,6 +986,12 @@ def cmd_check(args, repo, run):
             continue
         _iteration, path, ledger = max(candidates, key=lambda item: item[0])
         packet = ledger.get("packet", {})
+        try:
+            validate_source_snapshots(run, packet)
+            if ledger.get("completed_at"):
+                validate_completed_review(run, path, ledger)
+        except SystemExit as exc:
+            errors.append(f"{axis} ledger integrity failure: {exc}")
         if not packet_matches_policy(packet, state, wave_policy):
             errors.append(f"{axis} ledger policy is stale or invalid")
         if args.head and packet.get("head_sha") != git(["rev-parse", args.head], repo):

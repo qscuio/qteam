@@ -18,6 +18,7 @@ STATE = PLUGIN / "bin/agent-team-state.py"
 WORKER = PLUGIN / "bin/agent-team-worker.py"
 CHECK = PLUGIN / "bin/agent-team-check-task.py"
 REVIEW = PLUGIN / "bin/agent-team-review.py"
+ARTIFACT = PLUGIN / "bin/agent_team_artifact.py"
 POLICY = PLUGIN / "bin/agent_team_policy.py"
 FINISH = PLUGIN / "bin/agent-team-finish.py"
 IMPORT = PLUGIN / "bin/import-agent-learning.py"
@@ -223,6 +224,52 @@ class RepoCase(unittest.TestCase):
 
 
 class StateTests(RepoCase):
+    def test_state_wal_lock_and_events_reject_symlinks(self):
+        run = self.init_run()
+        outside_events = Path(self.tmp.name) / "outside-events.jsonl"
+        outside_events.write_text("sentinel\n", encoding="utf-8")
+        events = run / "events.jsonl"
+        events.unlink()
+        os.symlink(outside_events, events)
+        decision = self.repo / "unsafe-event-decision.json"
+        decision.write_text(json.dumps({
+            "schema_version": 1, "id": "D-unsafe", "status": "open",
+            "question": "Unsafe?", "authority": "user",
+            "scope": {"kind": "action", "targets": ["finish"]},
+        }), encoding="utf-8")
+        rejected_event = self.run_tool(
+            STATE, "--run", str(run), "decision-put", "--file", str(decision)
+        )
+        self.assertNotEqual(rejected_event.returncode, 0)
+        self.assertIn("symlink", rejected_event.stderr)
+        self.assertEqual(outside_events.read_text(encoding="utf-8"), "sentinel\n")
+        self.assertNotIn(
+            "D-unsafe",
+            json.loads((run / "state.json").read_text(encoding="utf-8"))["decisions"],
+        )
+
+        events.unlink()
+        events.write_text("[]\n", encoding="utf-8")
+        rejected_value = self.run_tool(
+            STATE, "--run", str(run), "decision-put", "--file", str(decision)
+        )
+        self.assertNotEqual(rejected_value.returncode, 0)
+        self.assertNotIn("Traceback", rejected_value.stderr)
+        self.assertNotIn(
+            "D-unsafe",
+            json.loads((run / "state.json").read_text(encoding="utf-8"))["decisions"],
+        )
+
+        events.write_text("", encoding="utf-8")
+        lock = run / ".state.lock"
+        lock.unlink()
+        outside_lock = Path(self.tmp.name) / "outside-lock"
+        outside_lock.write_text("", encoding="utf-8")
+        os.symlink(outside_lock, lock)
+        rejected_lock = self.run_tool(STATE, "--run", str(run), "status")
+        self.assertNotEqual(rejected_lock.returncode, 0)
+        self.assertIn("symlink", rejected_lock.stderr)
+
     def test_dependency_graph_requires_registered_strictly_earlier_predecessors(self):
         run = self.init_run()
         self.make_task(run, task="T01", wave=1)
@@ -2685,6 +2732,22 @@ class ReviewTests(RepoCase):
         self.assertNotEqual(blocked.returncode, 0)
         self.assertIn("snapshot integrity", blocked.stderr)
 
+    def test_completed_review_rejects_tampered_artifact_lint_packet(self):
+        run = self.init_run()
+        integration, _worktree = self.prepare_ready_run(run)
+        ledger_path = run / "reviews/wave-1-spec.json"
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        ledger["packet"]["artifact_lint"]["warnings"].append({
+            "code": "SPEC999", "severity": "warning", "message": "tampered",
+        })
+        ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
+        blocked = self.run_tool(
+            REVIEW, "--run", str(run), "check", "--wave", "1",
+            "--head", integration,
+        )
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn("ledger integrity failure", blocked.stdout)
+
     def test_interrupted_multi_ledger_closure_recovers_idempotently(self):
         run = self.init_run()
         original = self.run_git("rev-parse", "HEAD").stdout.strip()
@@ -3321,6 +3384,52 @@ class ReviewTests(RepoCase):
 
 
 class FinishTests(RepoCase):
+    def test_bound_spec_drift_is_rechecked_by_finish(self):
+        run = self.init_run()
+        integration, _ = self.prepare_ready_run(run)
+        decision = self.repo / "drift-decision.json"
+        decision.write_text(json.dumps({
+            "schema_version": 1, "id": "drift-D1", "status": "open",
+            "question": "Approve the spec drift?", "authority": "user",
+            "scope": {"kind": "action", "targets": ["finish"]},
+        }), encoding="utf-8")
+        self.run_tool(
+            STATE, "--run", str(run), "decision-put", "--file", str(decision),
+            check=True,
+        )
+        draft = self.repo / "drift-draft.json"
+        draft.write_text(json.dumps({
+            "summary": "document actual behavior", "changes": [{
+                "id": "D1", "layer": "design", "original": "implicit",
+                "actual": "explicit", "reason": "integration evidence",
+                "proposal": "document explicit behavior",
+                "decision_id": "drift-D1",
+            }],
+        }), encoding="utf-8")
+        self.run_tool(
+            ARTIFACT, "drift-seal", "--run", run.name, "--file", str(draft),
+            "--source", "README.md", "--head", integration,
+            "--output", f".agents/runs/{run.name}/spec-drift.json", check=True,
+        )
+        state = json.loads((run / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["spec_drift"]["decision_ids"], ["drift-D1"])
+        self.run_tool(
+            STATE, "--run", str(run), "decision-resolve", "drift-D1",
+            "--outcome", "allow", "--choice", "accept",
+            "--evidence", "user approval", check=True,
+        )
+        ready = self.run_tool(
+            STATE, "--run", str(run), "finish", "--check-only"
+        )
+        self.assertEqual(ready.returncode, 0, ready.stderr)
+
+        (self.repo / "README.md").write_text("changed after approval\n", encoding="utf-8")
+        blocked = self.run_tool(
+            STATE, "--run", str(run), "finish", "--check-only"
+        )
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn("spec drift gate is stale", blocked.stderr)
+
     def test_state_mutation_rechecks_publication_seal_inside_run_lock(self):
         run = self.init_run()
         state_path = run / "state.json"
@@ -3694,6 +3803,47 @@ class InvariantTests(RepoCase):
         self.assertEqual(json.loads(shown.stdout)["goal"], "recovered goal")
         self.assertFalse((run / ".transaction.json").exists())
 
+    def test_malformed_wal_never_overwrites_valid_run_state(self):
+        run = self.init_run()
+        state_path = run / "state.json"
+        original = state_path.read_bytes()
+        intent = run / ".transaction.json"
+        intent.write_text(json.dumps({
+            "schema_version": 1, "txid": "malformed-recovery",
+            "writes": {"state.json": {}},
+            "event": {"event": "tampered"},
+        }), encoding="utf-8")
+        rejected = self.run_tool(STATE, "--run", str(run), "show")
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertNotIn("Traceback", rejected.stderr)
+        self.assertEqual(state_path.read_bytes(), original)
+        self.assertTrue(intent.exists())
+
+    def test_legacy_v2_wal_recovers_before_migration(self):
+        run = self.init_run()
+        state_path = run / "state.json"
+        legacy = json.loads(state_path.read_text(encoding="utf-8"))
+        legacy["schema_version"] = 2
+        for field in (
+            "risk_forced", "model_profiles", "waves", "policy_migration_pending",
+            "integration_provenance_head", "integration_provenance",
+        ):
+            legacy.pop(field, None)
+        state_path.write_text(json.dumps(legacy), encoding="utf-8")
+        recovered = {**legacy, "goal": "recovered legacy goal"}
+        intent = {
+            "schema_version": 1, "txid": "legacy-v2-recovery",
+            "writes": {"state.json": recovered},
+            "event": {"event": "legacy_recovered"},
+        }
+        (run / ".transaction.json").write_text(json.dumps(intent), encoding="utf-8")
+        migrated = self.run_tool(STATE, "--run", str(run), "migrate-v2")
+        self.assertEqual(migrated.returncode, 0, migrated.stderr)
+        current = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(current["schema_version"], 5)
+        self.assertEqual(current["goal"], "recovered legacy goal")
+        self.assertFalse((run / ".transaction.json").exists())
+
     def test_reset_integration_cannot_hide_a_previously_merged_task(self):
         run = self.init_run()
         worktree, _ = self.make_task(run)
@@ -3832,6 +3982,8 @@ class InstallerTests(RepoCase):
         self.assertTrue((self.repo / ".codex/bin/agent-team-worker").is_file())
         self.assertTrue((self.repo / ".codex/bin/agent-team-state").is_file())
         self.assertTrue((self.repo / ".codex/bin/agent-team-review").is_file())
+        self.assertTrue((self.repo / ".codex/bin/agent-team-artifact").is_file())
+        self.assertTrue((self.repo / ".codex/bin/agent_team_artifact.py").is_file())
         self.assertTrue((self.repo / ".codex/bin/agent_team_policy.py").is_file())
         self.assertTrue((self.repo / ".codex/bin/import-agent-learning").is_file())
         self.assertTrue((self.repo /
@@ -3844,9 +3996,17 @@ class InstallerTests(RepoCase):
                          ".codex/schemas/handoff.schema.json").is_file())
         self.assertTrue((self.repo /
                          ".codex/schemas/scenario-coverage.schema.json").is_file())
+        self.assertTrue((self.repo /
+                         ".codex/schemas/artifact-lint.schema.json").is_file())
+        self.assertTrue((self.repo / ".codex/schemas/epic.schema.json").is_file())
+        self.assertTrue((self.repo /
+                         ".codex/schemas/code-index.schema.json").is_file())
+        self.assertTrue((self.repo /
+                         ".codex/schemas/spec-drift.schema.json").is_file())
         self.assertTrue((self.repo / ".codex/licenses/Superpowers-MIT.txt").is_file())
         self.assertTrue((self.repo / ".codex/licenses/Autoresearch-MIT.txt").is_file())
         self.assertTrue((self.repo / ".codex/licenses/LoopX-MIT.txt").is_file())
+        self.assertTrue((self.repo / ".codex/licenses/Smart-Ralph-MIT.txt").is_file())
         self.assertFalse((self.repo / ".agents/skills/qteam-router").exists())
         self.assertFalse(old_qteam.exists())
         self.assertFalse(old_skill.exists())
@@ -4332,6 +4492,13 @@ class PluginTests(RepoCase):
                 previous_paths = {
                     autoresearch_license, experiment_schema,
                     ".codex/licenses/LoopX-MIT.txt",
+                    ".codex/licenses/Smart-Ralph-MIT.txt",
+                    ".codex/bin/agent-team-artifact",
+                    ".codex/bin/agent_team_artifact.py",
+                    ".codex/schemas/artifact-lint.schema.json",
+                    ".codex/schemas/code-index.schema.json",
+                    ".codex/schemas/epic.schema.json",
+                    ".codex/schemas/spec-drift.schema.json",
                     ".codex/schemas/decision-gate.schema.json",
                     ".codex/schemas/handoff.schema.json",
                     ".codex/schemas/scenario-coverage.schema.json",
@@ -4389,6 +4556,13 @@ class PluginTests(RepoCase):
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         additions = {
             ".codex/licenses/LoopX-MIT.txt",
+            ".codex/licenses/Smart-Ralph-MIT.txt",
+            ".codex/bin/agent-team-artifact",
+            ".codex/bin/agent_team_artifact.py",
+            ".codex/schemas/artifact-lint.schema.json",
+            ".codex/schemas/code-index.schema.json",
+            ".codex/schemas/epic.schema.json",
+            ".codex/schemas/spec-drift.schema.json",
             ".codex/schemas/decision-gate.schema.json",
             ".codex/schemas/handoff.schema.json",
             ".codex/schemas/scenario-coverage.schema.json",
@@ -4409,7 +4583,8 @@ class PluginTests(RepoCase):
         )
         self.assertEqual(upgraded.returncode, 0, upgraded.stdout + upgraded.stderr)
         current = json.loads(manifest_path.read_text(encoding="utf-8"))
-        self.assertEqual(current["version"], "0.9.0")
+        self.assertEqual(current["version"],
+                         (PLUGIN / "VERSION").read_text(encoding="utf-8").strip())
         for relative in additions:
             self.assertTrue((self.repo / relative).is_file())
 

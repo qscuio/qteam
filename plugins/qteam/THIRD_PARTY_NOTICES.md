@@ -32,3 +32,11 @@ LoopX contributors). QTeam implements them inside its existing coordinator and
 transactional state manager; it does not import LoopX's token/quota economy or
 create a second orchestration kernel. The upstream license is reproduced in
 `LICENSES/LoopX-MIT.txt`.
+
+QTeam's deterministic spec preflight, epic-to-spec dependency manifest,
+freshness-checked component index, and post-implementation specification drift
+proposal adapt workflow ideas from Smart Ralph (MIT License, copyright 2025
+tzachbon). QTeam implements them as bounded artifacts and gates inside the
+existing coordinator: it does not import Ralph's stop-hook loop, role set,
+POC-first test deferral, or state authority. The upstream license is reproduced
+in `LICENSES/Smart-Ralph-MIT.txt`.

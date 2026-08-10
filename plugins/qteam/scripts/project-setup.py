@@ -169,12 +169,14 @@ def installed_payloads(plugin_root, version, source_commit, stamp):
         )
     binary_sources = {
         "wake-agent-team": "bin/wake-agent-team.sh",
+        "agent-team-artifact": "bin/agent_team_artifact.py",
         "agent-team-finish": "bin/agent-team-finish.py",
         "agent-team-check-task": "bin/agent-team-check-task.py",
         "agent-team-doctor": "bin/agent-team-doctor.sh",
         "agent-team-state": "bin/agent-team-state.py",
         "agent-team-worker": "bin/agent-team-worker.py",
         "agent-team-review": "bin/agent-team-review.py",
+        "agent_team_artifact.py": "bin/agent_team_artifact.py",
         "agent_team_policy.py": "bin/agent_team_policy.py",
         "import-agent-learning": "bin/import-agent-learning.py",
         "qteam-project-uninstall": "scripts/project-uninstall.py",
@@ -192,7 +194,7 @@ def installed_payloads(plugin_root, version, source_commit, stamp):
     )
     for name in (
         "Matt-Pocock-MIT.txt", "Superpowers-MIT.txt", "Autoresearch-MIT.txt",
-        "LoopX-MIT.txt",
+        "LoopX-MIT.txt", "Smart-Ralph-MIT.txt",
     ):
         payloads[f".codex/licenses/{name}"] = (
             source_bytes(plugin_root / f"LICENSES/{name}"), 0o644,

@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qteam.local/schemas/code-index.schema.json",
+  "type": "object",
+  "required": ["schema_version", "base_commit", "generated_at", "components", "external_resources"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "base_commit": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+    "generated_at": {"type": "string", "minLength": 1},
+    "components": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "summary", "sources", "symbols", "contracts"],
+        "properties": {
+          "id": {"$ref": "#/$defs/id"},
+          "summary": {"type": "string", "minLength": 1},
+          "sources": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": ["path", "blob"],
+              "properties": {
+                "path": {"type": "string", "minLength": 1},
+                "blob": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"}
+              },
+              "additionalProperties": false
+            }
+          },
+          "symbols": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+          "contracts": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+        },
+        "additionalProperties": false
+      }
+    },
+    "external_resources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "url", "evidence"],
+        "properties": {
+          "id": {"$ref": "#/$defs/id"},
+          "url": {"type": "string", "pattern": "^https?://"},
+          "version": {"type": "string"},
+          "verified_at": {"type": "string"},
+          "evidence": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "id": {"type": "string", "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"}
+  }
+}
