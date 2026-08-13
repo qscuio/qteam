@@ -17,6 +17,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -25,13 +26,17 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 
 from agent_team_policy import (
-    MODEL_PROFILES, REVIEW_MODEL_PROFILES, REVERSIBILITY_ORDER,
-    derive_task_policy, review_contract_digest, safe_identifier,
+    DEFAULT_PROJECT_POLICY, MODEL_PROFILES, QUALITY_LANES, RISK_FLAGS,
+    REVIEW_MODEL_PROFILES, REVERSIBILITY_ORDER, WORKFLOW_SHAPE_ORDER,
+    core_policy_digest, derive_task_policy, project_policy_digest, review_contract_digest,
+    safe_identifier, validate_project_policy,
 )
 from agent_team_eval import (
-    calibration_suite, execution_profile, object_sha256,
-    run_regular_file, trajectory_independence, validate_calibration,
+    calibration_suite, execution_profile, file_sha256, object_sha256,
+    regular_output, run_regular_file, trajectory_independence,
+    validate_calibration,
     validate_eval_case, validate_trajectory, wave_trajectory,
+    wait_capped_process,
 )
 from agent_team_artifact import (
     ArtifactError, epic_binding, locked_regular, require_bound_drift, safe_regular,
@@ -114,10 +119,346 @@ LOCAL_PATH_PATTERN = re.compile(
     re.IGNORECASE,
 )
 LOCAL_PATH_PLACEHOLDERS = {"user", "username", "name", "example", "<user>"}
+QUEUE_KINDS = {"task", "quality", "review", "fix", "research"}
+QUEUE_STATUSES = {"pending", "claimed", "completed", "failed"}
+MAX_QUALITY_COMMANDS = 8
+MAX_AGGREGATE_QUALITY_COMMANDS = 64
+MAX_QUALITY_COMMAND_LENGTH = 2048
+MAX_QUEUE_ITEMS = 256
+MAX_QUEUE_TARGETS = 64
+MAX_QUEUE_EVIDENCE = 4096
+MAX_STATE_BYTES = 8 * 1024 * 1024
+VERIFICATION_TIMEOUT_SECONDS = 300
+QUALITY_LANE_TIMEOUT_SECONDS = 2400
+RUN_TRANSACTION_EVENTS = {
+    "run_created", "run_migrated", "phase", "task_put", "task_status",
+    "handoff_closed", "task_check", "artifact_complete",
+    "learning_item_decided", "tdd_cycle_verified", "experiment_recorded",
+    "diagnosis_recorded", "diagnosis_green", "task_verification",
+    "quality_assessed", "quality_lane", "queue_put", "queue_claim",
+    "queue_complete", "gate",
+    "decision_opened", "decision_resolved", "decision_superseded",
+    "publication_sealed",
+}
 
 
 def safe_task_id(value):
     return safe_identifier(value)
+
+
+def load_project_policy(repo):
+    core_digest = core_policy_digest()
+    path = repo / ".qteam" / "policy.json"
+    current = repo
+    for part in (".qteam", "policy.json"):
+        current = current / part
+        if current.is_symlink():
+            raise SystemExit("error: QTeam project policy path must not contain symlinks")
+    if not path.exists():
+        policy = validate_project_policy(DEFAULT_PROJECT_POLICY)
+        return policy, [{
+            "name": "qteam-core", "kind": "core",
+            "policy_version": 3, "sha256": core_digest,
+            "defaults_sha256": project_policy_digest(policy),
+        }]
+    if not path.is_file():
+        raise SystemExit("error: .qteam/policy.json must be a regular file")
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            info = os.fstat(descriptor)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_size > 1024 * 1024):
+                raise ValueError(
+                    "project policy must be a singly-linked file of at most 1 MiB"
+                )
+            raw = os.read(descriptor, 1024 * 1024 + 1).decode(
+                "utf-8", errors="strict"
+            )
+        finally:
+            os.close(descriptor)
+        value = json.loads(raw)
+        policy = validate_project_policy(value)
+    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError,
+            ValueError) as exc:
+        raise SystemExit(f"error: invalid .qteam/policy.json: {exc}")
+    return policy, [
+        {
+            "name": "qteam-core", "kind": "core",
+            "policy_version": 3, "sha256": core_digest,
+            "defaults_sha256": project_policy_digest(DEFAULT_PROJECT_POLICY),
+        },
+        {
+            "name": "project", "kind": "project", "path": ".qteam/policy.json",
+            "sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+            "effective_sha256": project_policy_digest(policy),
+        },
+    ]
+
+
+def validate_quality_commands(record):
+    required = set(record.get("policy", {}).get("required_quality_lanes", []))
+    commands = record.get("quality_commands", {})
+    if not isinstance(commands, dict) or any(lane not in QUALITY_LANES for lane in commands):
+        raise SystemExit("error: quality_commands must map known quality lanes")
+    if not required.issubset(commands):
+        raise SystemExit(
+            "error: task is missing frozen commands for quality lanes: "
+            + ", ".join(sorted(required - set(commands)))
+        )
+    for lane, values in commands.items():
+        if (not isinstance(values, list) or not values
+                or len(values) > MAX_QUALITY_COMMANDS
+                or any(not isinstance(value, str) or not value.strip()
+                       or len(value) > MAX_QUALITY_COMMAND_LENGTH
+                       for value in values)
+                or len(values) != len(set(values))):
+            raise SystemExit(
+                f"error: quality_commands.{lane} must be unique non-empty commands"
+            )
+
+
+def validate_queue_item(item, state, *, allow_terminal=True):
+    required = {
+        "schema_version", "id", "kind", "targets", "priority", "status",
+        "created_at",
+    }
+    optional = {"claimed_by", "claimed_at", "completed_at", "evidence"}
+    if (not isinstance(item, dict) or not required.issubset(item)
+            or set(item) - required - optional
+            or item.get("schema_version") != 1
+            or not safe_task_id(item.get("id"))
+            or item.get("kind") not in QUEUE_KINDS
+            or not isinstance(item.get("targets"), list) or not item["targets"]
+            or len(item["targets"]) > MAX_QUEUE_TARGETS
+            or any(not safe_task_id(value) for value in item["targets"])
+            or len(item["targets"]) != len(set(item["targets"]))
+            or not isinstance(item.get("priority"), int)
+            or isinstance(item.get("priority"), bool)
+            or not 0 <= item["priority"] <= 9
+            or item.get("status") not in QUEUE_STATUSES
+            or not isinstance(item.get("created_at"), str)
+            or not item["created_at"]):
+        raise SystemExit("error: invalid coordinator queue item")
+    if item["kind"] in {"task", "fix"}:
+        missing = [value for value in item["targets"] if value not in state.get("tasks", {})]
+        if missing:
+            raise SystemExit("error: queue targets unknown tasks: " + ", ".join(missing))
+    if item["status"] == "pending":
+        if set(item) & {"claimed_by", "claimed_at", "completed_at", "evidence"}:
+            raise SystemExit("error: pending queue item contains lifecycle output")
+    elif item["status"] == "claimed":
+        if (not safe_task_id(item.get("claimed_by"))
+                or not isinstance(item.get("claimed_at"), str)
+                or not item["claimed_at"]
+                or set(item) & {"completed_at", "evidence"}):
+            raise SystemExit("error: invalid claimed queue item")
+    elif allow_terminal:
+        if (not safe_task_id(item.get("claimed_by"))
+                or not isinstance(item.get("claimed_at"), str)
+                or not item["claimed_at"]
+                or not isinstance(item.get("completed_at"), str)
+                or not item["completed_at"]
+                or not isinstance(item.get("evidence"), str)
+                or not item["evidence"]
+                or len(item["evidence"]) > MAX_QUEUE_EVIDENCE):
+            raise SystemExit("error: invalid completed queue item")
+    return item
+
+
+def validate_frozen_policy_layers(state, *, require_current=False):
+    try:
+        normalized = validate_project_policy(state.get("project_policy"))
+    except ValueError as exc:
+        raise SystemExit(f"error: invalid frozen project policy: {exc}")
+    if normalized != state.get("project_policy"):
+        raise SystemExit("error: frozen project policy is not canonical")
+    layers = state.get("policy_layers")
+    if not isinstance(layers, list) or len(layers) not in {1, 2}:
+        raise SystemExit("error: invalid frozen policy layers")
+    core = layers[0] if layers else None
+    if (not isinstance(core, dict)
+            or set(core) != {
+                "name", "kind", "policy_version", "sha256", "defaults_sha256",
+            }
+            or core.get("name") != "qteam-core" or core.get("kind") != "core"
+            or core.get("policy_version") != 3
+            or any(re.fullmatch(r"[0-9a-f]{64}", core.get(field, "")) is None
+                   for field in ("sha256", "defaults_sha256"))):
+        raise SystemExit("error: invalid frozen core policy identity")
+    if require_current:
+        if (core["sha256"] != core_policy_digest()
+                or core["defaults_sha256"]
+                != project_policy_digest(DEFAULT_PROJECT_POLICY)):
+            raise SystemExit(
+                "error: frozen core policy differs from this runtime; run migrate-run"
+            )
+    if len(layers) == 1:
+        if normalized != DEFAULT_PROJECT_POLICY:
+            raise SystemExit("error: project policy lacks its frozen layer")
+        return layers
+    project = layers[1]
+    if (not isinstance(project, dict)
+            or set(project) != {
+                "name", "kind", "path", "sha256", "effective_sha256",
+            }
+            or project.get("name") != "project" or project.get("kind") != "project"
+            or project.get("path") != ".qteam/policy.json"
+            or re.fullmatch(r"[0-9a-f]{64}", project.get("sha256", "")) is None
+            or project.get("effective_sha256") != project_policy_digest(normalized)):
+        raise SystemExit("error: invalid frozen project policy identity")
+    return layers
+
+
+def validate_quality_lane_record(raw_wave, lane, record, state):
+    if (not isinstance(raw_wave, str) or not raw_wave.isdigit()
+            or int(raw_wave) < 1 or lane not in QUALITY_LANES
+            or not isinstance(record, dict)
+            or set(record) - {
+                "lane", "required_by", "commands", "status", "head_sha",
+                "results", "updated_at", "attempts", "assessment",
+            }
+            or record.get("lane") != lane
+            or not isinstance(record.get("required_by"), list)
+            or not record["required_by"]
+            or any(not safe_task_id(value) for value in record["required_by"])
+            or len(record["required_by"]) != len(set(record["required_by"]))
+            or any(value not in state.get("tasks", {})
+                   for value in record["required_by"])
+            or not isinstance(record.get("commands"), list)
+            or not record["commands"]
+            or len(record["commands"]) > MAX_AGGREGATE_QUALITY_COMMANDS
+            or any(not isinstance(value, str) or not value.strip()
+                   or len(value) > MAX_QUALITY_COMMAND_LENGTH
+                   for value in record["commands"])
+            or len(record["commands"]) != len(set(record["commands"]))
+            or record.get("status") not in {"pending", "passed", "failed"}):
+        raise SystemExit("error: invalid quality lane state")
+    assessment = record.get("assessment")
+    if assessment is not None:
+        required_assessment = {
+            "outcome", "rationale", "head_sha", "assessed_at",
+        }
+        if (not isinstance(assessment, dict)
+                or not required_assessment.issubset(assessment)
+                or set(assessment) - required_assessment - {"task_id"}
+                or assessment.get("outcome") not in {"not-needed", "task-created"}
+                or not isinstance(assessment.get("rationale"), str)
+                or not assessment["rationale"].strip()
+                or len(assessment["rationale"]) > 2048
+                or re.fullmatch(r"[0-9a-f]{40,64}",
+                                assessment.get("head_sha", "")) is None
+                or not isinstance(assessment.get("assessed_at"), str)):
+            raise SystemExit("error: invalid quality lane assessment")
+        if ((assessment["outcome"] == "task-created")
+                != safe_task_id(assessment.get("task_id"))):
+            raise SystemExit("error: refactor assessment task binding is invalid")
+    evidence = {"head_sha", "results", "updated_at", "attempts"}
+    if record["status"] == "pending":
+        if set(record) & evidence:
+            raise SystemExit("error: pending quality lane contains execution evidence")
+        return record
+    if (not isinstance(record.get("head_sha"), str)
+            or re.fullmatch(r"[0-9a-f]{40,64}", record["head_sha"]) is None
+            or not isinstance(record.get("updated_at"), str)
+            or not record["updated_at"]
+            or not isinstance(record.get("results"), list)
+            or not record["results"]
+            or len(record["results"]) > len(record["commands"])
+            or (record["status"] == "passed"
+                and len(record["results"]) != len(record["commands"]))):
+        raise SystemExit("error: completed quality lane lacks exact evidence")
+    def validate_results(results, receipt_head, receipt_status, commands):
+        if (not isinstance(results, list) or not results
+                or len(results) > len(commands)
+                or (receipt_status == "passed"
+                    and len(results) != len(commands))):
+            raise SystemExit("error: quality lane receipt is incomplete")
+        expected = set(commands)
+        observed = set()
+        for result in results:
+            if (not isinstance(result, dict)
+                    or set(result) != {
+                        "command", "exit_code", "head_sha", "log", "log_sha256",
+                        "stderr_log", "stderr_sha256", "ts",
+                    }
+                    or not isinstance(result.get("command"), str)
+                    or result.get("command") not in expected
+                    or result.get("command") in observed
+                    or not isinstance(result.get("exit_code"), int)
+                    or isinstance(result.get("exit_code"), bool)
+                    or result.get("head_sha") != receipt_head
+                    or not isinstance(result.get("log"), str)
+                    or not result["log"].startswith("verifications/quality-wave-")
+                    or not isinstance(result.get("stderr_log"), str)
+                    or not result["stderr_log"].startswith(
+                        "verifications/quality-wave-")
+                    or re.fullmatch(r"[0-9a-f]{64}", result.get("log_sha256", "")) is None
+                    or re.fullmatch(r"[0-9a-f]{64}", result.get("stderr_sha256", "")) is None
+                    or not isinstance(result.get("ts"), str) or not result["ts"]):
+                raise SystemExit("error: malformed quality lane command evidence")
+            observed.add(result["command"])
+        if receipt_status == "passed" and observed != expected:
+            raise SystemExit("error: quality lane command evidence is incomplete")
+        passed = all(item["exit_code"] == 0 for item in results)
+        if (receipt_status == "passed") != passed:
+            raise SystemExit("error: quality lane status contradicts command results")
+
+    validate_results(
+        record["results"], record["head_sha"], record["status"],
+        record["commands"],
+    )
+    attempts = record.get("attempts", [])
+    if not isinstance(attempts, list) or not attempts or len(attempts) > 64:
+        raise SystemExit("error: completed quality lane lacks bounded attempt history")
+    for index, attempt in enumerate(attempts, start=1):
+        if (not isinstance(attempt, dict)
+                or set(attempt) != {
+                    "attempt", "status", "head_sha", "commands", "results",
+                    "updated_at",
+                }
+                or attempt.get("attempt") != index
+                or attempt.get("status") not in {"passed", "failed"}
+                or not isinstance(attempt.get("head_sha"), str)
+                or re.fullmatch(r"[0-9a-f]{40,64}", attempt["head_sha"]) is None
+                or not isinstance(attempt.get("commands"), list)
+                or not attempt["commands"]
+                or len(attempt["commands"]) > MAX_AGGREGATE_QUALITY_COMMANDS
+                or len(attempt["commands"]) != len(set(attempt["commands"]))
+                or any(not isinstance(command, str) or not command.strip()
+                       or len(command) > MAX_QUALITY_COMMAND_LENGTH
+                       for command in attempt["commands"])
+                or not isinstance(attempt.get("results"), list)
+                or not isinstance(attempt.get("updated_at"), str)
+                or not attempt["updated_at"]):
+            raise SystemExit("error: malformed quality lane attempt history")
+        validate_results(
+            attempt["results"], attempt["head_sha"], attempt["status"],
+            attempt["commands"],
+        )
+    latest = attempts[-1]
+    if (latest["status"] != record["status"]
+            or latest["head_sha"] != record["head_sha"]
+            or latest["results"] != record["results"]
+            or latest["updated_at"] != record["updated_at"]):
+        raise SystemExit("error: quality lane current receipt differs from history")
+    return record
+
+
+def validate_quality_lane_map(state):
+    lanes = state.get("quality_lanes", {})
+    if not isinstance(lanes, dict):
+        raise SystemExit("error: invalid quality lane map")
+    for raw_wave, values in lanes.items():
+        if not isinstance(values, dict) or not values:
+            raise SystemExit("error: invalid quality lane wave")
+        for lane, record in values.items():
+            validate_quality_lane_record(raw_wave, lane, record, state)
+    return lanes
 
 
 def finite_number(value):
@@ -379,11 +720,32 @@ def state_regular(path, label, *, required=False):
         raise SystemExit(f"error: {exc}")
 
 
+def ensure_run_directory(run_dir, name):
+    target = run_dir / name
+    if target.exists() or target.is_symlink():
+        if target.is_symlink() or not target.is_dir():
+            raise SystemExit(f"error: run {name} must be a real directory")
+        if target.resolve().parent != run_dir.resolve():
+            raise SystemExit(f"error: run {name} escaped the run directory")
+        return target
+    target.mkdir(mode=0o700)
+    if target.is_symlink() or target.resolve().parent != run_dir.resolve():
+        raise SystemExit(f"error: unsafe run {name} directory")
+    return target
+
+
 def event_recorded(run_dir, txid):
     path = state_regular(run_dir / "events.jsonl", "run event log")
     if not path.exists():
         return False
-    for line in path.read_text(encoding="utf-8", errors="strict").splitlines():
+    info = path.stat()
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise SystemExit("error: run event log must be a singly-linked regular file")
+    try:
+        text = path.read_text(encoding="utf-8", errors="strict")
+    except UnicodeError as exc:
+        raise SystemExit(f"error: invalid run event log encoding: {exc}")
+    for line in text.splitlines():
         try:
             record = json.loads(line)
             if not isinstance(record, dict):
@@ -399,6 +761,9 @@ def repair_truncated_event_tail(run_dir):
     path = state_regular(run_dir / "events.jsonl", "run event log")
     if not path.exists():
         return
+    info = path.stat()
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise SystemExit("error: run event log must be a singly-linked regular file")
     raw = path.read_bytes()
     offset = 0
     lines = raw.splitlines(keepends=True)
@@ -416,6 +781,11 @@ def repair_truncated_event_tail(run_dir):
                     flags |= os.O_NOFOLLOW
                 descriptor = os.open(path, flags)
                 try:
+                    info = os.fstat(descriptor)
+                    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                        raise SystemExit(
+                            "error: run event log must be a singly-linked regular file"
+                        )
                     os.ftruncate(descriptor, offset)
                     os.fsync(descriptor)
                 finally:
@@ -433,16 +803,22 @@ def validate_transaction_write(run_dir, relative, value):
             or any(part in {"", ".", ".."} for part in path.parts)):
         raise SystemExit("error: invalid run transaction path")
     if relative == "state.json":
+        if len((json.dumps(value, indent=2, sort_keys=True) + "\n").encode(
+                "utf-8")) > MAX_STATE_BYTES:
+            raise SystemExit("error: durable run state exceeds the 8 MiB limit")
         required = {
             "schema_version", "run_id", "goal", "base_branch", "base_commit",
             "integration_branch", "phase", "current_wave", "tasks",
             "decisions", "gates", "risk_required", "shared_surfaces",
             "plan_file", "finished", "created_at", "updated_at",
         }
+        schema_version = value.get("schema_version")
+        phase = value.get("phase")
         if (not required.issubset(value)
-                or value.get("schema_version") not in {2, 3, 4, 5, 6}
+                or type(schema_version) is not int
+                or schema_version not in {2, 3, 4, 5, 6}
                 or value.get("run_id") != run_dir.name
-                or value.get("phase") not in PHASES
+                or not isinstance(phase, str) or phase not in PHASES
                 or not isinstance(value.get("finished"), bool)
                 or any(not isinstance(value.get(field), dict)
                        for field in ("tasks", "decisions", "gates"))
@@ -450,7 +826,7 @@ def validate_transaction_write(run_dir, relative, value):
                 or ("integration_provenance" in value
                     and not isinstance(value["integration_provenance"], list))):
             raise SystemExit("error: invalid state.json in run transaction")
-        if value.get("schema_version") == 6:
+        if schema_version == 6:
             v6_required = {
                 "integration_provenance_head", "integration_provenance", "waves",
                 "risk_forced", "hard_to_reverse", "model_profiles",
@@ -461,10 +837,28 @@ def validate_transaction_write(run_dir, relative, value):
                     or not isinstance(value.get("integration_provenance"), list)
                     or not isinstance(value.get("waves"), dict)
                     or not isinstance(value.get("risk_forced"), bool)
-                    or not isinstance(value.get("hard_to_reverse"), bool)
-                    or any(not isinstance(value.get(field), dict)
-                           for field in ("model_profiles", "review_model_profiles"))):
+                or not isinstance(value.get("hard_to_reverse"), bool)
+                or any(not isinstance(value.get(field), dict)
+                           for field in ("model_profiles", "review_model_profiles"))
+                or ("quality_lanes" in value
+                    and not isinstance(value["quality_lanes"], dict))
+                or ("work_queue" in value
+                    and not isinstance(value["work_queue"], list))
+                or ("project_policy" in value
+                    and not isinstance(value["project_policy"], dict))
+                or ("policy_layers" in value
+                    and not isinstance(value["policy_layers"], list))):
                 raise SystemExit("error: invalid schema-version-6 state core")
+            for item in value.get("work_queue", []):
+                validate_queue_item(item, value)
+            queue_ids = [item["id"] for item in value.get("work_queue", [])]
+            if len(queue_ids) != len(set(queue_ids)):
+                raise SystemExit("error: coordinator queue ids must be unique")
+            if "project_policy" in value or "policy_layers" in value:
+                if not {"project_policy", "policy_layers"}.issubset(value):
+                    raise SystemExit("error: frozen policy snapshot is incomplete")
+                validate_frozen_policy_layers(value)
+            validate_quality_lane_map(value)
         return
     if relative == "learning-outbox/manifest.json":
         try:
@@ -552,13 +946,866 @@ def validate_transaction_write(run_dir, relative, value):
     raise SystemExit("error: unsupported run transaction target")
 
 
+def changed_paths(before, after, prefix=()):
+    if isinstance(before, dict) and isinstance(after, dict):
+        changes = set()
+        for key in set(before) | set(after):
+            path = (*prefix, str(key))
+            if key not in before or key not in after:
+                changes.add(path)
+            else:
+                changes.update(changed_paths(before[key], after[key], path))
+        return changes
+    return {prefix} if before != after else set()
+
+
+def require_changes_within(before, after, allowed, label):
+    changes = changed_paths(before, after)
+    unexpected = [
+        "/".join(path) for path in changes
+        if not any(path[:len(prefix)] == prefix for prefix in allowed)
+    ]
+    if unexpected:
+        raise SystemExit(
+            f"error: {label} transaction changes unrelated state: "
+            + ", ".join(sorted(unexpected)[:8])
+        )
+
+
+def validate_state_event_binding(run_dir, transaction, *, final_recorded=False):
+    """Bind security-sensitive state-only WAL modes to their exact transition."""
+    event = transaction["event"]
+    kind = event.get("event")
+    if transaction.get("schema_version") == 1:
+        # Schema-v1 intents are accepted only for pre-v6 state by
+        # validate_run_transaction. Preserve their historical recovery
+        # compatibility; current runs always require schema-v2 semantic WAL.
+        return
+    if "state.json" in transaction["writes"]:
+        state_path = state_regular(run_dir / "state.json", "run state")
+        if state_path.is_file() and not final_recorded:
+            current = load_json(state_path)
+            updated = transaction["writes"]["state.json"]
+            changed = changed_paths(current, updated)
+            authorities = {
+                "phase": {"phase", "run_migrated"},
+                "current_wave": {"phase", "run_migrated"},
+                "finished": {"phase"},
+                "finished_at": {"phase"},
+                "finished_head": {"phase"},
+                "tasks": {
+                    "run_migrated", "task_put", "task_status",
+                    "handoff_closed", "task_check", "artifact_complete",
+                },
+                "waves": {
+                    "run_migrated", "task_put", "task_status",
+                    "handoff_closed",
+                },
+                "risk_forced": {"run_migrated", "gate"},
+                "risk_required": {
+                    "run_migrated", "task_put", "task_status",
+                    "handoff_closed", "gate",
+                },
+                "hard_to_reverse": {
+                    "run_migrated", "task_put", "task_status",
+                    "handoff_closed",
+                },
+                "integration_provenance": {"run_migrated", "task_status"},
+                "integration_provenance_head": {
+                    "run_migrated", "task_status",
+                },
+                "model_profiles": {"run_migrated"},
+                "review_model_profiles": {"run_migrated"},
+                "gates": {"run_migrated", "phase", "gate"},
+                "decisions": {
+                    "run_migrated", "task_status", "decision_opened",
+                    "decision_resolved", "decision_superseded",
+                },
+                "publication_seal": {"publication_sealed", "run_migrated"},
+                "policy_migration_pending": {
+                    "run_migrated", "task_put", "task_status",
+                    "handoff_closed",
+                },
+                "project_policy": {"run_migrated"},
+                "policy_layers": {"run_migrated"},
+                "quality_lanes": {
+                    "run_migrated", "task_put", "task_status", "handoff_closed",
+                    "quality_assessed", "quality_lane",
+                },
+                "work_queue": {
+                    "run_migrated", "queue_put", "queue_claim", "queue_complete",
+                },
+            }
+            for field, events in authorities.items():
+                if any(path and path[0] == field for path in changed) and kind not in events:
+                    raise SystemExit(
+                        f"error: {kind} transaction cannot mutate {field}"
+                    )
+            if (kind == "run_migrated"
+                    and any(path and path[0] == "publication_seal"
+                            for path in changed)
+                    and ("publication_seal" not in current
+                         or "publication_seal" in updated)):
+                raise SystemExit(
+                    "error: migration may only invalidate a legacy publication seal"
+                )
+            # A normal gate may update only its named receipt. The reviews gate
+            # may additionally make --require-risk monotonic; no gate may use
+            # its broad state write to forge phase, completion, task, or policy.
+            if kind == "gate":
+                gate = event.get("gate")
+                allowed = {("gates", str(gate)), ("updated_at",)}
+                if gate == "reviews":
+                    allowed.update({("risk_forced",), ("risk_required",)})
+                require_changes_within(current, updated, allowed, "gate")
+    if kind in {"task_put", "task_status"}:
+        if final_recorded:
+            return
+        task_id = event.get("task")
+        relative = f"tasks/{task_id}.json"
+        updated_state = transaction["writes"].get("state.json")
+        updated_task = transaction["writes"].get(relative)
+        extra = set(transaction["writes"]) - {"state.json", relative}
+        allowed_decision = None
+        if kind == "task_status" and event.get("to") == "superseded":
+            decision_paths = [path for path in extra if path.startswith("decisions/")]
+            if len(decision_paths) == 1:
+                allowed_decision = decision_paths[0]
+                extra.remove(allowed_decision)
+        if extra:
+            raise SystemExit(f"error: {kind} WAL contains unrelated record writes")
+        if (not safe_task_id(task_id) or not isinstance(updated_state, dict)
+                or not isinstance(updated_task, dict)
+                or updated_task.get("id") != task_id
+                or updated_state.get("tasks", {}).get(task_id, {}).get("status")
+                != updated_task.get("status")):
+            raise SystemExit(f"error: {kind} WAL does not bind its task record")
+        current_task_path = run_dir / relative
+        already_applied = (
+            current == updated_state and current_task_path.is_file()
+            and load_json(current_task_path) == updated_task
+        )
+        if already_applied:
+            if (event.get("status", event.get("to")) != updated_task.get("status")
+                    or allowed_decision is not None
+                    and load_json(run_dir / allowed_decision)
+                    != transaction["writes"][allowed_decision]):
+                raise SystemExit(f"error: applied {kind} WAL differs from its event")
+            return
+        if kind == "task_put":
+            if (event.get("status") != updated_task.get("status")
+                    or event.get("replaced") != (task_id in current.get("tasks", {}))):
+                raise SystemExit("error: task-put WAL metadata is inconsistent")
+            allowed = {
+                ("tasks", task_id), ("waves",), ("quality_lanes",),
+                ("risk_required",), ("hard_to_reverse",),
+                ("policy_migration_pending",), ("updated_at",),
+            }
+        else:
+            current_summary = current.get("tasks", {}).get(task_id)
+            current_status = (event.get("from") if current == updated_state
+                              else current_summary.get("status")
+                              if isinstance(current_summary, dict) else None)
+            # The task record is written before state.json. After a crash in
+            # that window, state.json is the durable pre-transition authority;
+            # using the already-updated task file would reject valid recovery.
+            if (current_status is None
+                    or event.get("from") != current_status
+                    or event.get("to") != updated_task.get("status")
+                    or (event.get("to") != event.get("from")
+                        and event.get("to") not in TASK_TRANSITIONS.get(
+                            event.get("from"), set()))):
+                raise SystemExit("error: task-status WAL transition is inconsistent")
+            if allowed_decision is not None:
+                decision = transaction["writes"][allowed_decision]
+                decision_id = Path(allowed_decision).stem
+                if (not isinstance(decision, dict)
+                        or decision.get("id") != decision_id
+                        or decision.get("status") != "superseded"
+                        or updated_state.get("decisions", {}).get(
+                            decision_id, {}
+                        ).get("status") != "superseded"):
+                    raise SystemExit(
+                        "error: task-status WAL has an unbound decision transition"
+                    )
+            allowed = {
+                ("tasks", task_id), ("waves",), ("quality_lanes",),
+                ("risk_required",), ("hard_to_reverse",), ("updated_at",),
+                ("integration_provenance",), ("integration_provenance_head",),
+                ("decisions",),
+            }
+        require_changes_within(current, updated_state, allowed, kind)
+        records = []
+        for other_id in updated_state.get("tasks", {}):
+            records.append(
+                updated_task if other_id == task_id
+                else load_json(run_dir / "tasks" / f"{other_id}.json")
+            )
+        expected_waves = summarize_wave_policies(records)
+        expected_lanes = rebuild_quality_lanes(run_dir, current, updated_task)
+        expected_risk = bool(updated_state.get("risk_forced")) or any(
+            item["require_risk_review"] for item in expected_waves.values()
+        )
+        expected_hard = any(
+            item["require_user_finish_decision"] for item in expected_waves.values()
+        )
+        if (updated_state.get("waves") != expected_waves
+                or updated_state.get("quality_lanes") != expected_lanes
+                or updated_state.get("risk_required") != expected_risk
+                or updated_state.get("hard_to_reverse") != expected_hard):
+            raise SystemExit(f"error: {kind} WAL derived policy cache is forged")
+        return
+    task_only = {
+        "tdd_cycle_verified", "experiment_recorded", "diagnosis_recorded",
+        "diagnosis_green", "task_verification",
+    }
+    if kind in task_only:
+        task_id = event.get("task")
+        relative = f"tasks/{task_id}.json"
+        if not safe_task_id(task_id) or set(transaction["writes"]) != {relative}:
+            raise SystemExit(f"error: {kind} transaction must write its exact task")
+        updated_task = transaction["writes"][relative]
+        if updated_task.get("id") != task_id:
+            raise SystemExit(f"error: {kind} transaction task identity mismatch")
+        current_path = run_dir / relative
+        current_task = load_json(current_path)
+        already_applied = current_task == updated_task
+        if not final_recorded and not already_applied:
+            allowed_task_fields = {
+                "tdd_cycle_verified": {("tdd_evidence",), ("updated_at",)},
+                "experiment_recorded": {
+                    ("experiment_evidence",), ("experiment_verification",),
+                    ("updated_at",),
+                },
+                "diagnosis_recorded": {
+                    ("diagnosis_evidence",), ("updated_at",),
+                },
+                "diagnosis_green": {
+                    ("diagnosis_evidence",), ("updated_at",),
+                },
+                "task_verification": {
+                    ("verification_evidence",), ("diagnosis_evidence",),
+                    ("updated_at",),
+                },
+            }[kind]
+            require_changes_within(
+                current_task, updated_task,
+                allowed_task_fields, kind,
+            )
+        repo = run_dir.parents[2]
+
+        def require_current_stream(receipt, *prefixes):
+            if (not isinstance(receipt, dict)
+                    or receipt.get("stream_schema_version") != 1):
+                raise SystemExit(
+                    f"error: {kind} WAL must introduce versioned stream evidence"
+                )
+            for prefix in prefixes:
+                validate_stream_evidence(run_dir, receipt, prefix=prefix)
+
+        if kind == "tdd_cycle_verified":
+            before = current_task.get("tdd_evidence", [])
+            after = updated_task.get("tdd_evidence", [])
+            if (not isinstance(before, list) or not isinstance(after, list)
+                    or not after
+                    or (not already_applied
+                        and (len(after) != len(before) + 1
+                             or after[:-1] != before))):
+                raise SystemExit("error: TDD WAL must append exactly one cycle")
+            receipt = after[-1]
+            require_current_stream(receipt, "red_", "green_")
+            if (event.get("seam_id") != receipt.get("seam_id")
+                    or event.get("red_commit") != receipt.get("red_commit")
+                    or event.get("green_commit") != receipt.get("green_commit")
+                    or event.get("command") != receipt.get("command")
+                    or event.get("receipt_sha256") != object_sha256(receipt)):
+                raise SystemExit("error: TDD WAL receipt differs from its event")
+            if (not isinstance(receipt.get("red_commit"), str)
+                    or not isinstance(receipt.get("green_commit"), str)):
+                raise SystemExit("error: TDD WAL receipt lacks commit identities")
+            head = git(["rev-parse", updated_task["branch"]], repo).stdout.strip()
+            seams = {
+                seam.get("id"): seam for seam in updated_task.get("test_seams", [])
+                if isinstance(seam, dict)
+            }
+            seam = seams.get(receipt.get("seam_id"))
+            previous_green = (
+                after[-2].get("green_commit") if len(after) > 1
+                else updated_task.get("base_commit")
+            )
+            red_parents = git([
+                "rev-list", "--parents", "-n", "1", receipt["red_commit"],
+            ], repo).stdout.split()
+            green_parents = git([
+                "rev-list", "--parents", "-n", "1", receipt["green_commit"],
+            ], repo).stdout.split()
+            red_paths = git([
+                "diff-tree", "--no-commit-id", "--name-only", "-r",
+                previous_green, receipt["red_commit"],
+            ], repo).stdout.splitlines()
+            green_paths = git([
+                "diff-tree", "--no-commit-id", "--name-only", "-r",
+                receipt["red_commit"], receipt["green_commit"],
+            ], repo).stdout.splitlines()
+            all_tests = [
+                pattern for item in seams.values()
+                for pattern in item.get("test_paths", [])
+            ]
+            if (not isinstance(seam, dict)
+                    or receipt.get("behavior") != seam.get("behavior")
+                    or receipt.get("command") != seam.get("command")
+                    or receipt.get("red_pattern") != seam.get("red_pattern")
+                    or receipt.get("test_files") != sorted(seam.get("test_paths", []))
+                    or receipt.get("red_exit_code") == 0
+                    or receipt.get("green_exit_code") != 0
+                    or len(red_parents) != 2
+                    or red_parents[1] != previous_green
+                    or len(green_parents) != 2
+                    or green_parents[1] != receipt["red_commit"]
+                    or not red_paths
+                    or any(not any(glob_match(path, pattern)
+                                   for pattern in seam["test_paths"])
+                           for path in red_paths)
+                    or not green_paths
+                    or any(any(glob_match(path, pattern)
+                               for pattern in all_tests)
+                           for path in green_paths)
+                    or receipt["red_pattern"] not in stream_text(
+                        run_dir, receipt, "red_"
+                    )
+                    or git(["merge-base", "--is-ancestor",
+                            receipt["green_commit"], head], repo,
+                           check=False).returncode):
+                raise SystemExit("error: TDD WAL cycle is not mechanically valid")
+        elif kind == "experiment_recorded":
+            replay = updated_task.get("experiment_verification")
+            evidence = updated_task.get("experiment_evidence")
+            require_current_stream(
+                replay, "baseline_", "metric_", "guard_", "holdout_"
+            )
+            bound = {"experiment_evidence": evidence,
+                     "experiment_verification": replay}
+            if (event.get("base") != replay.get("baseline")
+                    or event.get("final") != replay.get("final")
+                    or event.get("head") != replay.get("head_sha")
+                    or event.get("receipt_sha256") != object_sha256(bound)):
+                raise SystemExit(
+                    "error: experiment WAL receipt differs from its event"
+                )
+            validate_method_evidence(
+                repo, run_dir, updated_task, replay["head_sha"],
+                require_diagnosis_green=False,
+            )
+        elif kind == "diagnosis_recorded":
+            diagnosis = updated_task.get("diagnosis_evidence")
+            require_current_stream(diagnosis, "repro_")
+            if (event.get("root_cause") != diagnosis.get("root_cause")
+                    or event.get("receipt_sha256")
+                    != object_sha256(diagnosis)):
+                raise SystemExit(
+                    "error: diagnosis WAL receipt differs from its event"
+                )
+            head = git(["rev-parse", updated_task["branch"]], repo).stdout.strip()
+            if not updated_task.get("diagnosis_required"):
+                raise SystemExit("error: diagnosis WAL is attached to a non-debug task")
+            validate_diagnosis_semantics(
+                repo, run_dir, updated_task, head, False
+            )
+        elif kind == "diagnosis_green":
+            diagnosis = updated_task.get("diagnosis_evidence")
+            require_current_stream(diagnosis, "repro_", "green_")
+            if (event.get("exit_code") != diagnosis.get("green_exit_code")
+                    or event.get("head_sha") != diagnosis.get("green_head")
+                    or event.get("log") != diagnosis.get("green_log")
+                    or event.get("receipt_sha256")
+                    != object_sha256(diagnosis)):
+                raise SystemExit(
+                    "error: diagnosis GREEN WAL differs from its event"
+                )
+            validate_diagnosis_semantics(
+                repo, run_dir, updated_task, event.get("head_sha"), False
+            )
+        else:
+            before = current_task.get("verification_evidence", [])
+            after = updated_task.get("verification_evidence", [])
+            if (not isinstance(before, list) or not isinstance(after, list)
+                    or not after
+                    or (not already_applied
+                        and (len(after) != len(before) + 1
+                             or after[:-1] != before))):
+                raise SystemExit(
+                    "error: task verification WAL must append one receipt"
+                )
+            receipt = after[-1]
+            require_current_stream(receipt, "")
+            diagnosis = updated_task.get("diagnosis_evidence")
+            diagnosis_sha = (
+                object_sha256(diagnosis) if isinstance(diagnosis, dict) else None
+            )
+            if current_task.get("diagnosis_evidence") != diagnosis:
+                require_current_stream(diagnosis, "repro_", "green_")
+            if (event.get("exit_code") != receipt.get("exit_code")
+                    or event.get("head_sha") != receipt.get("head_sha")
+                    or event.get("log") != receipt.get("log")
+                    or event.get("receipt_sha256") != object_sha256(receipt)
+                    or event.get("diagnosis_sha256") != diagnosis_sha):
+                raise SystemExit(
+                    "error: task verification WAL differs from its receipt"
+                )
+            validate_method_evidence(
+                repo, run_dir, updated_task, receipt["head_sha"]
+            )
+        return
+    paired_task = {"handoff_closed", "task_check", "artifact_complete"}
+    if kind in paired_task:
+        task_id = event.get("task")
+        expected = {"state.json", f"tasks/{task_id}.json"}
+        if not safe_task_id(task_id) or set(transaction["writes"]) != expected:
+            raise SystemExit(f"error: {kind} transaction has an unrelated write set")
+        updated = transaction["writes"][f"tasks/{task_id}.json"]
+        state = transaction["writes"]["state.json"]
+        if (updated.get("id") != task_id
+                or state.get("tasks", {}).get(task_id, {}).get("status")
+                != updated.get("status")):
+            raise SystemExit(f"error: {kind} transaction does not bind task status")
+        if not final_recorded:
+            current_state = load_json(run_dir / "state.json")
+            current_task = load_json(run_dir / f"tasks/{task_id}.json")
+            task_allowed = {
+                "handoff_closed": {
+                    ("status",), ("handoff_resolution",), ("updated_at",),
+                },
+                "task_check": {
+                    ("status",), ("check_result",), ("updated_at",),
+                },
+                "artifact_complete": {
+                    ("status",), ("artifact_result",), ("updated_at",),
+                },
+            }[kind]
+            state_allowed = {
+                "handoff_closed": {
+                    ("tasks", task_id), ("waves",), ("quality_lanes",),
+                    ("risk_required",), ("hard_to_reverse",),
+                    ("policy_migration_pending",), ("updated_at",),
+                },
+                "task_check": {("tasks", task_id), ("updated_at",)},
+                "artifact_complete": {("tasks", task_id), ("updated_at",)},
+            }[kind]
+            require_changes_within(current_task, updated, task_allowed, kind)
+            require_changes_within(current_state, state, state_allowed, kind)
+            expected_from = (
+                event.get("from") if current_state == state
+                else current_state.get("tasks", {}).get(task_id, {}).get("status")
+            )
+            if kind == "task_check" and (
+                    event.get("from") != expected_from
+                    or event.get("to") != updated.get("status")
+                    or event.get("result")
+                    != updated.get("check_result", {}).get("status")):
+                raise SystemExit("error: task-check WAL metadata is inconsistent")
+            if kind == "task_check":
+                check = updated.get("check_result")
+                if (not isinstance(check, dict)
+                        or set(check) != {
+                            "status", "base_sha", "head_sha", "evidence",
+                            "checked_at",
+                        }
+                        or event.get("base") != check.get("base_sha")
+                        or event.get("head") != check.get("head_sha")
+                        or event.get("evidence") != check.get("evidence")
+                        or event.get("check_sha256") != object_sha256(check)
+                        or (check.get("status") == "passed"
+                            and (event.get("from") != "running"
+                                 or updated.get("status") != "completed"))
+                        or (check.get("status") == "failed"
+                            and updated.get("status") != event.get("from"))):
+                    raise SystemExit(
+                        "error: task-check WAL receipt differs from its event"
+                    )
+                if check["status"] == "passed":
+                    repo = run_dir.parents[2]
+                    branch_head = git([
+                        "rev-parse", updated.get("branch", "")
+                    ], repo).stdout.strip()
+                    integration = state.get("integration_branch")
+                    integration_ref = git([
+                        "rev-parse", "--verify", integration or ""
+                    ], repo, check=False)
+                    expected_base = (
+                        integration_ref.stdout.strip()
+                        if integration_ref.returncode == 0
+                        else updated.get("base_commit")
+                    )
+                    if (check.get("head_sha") != branch_head
+                            or check.get("base_sha") != expected_base):
+                        raise SystemExit(
+                            "error: passing task-check WAL is stale for its task "
+                            "branch or integration base"
+                        )
+                    verification = updated.get("verification_evidence")
+                    if (not isinstance(verification, list)
+                            or not any(
+                                isinstance(receipt, dict)
+                                and receipt.get("stream_schema_version") == 1
+                                and receipt.get("exit_code") == 0
+                                and receipt.get("command")
+                                == updated.get("verification")
+                                and receipt.get("head_sha") == check["head_sha"]
+                                for receipt in verification
+                            )):
+                        raise SystemExit(
+                            "error: passing task-check WAL lacks current verified "
+                            "task evidence at its exact head"
+                        )
+                    require_current_method_streams(run_dir, updated)
+                    validate_method_evidence(
+                        repo, run_dir, updated,
+                        check["head_sha"],
+                    )
+            if kind == "artifact_complete" and (
+                    expected_from != "running"
+                    or updated.get("status") != "artifact_complete"
+                    or event.get("kind") != updated.get("artifact_kind")
+                    or event.get("result") != updated.get("artifact_result")):
+                raise SystemExit("error: artifact WAL metadata is inconsistent")
+        return
+    decision_kinds = {
+        "decision_opened", "decision_resolved", "decision_superseded",
+    }
+    if kind in decision_kinds:
+        decision_id = event.get("decision")
+        relative = f"decisions/{decision_id}.json"
+        if (not safe_task_id(decision_id)
+                or set(transaction["writes"]) != {"state.json", relative}):
+            raise SystemExit(f"error: {kind} transaction has an unrelated write set")
+        decision = transaction["writes"][relative]
+        summary = transaction["writes"]["state.json"].get(
+            "decisions", {}
+        ).get(decision_id, {})
+        expected_status = {
+            "decision_opened": "open", "decision_resolved": "resolved",
+            "decision_superseded": "superseded",
+        }[kind]
+        if (decision.get("id") != decision_id
+                or decision.get("status") != expected_status
+                or summary.get("status") != expected_status):
+            raise SystemExit(f"error: {kind} transaction decision is not bound")
+        if not final_recorded:
+            current_state = load_json(run_dir / "state.json")
+            current_path = run_dir / relative
+            current_decision = (load_json(current_path)
+                                if current_path.is_file() else None)
+            require_changes_within(
+                current_state, transaction["writes"]["state.json"],
+                {("decisions", decision_id), ("updated_at",)}, kind,
+            )
+            if kind == "decision_opened":
+                if (decision.get("authority") != event.get("authority")
+                        or decision.get("scope") != event.get("scope")
+                        or (current_decision is not None
+                            and current_decision != decision)):
+                    raise SystemExit("error: decision-open WAL payload is inconsistent")
+            else:
+                prior_status = current_state.get("decisions", {}).get(
+                    decision_id, {}
+                ).get("status")
+                if prior_status == expected_status:
+                    if current_decision != decision:
+                        raise SystemExit(
+                            f"error: partially applied {kind} decision differs"
+                        )
+                elif (prior_status != "open" or not isinstance(current_decision, dict)
+                      or current_decision.get("status") not in {
+                          "open", expected_status,
+                      }):
+                    raise SystemExit(f"error: {kind} is not an open-decision transition")
+                if kind == "decision_resolved":
+                    resolution = decision.get("resolution")
+                    if (not isinstance(resolution, dict)
+                            or resolution.get("outcome") != event.get("outcome")
+                            or resolution.get("choice") != event.get("choice")
+                            or resolution.get("evidence") != event.get("evidence")):
+                        raise SystemExit(
+                            "error: decision resolution WAL payload is inconsistent"
+                        )
+                    allowed = {
+                        ("status",), ("resolution",), ("updated_at",),
+                    }
+                else:
+                    if decision.get("superseded_reason") != event.get("reason"):
+                        raise SystemExit(
+                            "error: decision supersede WAL payload is inconsistent"
+                        )
+                    allowed = {
+                        ("status",), ("superseded_reason",), ("updated_at",),
+                    }
+                if current_decision.get("status") == "open":
+                    require_changes_within(
+                        current_decision, decision, allowed, kind,
+                    )
+        return
+    if kind == "publication_sealed":
+        if set(transaction["writes"]) != {"state.json"}:
+            raise SystemExit("error: publication seal must write only state.json")
+        seal = transaction["writes"]["state.json"].get("publication_seal")
+        if (not isinstance(seal, dict)
+                or seal.get("purpose") != event.get("purpose")
+                or seal.get("head_sha") != event.get("head_sha")
+                or seal.get("decision_sha256") != event.get("decision_sha256")
+                or seal.get("authorization_sha256")
+                != event.get("authorization_sha256")):
+            raise SystemExit("error: publication seal WAL is not bound to its event")
+        if not final_recorded:
+            current = load_json(run_dir / "state.json")
+            updated = transaction["writes"]["state.json"]
+            require_changes_within(
+                current, updated,
+                {("publication_seal",), ("updated_at",)},
+                "publication seal",
+            )
+            if (current.get("publication_seal") is not None
+                    and current.get("publication_seal") != seal):
+                raise SystemExit("error: publication seal WAL replaces another seal")
+        return
+    if kind not in {
+            "phase", "quality_assessed", "quality_lane", "queue_put", "queue_claim",
+            "queue_complete", "gate", "run_created", "run_migrated",
+            "learning_item_decided",
+    }:
+        raise SystemExit(f"error: {kind} transaction lacks a semantic WAL binding")
+    if kind in {"run_created", "run_migrated", "learning_item_decided"}:
+        return
+    if set(transaction["writes"]) != {"state.json"}:
+        raise SystemExit(f"error: {kind} transaction must write only state.json")
+    state_path = state_regular(run_dir / "state.json", "run state")
+    if not state_path.is_file():
+        raise SystemExit(f"error: {kind} transaction requires existing state")
+    current = load_json(state_path)
+    updated = transaction["writes"]["state.json"]
+    if final_recorded:
+        return
+    already_applied = current == updated
+    if kind == "gate":
+        gate_name = event.get("gate")
+        before = current.get("gates", {}).get(gate_name, {})
+        after = updated.get("gates", {}).get(gate_name, {})
+        prior_status = event.get("from") if already_applied else before.get(
+            "status", "pending"
+        )
+        if (not isinstance(gate_name, str) or not gate_name
+                or not isinstance(after, dict)
+                or event.get("from") != prior_status
+                or event.get("to") != after.get("status")):
+            raise SystemExit("error: gate WAL event does not bind its receipt")
+        if gate_name == "reviews":
+            if updated.get("risk_forced") is not True and (
+                    current.get("risk_forced") is True):
+                raise SystemExit("error: reviews gate cannot weaken forced risk review")
+        return
+    if kind == "phase":
+        old = event.get("from") if already_applied else current.get("phase")
+        target = updated.get("phase")
+        if (event.get("from") != old or event.get("to") != target
+                or target not in TRANSITIONS.get(old, set())):
+            raise SystemExit("error: phase WAL event does not bind a legal transition")
+        if not already_applied:
+            require_changes_within(
+                current, updated,
+                {
+                    ("phase",), ("current_wave",), ("updated_at",), ("gates",),
+                    ("finished",), ("finished_at",), ("finished_head",),
+                },
+                "phase",
+            )
+        if target == "DONE":
+            if (updated.get("finished") is not True
+                    or not isinstance(updated.get("finished_at"), str)
+                    or re.fullmatch(r"[0-9a-f]{40}", updated.get("finished_head", "")) is None):
+                raise SystemExit("error: DONE phase WAL lacks exact finish evidence")
+        elif updated.get("finished") is not False:
+            raise SystemExit("error: unfinished phase WAL cannot set finished")
+        return
+    if kind == "quality_assessed":
+        raw_wave = str(event.get("wave"))
+        lane_name = event.get("lane")
+        if lane_name != "refactor":
+            raise SystemExit("error: only the refactor lane has a semantic assessment")
+        before = current.get("quality_lanes", {}).get(raw_wave, {}).get(lane_name)
+        after = updated.get("quality_lanes", {}).get(raw_wave, {}).get(lane_name)
+        assessment = after.get("assessment") if isinstance(after, dict) else None
+        if (not isinstance(before, dict) or not isinstance(after, dict)
+                or before.get("required_by") != after.get("required_by")
+                or before.get("commands") != after.get("commands")
+                or event.get("outcome") != (assessment or {}).get("outcome")
+                or event.get("head_sha") != (assessment or {}).get("head_sha")
+                or event.get("task_id") != (assessment or {}).get("task_id")):
+            raise SystemExit("error: refactor assessment WAL is not bound")
+        expected = json.loads(json.dumps(current.get("quality_lanes", {})))
+        expected[raw_wave][lane_name] = after
+        if expected != updated.get("quality_lanes"):
+            raise SystemExit("error: assessment WAL changes unrelated quality lanes")
+        return
+    require_changes_within(
+        current, updated,
+        {("quality_lanes",), ("work_queue",), ("updated_at",)},
+        kind,
+    )
+    if kind == "quality_lane":
+        if already_applied:
+            record = updated.get("quality_lanes", {}).get(
+                str(event.get("wave")), {}
+            ).get(event.get("lane"))
+            if (not isinstance(record, dict)
+                    or record.get("status") != event.get("to")
+                    or record.get("head_sha") != event.get("head_sha")):
+                raise SystemExit("error: applied quality WAL does not match its event")
+            return
+        if changed_paths(current.get("work_queue", []), updated.get("work_queue", [])):
+            raise SystemExit("error: quality WAL cannot mutate the work queue")
+        raw_wave = str(event.get("wave"))
+        lane_name = event.get("lane")
+        before = current.get("quality_lanes", {}).get(raw_wave, {}).get(lane_name)
+        after = updated.get("quality_lanes", {}).get(raw_wave, {}).get(lane_name)
+        if (not isinstance(before, dict) or not isinstance(after, dict)
+                or before.get("lane") != lane_name or after.get("lane") != lane_name
+                or before.get("required_by") != after.get("required_by")
+                or before.get("commands") != after.get("commands")
+                or event.get("from") != before.get("status")
+                or event.get("to") != after.get("status")
+                or event.get("head_sha") != after.get("head_sha")):
+            raise SystemExit("error: quality WAL event does not bind its frozen lane")
+        expected = json.loads(json.dumps(current.get("quality_lanes", {})))
+        expected[raw_wave][lane_name] = after
+        if expected != updated.get("quality_lanes", {}):
+            raise SystemExit("error: quality WAL changes more than one lane")
+        return
+    if changed_paths(current.get("quality_lanes", {}), updated.get("quality_lanes", {})):
+        raise SystemExit("error: queue WAL cannot mutate quality evidence")
+    before_queue = current.get("work_queue", [])
+    after_queue = updated.get("work_queue", [])
+    if not isinstance(before_queue, list) or not isinstance(after_queue, list):
+        raise SystemExit("error: malformed queue WAL state")
+    if kind == "queue_put":
+        if already_applied:
+            matches = [item for item in after_queue
+                       if item.get("id") == event.get("item")]
+            if (len(matches) != 1 or matches[0].get("kind") != event.get("kind")
+                    or matches[0].get("status") != "pending"):
+                raise SystemExit("error: applied queue-put WAL does not match its event")
+            return
+        if (len(after_queue) != len(before_queue) + 1
+                or after_queue[:-1] != before_queue
+                or after_queue[-1].get("id") != event.get("item")
+                or after_queue[-1].get("kind") != event.get("kind")
+                or after_queue[-1].get("status") != "pending"):
+            raise SystemExit("error: queue-put WAL event does not bind one append")
+        return
+    if len(before_queue) != len(after_queue):
+        raise SystemExit("error: queue lifecycle WAL cannot resize the queue")
+    before_by_id = {item.get("id"): item for item in before_queue}
+    after_by_id = {item.get("id"): item for item in after_queue}
+    if (len(before_by_id) != len(before_queue)
+            or len(after_by_id) != len(after_queue)
+            or set(before_by_id) != set(after_by_id)):
+        raise SystemExit("error: queue lifecycle WAL changes queue identities")
+    changed = {item_id for item_id in before_by_id
+               if before_by_id[item_id] != after_by_id[item_id]}
+    if kind == "queue_claim":
+        items = event.get("items")
+        consumer = event.get("consumer")
+        claim_kind = event.get("kind")
+        limit = event.get("limit")
+        if (claim_kind is not None and claim_kind not in QUEUE_KINDS) or (
+                not isinstance(limit, int) or isinstance(limit, bool)
+                or not 1 <= limit <= 16):
+            raise SystemExit("error: queue-claim WAL lacks its frozen selection rule")
+        if already_applied:
+            if (not isinstance(items, list) or not items
+                    or any(item_id not in after_by_id
+                           or after_by_id[item_id].get("status") != "claimed"
+                           or after_by_id[item_id].get("claimed_by") != consumer
+                           or after_by_id[item_id].get("priority") != event.get("priority")
+                           for item_id in items)):
+                raise SystemExit("error: applied queue-claim WAL does not match its event")
+            return
+        if (not isinstance(items, list) or not items or len(items) != len(set(items))
+                or changed != set(items) or not safe_task_id(consumer)):
+            raise SystemExit("error: queue-claim WAL identities are not bound")
+        candidates = sorted(
+            (item for item in before_queue
+             if item.get("status") == "pending"
+             and (claim_kind is None or item.get("kind") == claim_kind)),
+            key=lambda item: (
+                item.get("priority"), item.get("created_at"), item.get("id")
+            ),
+        )
+        expected_items = []
+        if candidates:
+            priority = candidates[0]["priority"]
+            expected_items = [
+                item["id"] for item in candidates
+                if item["priority"] == priority
+            ][:limit]
+        if items != expected_items or event.get("priority") != candidates[0]["priority"]:
+            raise SystemExit("error: queue-claim WAL is not the deterministic next batch")
+        for item_id in items:
+            before = before_by_id[item_id]
+            after = after_by_id[item_id]
+            expected = dict(before)
+            expected.update({
+                "status": "claimed", "claimed_by": consumer,
+                "claimed_at": after.get("claimed_at"),
+            })
+            if (before.get("status") != "pending" or after != expected
+                    or before.get("priority") != event.get("priority")):
+                raise SystemExit("error: queue-claim WAL transition is invalid")
+        return
+    item_id = event.get("item")
+    if already_applied:
+        item = after_by_id.get(item_id, {})
+        if (item.get("status") != event.get("outcome")
+                or item.get("claimed_by") != event.get("consumer")):
+            raise SystemExit("error: applied queue-complete WAL does not match its event")
+        return
+    if changed != {item_id} or item_id not in before_by_id:
+        raise SystemExit("error: queue-complete WAL identity is not bound")
+    before = before_by_id[item_id]
+    after = after_by_id[item_id]
+    expected = dict(before)
+    expected.update({
+        "status": event.get("outcome"), "completed_at": after.get("completed_at"),
+        "evidence": after.get("evidence"),
+    })
+    if (event.get("outcome") not in {"completed", "failed"}
+            or before.get("status") != "claimed"
+            or before.get("claimed_by") != event.get("consumer")
+            or after != expected):
+        raise SystemExit("error: queue-complete WAL transition is invalid")
+
+
+def require_current_runtime_contract(run_dir, state):
+    if state.get("schema_version") != 6:
+        raise SystemExit("error: run schema is not current; run migrate-run first")
+    if any(field not in state for field in (
+            "project_policy", "policy_layers", "quality_lanes", "work_queue")):
+        raise SystemExit("error: run policy contract is not current; run migrate-run first")
+    for task_id in state.get("tasks", {}):
+        task = load_json(run_dir / "tasks" / f"{task_id}.json")
+        if task.get("policy", {}).get("policy_version") != 3:
+            raise SystemExit(
+                "error: run policy contract is not current; run migrate-run first"
+            )
+    validate_frozen_policy_layers(state, require_current=True)
+    return True
+
+
 def validate_run_transaction(run_dir, transaction):
     if not isinstance(transaction, dict):
         raise SystemExit("error: invalid run transaction")
     version = transaction.get("schema_version")
     fields = {"schema_version", "txid", "writes", "event"}
     if (set(transaction) != fields
-            or version not in {1, 2}
+            or type(version) is not int or version not in {1, 2}
             or not isinstance(transaction.get("txid"), str)
             or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", transaction["txid"])
             or not isinstance(transaction.get("writes"), dict)
@@ -567,6 +1814,7 @@ def validate_run_transaction(run_dir, transaction):
             or not isinstance(transaction["event"].get("event"), str)
             or not transaction["event"]["event"]):
         raise SystemExit("error: invalid run transaction")
+    final_recorded = False
     if version == 1:
         state_path = run_dir / "state.json"
         current_version = (load_json(state_path).get("schema_version")
@@ -589,6 +1837,8 @@ def validate_run_transaction(run_dir, transaction):
                 "error: legacy run transactions are rejected for current runs"
             )
     else:
+        if transaction["event"].get("event") not in RUN_TRANSACTION_EVENTS:
+            raise SystemExit("error: unsupported run transaction event")
         digest = object_sha256(transaction)
         prepared = False
         final_recorded = False
@@ -626,6 +1876,9 @@ def validate_run_transaction(run_dir, transaction):
                     )
     for relative, value in transaction["writes"].items():
         validate_transaction_write(run_dir, relative, value)
+    validate_state_event_binding(
+        run_dir, transaction, final_recorded=final_recorded
+    )
     learning = [path for path in transaction["writes"]
                 if path.startswith("learning-outbox/")]
     if learning:
@@ -752,7 +2005,7 @@ def load_json(path):
         return json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         raise SystemExit(f"error: missing {path}")
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, UnicodeError, RecursionError) as exc:
         raise SystemExit(f"error: invalid JSON in {path}: {exc}")
 
 
@@ -766,7 +2019,8 @@ def append_event(run_dir, event):
         descriptor = os.open(path, flags, 0o600)
     except OSError as exc:
         raise SystemExit(f"error: cannot safely append run event log: {exc}")
-    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+    info = os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
         os.close(descriptor)
         raise SystemExit("error: run event log is not a regular file")
     size = os.fstat(descriptor).st_size
@@ -1664,6 +2918,8 @@ def summarize_wave_policies(records):
     waves = {}
     intensity_order = {"compact": 0, "full": 1, "risk": 2}
     for task in records:
+        if task.get("status") == "superseded":
+            continue
         if "policy" not in task:
             raise SystemExit(
                 f"error: task {task.get('id', '<unknown>')} predates policy derivation; "
@@ -1676,6 +2932,7 @@ def summarize_wave_policies(records):
             "risk_flags": [], "reversibility": "contained-reversible",
             "integration_lane": "shadow",
             "require_user_finish_decision": False,
+            "workflow_shape": "lean", "required_quality_lanes": [],
         })
         item["tasks"].append(task["id"])
         policy = task["policy"]
@@ -1692,6 +2949,13 @@ def summarize_wave_policies(records):
         item["require_user_finish_decision"] |= policy[
             "require_user_finish_decision"
         ]
+        shape = policy.get("workflow_shape", "lean")
+        if WORKFLOW_SHAPE_ORDER[shape] > WORKFLOW_SHAPE_ORDER[item["workflow_shape"]]:
+            item["workflow_shape"] = shape
+        item["required_quality_lanes"] = sorted(
+            set(item["required_quality_lanes"])
+            | set(policy.get("required_quality_lanes", []))
+        )
         item["risk_flags"] = sorted(set(item["risk_flags"])
                                     | set(policy["effective_risk_flags"]))
     for item in waves.values():
@@ -1700,6 +2964,114 @@ def summarize_wave_policies(records):
             item["execution_tier"] = "standard"
             item["review_intensity"] = "full"
     return waves
+
+
+def summarize_quality_lanes(records):
+    lanes = {}
+    for task in records:
+        if task.get("status") == "superseded":
+            continue
+        policy = task.get("policy", {})
+        for lane in policy.get("required_quality_lanes", []):
+            commands = task.get("quality_commands", {}).get(lane, [])
+            item = lanes.setdefault(str(task["wave"]), {}).setdefault(lane, {
+                "lane": lane, "required_by": [], "commands": [], "status": "pending",
+            })
+            item["required_by"].append(task["id"])
+            item["commands"].extend(commands)
+    for wave in lanes.values():
+        for item in wave.values():
+            item["required_by"] = sorted(set(item["required_by"]))
+            item["commands"] = list(dict.fromkeys(item["commands"]))
+            if len(item["commands"]) > MAX_AGGREGATE_QUALITY_COMMANDS:
+                raise SystemExit(
+                    "error: aggregate quality lane exceeds 64 frozen commands"
+                )
+    return lanes
+
+
+def rebuild_quality_lanes(run_dir, state, replacement=None):
+    records = []
+    for task_id in state.get("tasks", {}):
+        if replacement and task_id == replacement.get("id"):
+            records.append(replacement)
+        else:
+            records.append(load_json(run_dir / "tasks" / f"{task_id}.json"))
+    if replacement and replacement.get("id") not in state.get("tasks", {}):
+        records.append(replacement)
+    rebuilt = summarize_quality_lanes(records)
+    previous = state.get("quality_lanes", {})
+    for wave, lanes in rebuilt.items():
+        for lane, current in lanes.items():
+            old = previous.get(wave, {}).get(lane, {})
+            old_commands = old.get("commands") if isinstance(old, dict) else None
+            preserves_attempt_contract = (
+                old_commands == current["commands"]
+                or (old.get("status") == "failed"
+                    and isinstance(old_commands, list)
+                    and set(old_commands).issubset(current["commands"]))
+            ) if isinstance(old, dict) else False
+            if (isinstance(old, dict)
+                    and preserves_attempt_contract
+                    and isinstance(old.get("attempts"), list)
+                    and old["attempts"]):
+                # Preserve immutable attempt receipts while invalidating the
+                # current pass against a changed task graph/integration head.
+                retained = json.loads(json.dumps(old["attempts"]))
+                current.update({
+                    "status": retained[-1]["status"],
+                    "head_sha": retained[-1]["head_sha"],
+                    "results": retained[-1]["results"],
+                    "updated_at": retained[-1]["updated_at"],
+                    "attempts": retained,
+                })
+            if (isinstance(old, dict)
+                    and old.get("commands") == current["commands"]
+                    and isinstance(old.get("assessment"), dict)):
+                current["assessment"] = json.loads(json.dumps(old["assessment"]))
+    return rebuilt
+
+
+def validate_quality_lanes(repo, run_dir, state, *, through_wave, head_sha):
+    required = state.get("quality_lanes", {})
+    missing = []
+    for raw_wave, lanes in sorted(required.items(), key=lambda item: int(item[0])):
+        if int(raw_wave) > through_wave:
+            continue
+        if not isinstance(lanes, dict):
+            raise SystemExit("error: malformed quality lane state")
+        for lane, evidence in sorted(lanes.items()):
+            if (lane not in QUALITY_LANES or not isinstance(evidence, dict)
+                    or evidence.get("status") != "passed"
+                    or evidence.get("head_sha") != head_sha):
+                missing.append(f"wave-{raw_wave}:{lane}")
+                continue
+            if lane == "refactor":
+                assessment = evidence.get("assessment")
+                if (not isinstance(assessment, dict)
+                        or assessment.get("head_sha") != head_sha):
+                    missing.append(f"wave-{raw_wave}:{lane}-assessment")
+                    continue
+            validate_quality_lane_record(raw_wave, lane, evidence, state)
+            for attempt in evidence["attempts"]:
+                for result in attempt["results"]:
+                    try:
+                        stdout_path = run_regular_file(run_dir, result["log"])
+                        stderr_path = run_regular_file(run_dir, result["stderr_log"])
+                    except ValueError as exc:
+                        raise SystemExit(f"error: unsafe quality lane log: {exc}")
+                    if (file_sha256(stdout_path) != result["log_sha256"]
+                            or file_sha256(stderr_path) != result["stderr_sha256"]):
+                        raise SystemExit(
+                            f"error: quality lane evidence digest changed: "
+                            f"wave-{raw_wave}:{lane}:attempt-{attempt['attempt']}"
+                        )
+    if missing:
+        raise SystemExit(
+            "error: current integration HEAD lacks required quality lanes: "
+            + ", ".join(missing)
+        )
+    return True
 
 
 def rebuild_wave_policies(run_dir, state, replacement=None):
@@ -1727,6 +3099,7 @@ def validate_merged_tasks(repo, run_dir, state, head_sha):
         if task.get("check_result", {}).get("status") != "passed" or not checked:
             errors.append(f"{task_id} has no passed mechanical check")
             continue
+        validate_method_evidence(repo, run_dir, task, checked)
         if not merge_commit:
             errors.append(f"{task_id} has no recorded merge commit")
             continue
@@ -1795,6 +3168,7 @@ def validate_integration_provenance(repo, run_dir, state, head_sha):
 
 
 def cmd_init(args, repo, run_dir):
+    project_policy, policy_layers = load_project_policy(repo)
     try:
         model_profiles = {
             "economy": execution_profile(
@@ -1858,6 +3232,8 @@ def cmd_init(args, repo, run_dir):
             "phase": "INIT",
             "current_wave": 0,
             "waves": {},
+            "quality_lanes": {},
+            "work_queue": [],
             "tasks": {},
             "decisions": {},
             "gates": {
@@ -1871,6 +3247,8 @@ def cmd_init(args, repo, run_dir):
             "hard_to_reverse": False,
             "model_profiles": model_profiles,
             "review_model_profiles": review_model_profiles,
+            "project_policy": project_policy,
+            "policy_layers": policy_layers,
             "shared_surfaces": list(dict.fromkeys([*DEFAULT_SHARED_SURFACES,
                                                      *args.shared_surface])),
             "plan_file": args.plan_file,
@@ -1888,12 +3266,285 @@ def cmd_init(args, repo, run_dir):
 
 
 def cmd_migrate_run(_args, _repo, run_dir):
+    project_policy, policy_layers = load_project_policy(_repo)
     with locked(run_dir, allow_sealed=True):
         state_path = run_dir / "state.json"
         state = load_json(state_path)
         source_schema = state.get("schema_version")
         if source_schema == 6:
-            print("already-v6")
+            if state.get("finished") or state.get("phase") == "DONE":
+                raise SystemExit("error: finished schema-version-6 run is immutable")
+            if state.get("publication_seal"):
+                raise SystemExit(
+                    "error: publication-sealed run cannot migrate; explicitly abort "
+                    "the sealed delivery through a new authorized workflow"
+                )
+            active = [
+                task_id for task_id, summary in state.get("tasks", {}).items()
+                if isinstance(summary, dict) and summary.get("status") == "running"
+            ]
+            workers = run_dir / "workers"
+            if workers.is_dir() and not workers.is_symlink():
+                for path in workers.glob("*.json"):
+                    if path.name.endswith(".result.json"):
+                        continue
+                    worker = load_json(path)
+                    if worker.get("state") in {"launching", "running"}:
+                        active.append(f"worker:{worker.get('task', path.stem)}")
+            receipts = run_dir / "reviews" / "receipts"
+            if receipts.is_dir() and not receipts.is_symlink():
+                for path in receipts.glob("*.json"):
+                    receipt = load_json(path)
+                    if receipt.get("status") == "running":
+                        active.append(f"review:{path.stem}")
+            if active:
+                raise SystemExit(
+                    "error: cancel or settle active workers/reviews before migration: "
+                    + ", ".join(sorted(set(active)))
+                )
+            records = []
+            for task_id, summary in state.get("tasks", {}).items():
+                task = load_json(run_dir / "tasks" / f"{task_id}.json")
+                if (task.get("id") != task_id or not isinstance(summary, dict)
+                        or task.get("status") != summary.get("status")):
+                    raise SystemExit(
+                        f"error: task {task_id} identity/status mismatch during migration"
+                    )
+                version = task.get("policy", {}).get("policy_version")
+                if version not in {2, 3}:
+                    raise SystemExit(
+                        f"error: task {task_id} has unsupported policy version {version!r}"
+                    )
+                records.append(task)
+            legacy_policy = [
+                task["id"] for task in records
+                if task.get("policy", {}).get("policy_version") != 3
+            ]
+            additive_missing = any(
+                field not in state for field in (
+                    "project_policy", "policy_layers", "quality_lanes",
+                    "work_queue",
+                )
+            )
+            layer_drift = False
+            if not additive_missing:
+                validate_frozen_policy_layers(state)
+                frozen_project = state.get("project_policy", DEFAULT_PROJECT_POLICY)
+                if (WORKFLOW_SHAPE_ORDER[project_policy["workflow_shape_floor"]]
+                        < WORKFLOW_SHAPE_ORDER[
+                            frozen_project["workflow_shape_floor"]
+                        ]):
+                    raise SystemExit(
+                        "error: migration cannot weaken the frozen workflow shape floor"
+                    )
+                for lane in QUALITY_LANES:
+                    for field in ("work_kinds", "risk_flags"):
+                        if not set(
+                                frozen_project["required_quality_lanes"][lane][field]
+                                ).issubset(
+                                    project_policy["required_quality_lanes"][lane][field]
+                                ):
+                            raise SystemExit(
+                                "error: migration cannot remove frozen project quality triggers"
+                            )
+                layer_drift = (
+                    state.get("project_policy") != project_policy
+                    or state.get("policy_layers") != policy_layers
+                )
+            if not legacy_policy and not additive_missing and not layer_drift:
+                print("already-v6")
+                return
+            replan = []
+            writes = {}
+            immutable = {"merged", "superseded", "artifact_complete"}
+            for task in records:
+                old_policy = task.get("policy", {}).get("policy_version")
+                if old_policy == 3 and not layer_drift:
+                    continue
+                task_path = run_dir / "tasks" / f"{task['id']}.json"
+                frozen_policy = json.loads(json.dumps(task.get("policy", {})))
+                previous_lanes = set(
+                    frozen_policy.get("required_quality_lanes", [])
+                )
+                derived_policy = derive_task_policy(task, project_policy)
+                needs_replan = task.get("status") not in immutable
+                if needs_replan:
+                    derived_policy["required_quality_lanes"] = []
+                else:
+                    # Immutable historical work remains governed by its frozen
+                    # duties. A later policy may strengthen active/new work, but
+                    # must neither erase old evidence nor invent an unexecutable
+                    # retroactive lane after the implementation has merged.
+                    if old_policy == 3:
+                        # Merged/artifact evidence was authorized under this
+                        # exact frozen contract. Runtime drift must not silently
+                        # weaken or reinterpret any of its safety dimensions.
+                        derived_policy = frozen_policy
+                    else:
+                        tier_order = {"economy": 0, "standard": 1, "deep": 2}
+                        review_order = {"compact": 0, "full": 1, "risk": 2}
+                        for field, order in (
+                                ("execution_tier", tier_order),
+                                ("review_intensity", review_order),
+                                ("workflow_shape", WORKFLOW_SHAPE_ORDER),
+                                ("reversibility", REVERSIBILITY_ORDER)):
+                            old_value = frozen_policy.get(field)
+                            new_value = derived_policy.get(field)
+                            if (old_value in order and new_value in order
+                                    and order[old_value] > order[new_value]):
+                                derived_policy[field] = old_value
+                        for field in (
+                                "tdd_required", "diagnosis_required",
+                                "require_risk_review",
+                                "require_user_finish_decision"):
+                            if frozen_policy.get(field) is True:
+                                derived_policy[field] = True
+                        # Legacy policy-v2 tasks are immutable evidence. Merge
+                        # every transitive safety input monotonically, then
+                        # recompute the fields that must agree with it. Keeping
+                        # only the tier/reversibility labels would permit a
+                        # migration to erase the risk explanation or select a
+                        # weaker integration lane under a contradictory policy.
+                        for field in (
+                                "declared_risk_flags", "inferred_risk_flags",
+                                "effective_risk_flags"):
+                            old_flags = frozen_policy.get(field, [])
+                            if (not isinstance(old_flags, list)
+                                    or any(flag not in RISK_FLAGS
+                                           for flag in old_flags)):
+                                raise SystemExit(
+                                    f"error: task {task['id']} has invalid legacy {field}"
+                                )
+                            derived_policy[field] = sorted(
+                                set(derived_policy[field]) | set(old_flags)
+                            )
+                        derived_policy["effective_risk_flags"] = sorted(
+                            set(derived_policy["effective_risk_flags"])
+                            | set(derived_policy["declared_risk_flags"])
+                            | set(derived_policy["inferred_risk_flags"])
+                        )
+                        declared_reversibility = frozen_policy.get(
+                            "declared_reversibility"
+                        )
+                        if (declared_reversibility in REVERSIBILITY_ORDER
+                                and (derived_policy["declared_reversibility"] is None
+                                     or REVERSIBILITY_ORDER[declared_reversibility]
+                                     > REVERSIBILITY_ORDER[
+                                         derived_policy["declared_reversibility"]
+                                     ])):
+                            derived_policy["declared_reversibility"] = (
+                                declared_reversibility
+                            )
+                        inferred_reversibility = frozen_policy.get(
+                            "inferred_reversibility"
+                        )
+                        if (inferred_reversibility in REVERSIBILITY_ORDER
+                                and REVERSIBILITY_ORDER[inferred_reversibility]
+                                > REVERSIBILITY_ORDER[
+                                    derived_policy["inferred_reversibility"]
+                                ]):
+                            derived_policy["inferred_reversibility"] = (
+                                inferred_reversibility
+                            )
+                        reversibility = derived_policy["reversibility"]
+                        derived_policy["blast_radius"] = (
+                            "contained" if reversibility == "contained-reversible"
+                            else "wide"
+                        )
+                        derived_policy["integration_lane"] = {
+                            "contained-reversible": "shadow",
+                            "wide-reversible": "reviewed",
+                            "hard-to-reverse": "human-only",
+                        }[reversibility]
+                        derived_policy["require_user_finish_decision"] = (
+                            derived_policy["require_user_finish_decision"]
+                            or reversibility == "hard-to-reverse"
+                        )
+                        minimum_review = {
+                            "economy": "compact", "standard": "full",
+                            "deep": "risk",
+                        }[derived_policy["execution_tier"]]
+                        if (review_order[minimum_review]
+                                > review_order[derived_policy["review_intensity"]]):
+                            derived_policy["review_intensity"] = minimum_review
+                        derived_policy["require_risk_review"] = (
+                            derived_policy["require_risk_review"]
+                            or derived_policy["execution_tier"] == "deep"
+                        )
+                        old_reasons = frozen_policy.get("reasons", [])
+                        if not isinstance(old_reasons, list):
+                            raise SystemExit(
+                                f"error: task {task['id']} has invalid legacy reasons"
+                            )
+                        derived_policy["reasons"] = list(dict.fromkeys(
+                            [*derived_policy["reasons"],
+                             *(reason for reason in old_reasons
+                               if isinstance(reason, str) and reason)]
+                        ))
+                        derived_policy["required_quality_lanes"] = sorted(
+                            previous_lanes
+                        )
+                    task.pop("policy_migration_quality_gap", None)
+                task["policy"] = derived_policy
+                task["reversibility"] = task["policy"]["reversibility"]
+                task["tdd_required"] = task["policy"]["tdd_required"]
+                task["diagnosis_required"] = task["policy"]["diagnosis_required"]
+                task["policy_migration"] = {
+                    "from_schema": 6, "from_policy": old_policy,
+                    "mode": "adaptive-quality-contract-upgrade",
+                    "requires_replan": needs_replan, "migrated_at": now(),
+                }
+                if needs_replan:
+                    replan.append(task["id"])
+                task["updated_at"] = now()
+                writes[task_path] = task
+            state["project_policy"] = project_policy
+            state["policy_layers"] = policy_layers
+            state["quality_lanes"] = summarize_quality_lanes(records)
+            state.setdefault("work_queue", [])
+            state["waves"] = summarize_wave_policies(records)
+            state["risk_required"] = state.get("risk_forced", False) or any(
+                item["require_risk_review"] for item in state["waves"].values()
+            )
+            state["hard_to_reverse"] = any(
+                item["require_user_finish_decision"]
+                for item in state["waves"].values()
+            )
+            state["policy_migration_pending"] = sorted(replan)
+            if replan and state.get("phase") != "REPLANNING":
+                previous_phase = state.get("phase")
+                state["phase"] = "REPLANNING"
+                state["current_wave"] = 0
+                state.setdefault("gates", {})["reviews"] = {
+                    "status": "pending", "updated_at": now()
+                }
+                state["gates"]["final_verification"] = {
+                    "status": "pending", "updated_at": now()
+                }
+                state["gates"]["public_boundary"] = {
+                    "status": "pending", "updated_at": now()
+                }
+                state["gates"]["learning"] = {
+                    "status": "pending", "updated_at": now()
+                }
+            else:
+                previous_phase = state.get("phase")
+            state["updated_at"] = now()
+            writes[state_path] = state
+            from_policy = 2 if legacy_policy else 3
+            commit_transaction(
+                run_dir, writes,
+                {"event": "run_migrated", "from_schema": 6, "to_schema": 6,
+                 "from_policy": from_policy, "to_policy": 3,
+                 "policy_layer_changed": layer_drift,
+                 "requires_replan": sorted(replan), "reopened_decisions": [],
+                 "from_phase": previous_phase, "to_phase": state.get("phase")},
+            )
+            print(json.dumps({
+                "status": "migrated", "from_policy": from_policy, "to_policy": 3,
+                "policy_layer_changed": layer_drift,
+                "requires_replan": sorted(replan), "reopened_decisions": [],
+            }, sort_keys=True))
             return
         if source_schema not in {2, 3, 4, 5} or state.get("finished"):
             raise SystemExit(
@@ -1920,7 +3571,11 @@ def cmd_migrate_run(_args, _repo, run_dir):
                 task["risk_flags"] = []
                 task["tdd_required"] = False
                 task["diagnosis_required"] = False
-            task["policy"] = derive_task_policy(task)
+            task["policy"] = derive_task_policy(task, project_policy)
+            # Historical work did not freeze lane commands. Active tasks must be
+            # replaced during REPLANNING; immutable evidence remains readable
+            # without inventing a command after execution.
+            task["policy"]["required_quality_lanes"] = []
             task["reversibility"] = task["policy"]["reversibility"]
             task["tdd_required"] = task["policy"]["tdd_required"]
             task["diagnosis_required"] = task["policy"]["diagnosis_required"]
@@ -1988,6 +3643,10 @@ def cmd_migrate_run(_args, _repo, run_dir):
             state.get("review_model_profiles", state.get("model_profiles")),
             REVIEW_MODEL_PROFILES,
         )
+        state["project_policy"] = project_policy
+        state["policy_layers"] = policy_layers
+        state["quality_lanes"] = {}
+        state["work_queue"] = []
         state["waves"] = summarize_wave_policies(records)
         if source_schema in {2, 3}:
             provenance_head, provenance = rebuild_legacy_integration_provenance(
@@ -2086,6 +3745,11 @@ def cmd_phase(args, _repo, run_dir):
             records = wave_tasks(run_dir, state, wave)
             if records and any(task.get("status") != "merged" for task in records):
                 raise SystemExit("error: all wave tasks must be merged before integration/review")
+            if target == "REVIEWING":
+                validate_quality_lanes(
+                    _repo, run_dir, state, through_wave=wave,
+                    head_sha=integration_head(_repo, state),
+                )
         elif target == "RE_REVIEWING":
             fix_tasks = [task for task in wave_tasks(run_dir, state, wave)
                          if task.get("review_fix")]
@@ -2094,6 +3758,10 @@ def cmd_phase(args, _repo, run_dir):
                 raise SystemExit(
                     "error: RE_REVIEWING requires every finding-owned fix task merged"
                 )
+            validate_quality_lanes(
+                _repo, run_dir, state, through_wave=wave,
+                head_sha=integration_head(_repo, state),
+            )
         if target == "LEARNING_EXPORT":
             require_no_decision_blockers(
                 run_dir, state, "learning export", action="learning-export"
@@ -2134,6 +3802,12 @@ def cmd_phase(args, _repo, run_dir):
                 raise SystemExit("error: public-boundary check does not cover integration HEAD")
             validate_merged_tasks(_repo, run_dir, state, head)
             validate_integration_provenance(_repo, run_dir, state, head)
+            validate_quality_lanes(
+                _repo, run_dir, state,
+                through_wave=max((int(value) for value in state.get("waves", {})),
+                                 default=0),
+                head_sha=head,
+            )
             validate_reviews(_repo, run_dir, state, head)
         if target in {"WAVE_RUNNING", "FIXING", "REPLANNING"}:
             gates = state.setdefault("gates", {})
@@ -2154,6 +3828,8 @@ def cmd_phase(args, _repo, run_dir):
 
 def cmd_task_put(args, _repo, run_dir):
     record = load_json(Path(args.file))
+    declared_reversibility_present = "reversibility" in record
+    declared_reversibility = record.get("reversibility")
     task_id = record.get("id")
     if not safe_task_id(task_id):
         raise SystemExit("error: task record needs a safe non-empty id")
@@ -2241,6 +3917,20 @@ def cmd_task_put(args, _repo, run_dir):
         state = load_json(state_path)
         if state.get("finished") or state.get("phase") == "DONE":
             raise SystemExit("error: finished run is immutable")
+        if declared_reversibility_present:
+            record["reversibility"] = declared_reversibility
+        else:
+            record.pop("reversibility", None)
+        try:
+            record["policy"] = derive_task_policy(
+                record, state.get("project_policy", DEFAULT_PROJECT_POLICY)
+            )
+        except ValueError as exc:
+            raise SystemExit(f"error: {exc}")
+        record["tdd_required"] = record["policy"]["tdd_required"]
+        record["diagnosis_required"] = record["policy"]["diagnosis_required"]
+        record["reversibility"] = record["policy"]["reversibility"]
+        validate_quality_commands(record)
         for decision_id in record["required_decisions"]:
             if decision_id not in state.get("decisions", {}):
                 raise SystemExit(f"error: task references unknown decision {decision_id}")
@@ -2320,6 +4010,13 @@ def cmd_task_put(args, _repo, run_dir):
                     and not current_policy["require_risk_review"]
                     or REVERSIBILITY_ORDER[record["policy"]["reversibility"]]
                     > REVERSIBILITY_ORDER[current_policy["reversibility"]]
+                    or WORKFLOW_SHAPE_ORDER[record["policy"]["workflow_shape"]]
+                    > WORKFLOW_SHAPE_ORDER[
+                        current_policy.get("workflow_shape", "lean")
+                    ]
+                    or not set(record["policy"]["required_quality_lanes"]).issubset(
+                        current_policy.get("required_quality_lanes", [])
+                    )
                     or not set(record["policy"]["effective_risk_flags"]).issubset(
                         current_policy.get("risk_flags", []))):
                 raise SystemExit(
@@ -2389,6 +4086,7 @@ def cmd_task_put(args, _repo, run_dir):
         old = state.setdefault("tasks", {}).get(task_id)
         state["tasks"][task_id] = {"status": status, "attempt": record.get("attempt", 1)}
         state["waves"] = rebuild_wave_policies(run_dir, state, record)
+        state["quality_lanes"] = rebuild_quality_lanes(run_dir, state, record)
         state["risk_required"] = bool(state.get("risk_forced")) or any(
             item["require_risk_review"] for item in state["waves"].values()
         )
@@ -2574,6 +4272,16 @@ def cmd_task_status(args, _repo, run_dir):
         state.setdefault("tasks", {})[args.task] = {
             "status": args.status, "attempt": task.get("attempt", 1)
         }
+        if args.status == "superseded":
+            state["waves"] = rebuild_wave_policies(run_dir, state, task)
+            state["quality_lanes"] = rebuild_quality_lanes(run_dir, state, task)
+            state["risk_required"] = bool(state.get("risk_forced")) or any(
+                item["require_risk_review"] for item in state["waves"].values()
+            )
+            state["hard_to_reverse"] = any(
+                item["require_user_finish_decision"]
+                for item in state["waves"].values()
+            )
         state["updated_at"] = now()
         writes = {task_path: task, state_path: state}
         if args.status == "superseded" and task.get("handoff_required"):
@@ -2627,6 +4335,15 @@ def cmd_handoff_close(args, _repo, run_dir):
         }
         task["updated_at"] = stamp
         state["tasks"][args.task]["status"] = "superseded"
+        state["waves"] = rebuild_wave_policies(run_dir, state, task)
+        state["quality_lanes"] = rebuild_quality_lanes(run_dir, state, task)
+        state["risk_required"] = bool(state.get("risk_forced")) or any(
+            item["require_risk_review"] for item in state["waves"].values()
+        )
+        state["hard_to_reverse"] = any(
+            item["require_user_finish_decision"]
+            for item in state["waves"].values()
+        )
         state["updated_at"] = stamp
         commit_transaction(
             run_dir, {task_path: task, state_path: state},
@@ -2656,16 +4373,28 @@ def cmd_task_check(args, _repo, run_dir):
         branch_head = git(["rev-parse", task["branch"]], _repo).stdout.strip()
         if head_sha != branch_head:
             raise SystemExit("error: check head is not current task branch HEAD")
+        base_sha = git(["rev-parse", args.base], _repo).stdout.strip()
+        integration_ref = git([
+            "rev-parse", "--verify", state.get("integration_branch", "")
+        ], _repo, check=False)
+        expected_base = (
+            integration_ref.stdout.strip()
+            if integration_ref.returncode == 0 else task["base_commit"]
+        )
+        if base_sha != expected_base:
+            raise SystemExit(
+                "error: check base is not the current integration head or frozen task base"
+            )
         task["check_result"] = {
             "status": args.status,
-            "base_sha": git(["rev-parse", args.base], _repo).stdout.strip(),
+            "base_sha": base_sha,
             "head_sha": head_sha,
             "evidence": args.evidence, "checked_at": now(),
         }
         if args.status == "passed":
             if old != "running":
                 raise SystemExit(f"error: passing check requires running task, got {old}")
-            validate_method_evidence(_repo, task, head_sha)
+            validate_method_evidence(_repo, run_dir, task, head_sha)
             task["status"] = "completed"
             state.setdefault("tasks", {})[args.task] = {
                 "status": "completed", "attempt": task.get("attempt", 1)
@@ -2674,9 +4403,12 @@ def cmd_task_check(args, _repo, run_dir):
         state["updated_at"] = now()
         commit_transaction(run_dir, {task_path: task, state_path: state},
                            {"event": "task_check", "task": args.task,
-                            "result": args.status, "base": args.base,
+                            "result": args.status,
+                            "base": task["check_result"]["base_sha"],
                             "head": head_sha, "from": old,
-                            "to": task.get("status")})
+                            "to": task.get("status"),
+                            "evidence": args.evidence,
+                            "check_sha256": object_sha256(task["check_result"])})
     print(args.status)
 
 
@@ -2779,17 +4511,371 @@ def cmd_learning_item_decision(args, _repo, run_dir):
     print(args.outcome)
 
 
-def run_verification(command, cwd, env, log_path):
+def run_verification(
+        command, cwd, env, log_path, *, timeout_seconds=VERIFICATION_TIMEOUT_SECONDS):
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("w", encoding="utf-8") as log:
-        result = subprocess.run(["bash", "-lc", command], cwd=cwd, env=env,
-                                stdout=log, stderr=subprocess.STDOUT)
-    return result.returncode
+    stderr_path = log_path.with_name(log_path.name + ".stderr")
+    try:
+        with regular_output(log_path, "verification stdout log") as stdout_log:
+            with regular_output(
+                    stderr_path, "verification stderr log") as stderr_log:
+                process = subprocess.Popen(
+                    ["bash", "-lc", command], cwd=cwd, env=env,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    start_new_session=True,
+                )
+                code, overflow, timed_out = wait_capped_process(
+                    process, stdout_log, stderr_log, process_group=True,
+                    timeout_seconds=timeout_seconds,
+                )
+    except ValueError as exc:
+        raise SystemExit(f"error: {exc}")
+    if overflow:
+        raise SystemExit("error: verification output exceeded the retained limit")
+    if timed_out:
+        raise SystemExit(
+            f"error: verification exceeded {timeout_seconds} seconds"
+        )
+    return code
+
+
+def verification_stream_evidence(run_dir, log_path):
+    stderr_path = log_path.with_name(log_path.name + ".stderr")
+    return {
+        "stream_schema_version": 1,
+        "log": str(log_path.relative_to(run_dir)),
+        "log_sha256": file_sha256(log_path),
+        "stderr_log": str(stderr_path.relative_to(run_dir)),
+        "stderr_sha256": file_sha256(stderr_path),
+    }
+
+
+def validate_stream_evidence(run_dir, receipt, *, prefix=""):
+    version = receipt.get("stream_schema_version")
+    if version is None:
+        return  # immutable pre-0.12 combined-stream evidence
+    if version != 1:
+        raise SystemExit("error: unsupported verification stream evidence")
+    keys = (
+        (f"{prefix}log", f"{prefix}log_sha256"),
+        (f"{prefix}stderr_log", f"{prefix}stderr_sha256"),
+    )
+    for path_key, digest_key in keys:
+        relative = receipt.get(path_key)
+        digest = receipt.get(digest_key)
+        if (not isinstance(relative, str)
+                or re.fullmatch(r"[0-9a-f]{64}", digest or "") is None):
+            raise SystemExit("error: malformed verification stream receipt")
+        try:
+            path = run_regular_file(run_dir, relative)
+        except ValueError as exc:
+            raise SystemExit(f"error: {exc}")
+        if file_sha256(path) != digest:
+            raise SystemExit(
+                f"error: verification evidence digest changed: {relative}"
+            )
+
+
+def require_current_method_streams(run_dir, task):
+    """Reject legacy unbound streams when a current transaction consumes them."""
+    receipts = []
+    if task.get("work_kind") == "experiment":
+        receipts.append((task.get("experiment_verification"), (
+            "baseline_", "metric_", "guard_", "holdout_",
+        )))
+    receipts.extend(
+        (cycle, ("red_", "green_"))
+        for cycle in task.get("tdd_evidence", [])
+    )
+    diagnosis = task.get("diagnosis_evidence")
+    if isinstance(diagnosis, dict):
+        prefixes = ["repro_"]
+        if diagnosis.get("green_log"):
+            prefixes.append("green_")
+        receipts.append((diagnosis, tuple(prefixes)))
+    receipts.extend(
+        (receipt, ("",)) for receipt in task.get("verification_evidence", [])
+    )
+    for receipt, prefixes in receipts:
+        if (not isinstance(receipt, dict)
+                or receipt.get("stream_schema_version") != 1):
+            raise SystemExit(
+                "error: current task check cannot consume legacy unbound streams"
+            )
+        for prefix in prefixes:
+            validate_stream_evidence(run_dir, receipt, prefix=prefix)
+
+
+def stream_text(run_dir, receipt, prefix):
+    values = []
+    keys = [f"{prefix}log"]
+    if receipt.get("stream_schema_version") == 1:
+        keys.append(f"{prefix}stderr_log")
+    for key in keys:
+        try:
+            path = run_regular_file(run_dir, receipt.get(key))
+            values.append(path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, TypeError, ValueError) as exc:
+            raise SystemExit(f"error: invalid verification stream: {exc}")
+    return "".join(values)
+
+
+def validate_tdd_semantics(repo, run_dir, task, head_sha):
+    seams = {
+        seam.get("id"): seam for seam in task.get("test_seams", [])
+        if isinstance(seam, dict) and seam.get("id")
+    }
+    cycles = task.get("tdd_evidence", [])
+    if (not isinstance(cycles, list) or len(cycles) != len(seams)
+            or {cycle.get("seam_id") for cycle in cycles
+                if isinstance(cycle, dict)} != set(seams)):
+        raise SystemExit("error: TDD evidence does not cover each approved seam once")
+    used = set()
+    previous_green = task["base_commit"]
+    all_test_patterns = [
+        pattern for seam in seams.values() for pattern in seam.get("test_paths", [])
+    ]
+    for cycle in cycles:
+        seam = seams[cycle["seam_id"]]
+        if (cycle.get("behavior") != seam.get("behavior")
+                or cycle.get("test_files") != sorted(seam.get("test_paths", []))
+                or cycle.get("command") != seam.get("command")
+                or cycle.get("red_pattern") != seam.get("red_pattern")
+                or cycle.get("red_exit_code") == 0
+                or cycle.get("green_exit_code") != 0):
+            raise SystemExit("error: TDD evidence differs from its frozen seam")
+        red, green = cycle.get("red_commit"), cycle.get("green_commit")
+        if (not isinstance(red, str) or not isinstance(green, str)
+                or red in used or green in used):
+            raise SystemExit("error: TDD evidence reuses or omits a commit")
+        used.update({red, green})
+        red_parents = git(["rev-list", "--parents", "-n", "1", red], repo).stdout.split()
+        green_parents = git(
+            ["rev-list", "--parents", "-n", "1", green], repo
+        ).stdout.split()
+        if (len(red_parents) != 2 or red_parents[1] != previous_green
+                or len(green_parents) != 2 or green_parents[1] != red):
+            raise SystemExit("error: TDD evidence is not an immediate RED/GREEN chain")
+        red_paths = git([
+            "diff-tree", "--no-commit-id", "--name-only", "-r",
+            previous_green, red,
+        ], repo).stdout.splitlines()
+        green_paths = git([
+            "diff-tree", "--no-commit-id", "--name-only", "-r", red, green,
+        ], repo).stdout.splitlines()
+        if (not red_paths or any(
+                not any(glob_match(path, pattern)
+                        for pattern in seam["test_paths"])
+                for path in red_paths)):
+            raise SystemExit("error: TDD RED changed outside its frozen test seam")
+        if (not green_paths or any(
+                any(glob_match(path, pattern) for pattern in all_test_patterns)
+                for path in green_paths)):
+            raise SystemExit("error: TDD GREEN changed tests or no production path")
+        validate_stream_evidence(run_dir, cycle, prefix="red_")
+        validate_stream_evidence(run_dir, cycle, prefix="green_")
+        if cycle["red_pattern"] not in stream_text(run_dir, cycle, "red_"):
+            raise SystemExit("error: TDD RED output lacks its frozen failure pattern")
+        if git(["merge-base", "--is-ancestor", green, head_sha], repo,
+               check=False).returncode:
+            raise SystemExit("error: TDD GREEN commit is absent from task HEAD")
+        changed_after_green = git([
+            "diff", "--name-only", green, head_sha, "--", *cycle["test_files"],
+        ], repo).stdout.splitlines()
+        if changed_after_green:
+            raise SystemExit("error: tests proven by seam changed after GREEN")
+        previous_green = green
+
+
+def validate_diagnosis_semantics(repo, run_dir, task, head_sha, require_green):
+    report = task.get("diagnosis_evidence")
+    required = {
+        "schema_version", "repro_commit", "feedback_loop", "observed_red",
+        "minimized_repro", "hypotheses", "root_cause", "causal_chain",
+        "fix_boundary", "cleanup", "preventive_lesson", "repro_exit_code",
+        "repro_log", "failure_pattern", "recorded_at",
+    }
+    string_fields = {
+        "repro_commit", "feedback_loop", "observed_red", "minimized_repro",
+        "root_cause", "fix_boundary", "cleanup", "preventive_lesson",
+        "failure_pattern", "recorded_at",
+    }
+    if (not isinstance(report, dict) or not required.issubset(report)
+            or report.get("schema_version") != 1
+            or any(not isinstance(report.get(field), str)
+                   or not report[field].strip() for field in string_fields)
+            or report.get("feedback_loop") != task.get("diagnosis_command")
+            or report.get("failure_pattern") != task.get("failure_pattern")
+            or type(report.get("repro_exit_code")) is not int
+            or report["repro_exit_code"] == 0):
+        raise SystemExit("error: diagnosis evidence violates its frozen contract")
+    hypotheses = report.get("hypotheses")
+    fields = {"rank", "statement", "prediction", "check", "outcome"}
+    if (not isinstance(hypotheses, list) or not 3 <= len(hypotheses) <= 5
+            or [item.get("rank") for item in hypotheses
+                if isinstance(item, dict)] != list(range(1, len(hypotheses) + 1))
+            or any(not isinstance(item, dict) or not fields.issubset(item)
+                   or any(not isinstance(item.get(field), str)
+                          or not item[field].strip()
+                          for field in fields - {"rank"})
+                   for item in hypotheses)
+            or not isinstance(report.get("causal_chain"), list)
+            or len(report["causal_chain"]) < 2
+            or any(not isinstance(item, str) or not item.strip()
+                   for item in report["causal_chain"][:])):
+        raise SystemExit("error: diagnosis evidence has an invalid causal report")
+    repro = report["repro_commit"]
+    if (git(["merge-base", "--is-ancestor", task["base_commit"], repro], repo,
+            check=False).returncode
+            or git(["merge-base", "--is-ancestor", repro, head_sha], repo,
+                   check=False).returncode):
+        raise SystemExit("error: diagnosis repro commit is outside task history")
+    validate_stream_evidence(run_dir, report, prefix="repro_")
+    if report["failure_pattern"] not in stream_text(run_dir, report, "repro_"):
+        raise SystemExit("error: diagnosis repro output lacks its failure pattern")
+    if require_green and (report.get("green_exit_code") != 0
+                          or report.get("green_head") != head_sha):
+        raise SystemExit("error: diagnosis GREEN does not cover task HEAD")
+    if report.get("green_log"):
+        validate_stream_evidence(run_dir, report, prefix="green_")
+
+
+def validate_experiment_semantics(repo, run_dir, task, head_sha):
+    report = task.get("experiment_evidence")
+    replay = task.get("experiment_verification")
+    contract = task.get("experiment")
+    if not report or not replay:
+        raise SystemExit(
+            "error: experiment task has no independently replayed evidence"
+        )
+    report_fields = {
+        "schema_version", "task", "goal", "metric", "guard_command",
+        "holdout_command", "max_attempts", "plateau_window", "attempts",
+        "stop_reason", "final_head",
+    }
+    if (not isinstance(report, dict) or set(report) != report_fields
+            or report.get("schema_version") != 1 or not isinstance(contract, dict)
+            or report.get("task") != task.get("id")
+            or any(report.get(field) != contract.get(field) for field in (
+                "goal", "guard_command", "holdout_command", "max_attempts",
+                "plateau_window",
+            ))):
+        raise SystemExit("error: experiment evidence changed its frozen contract")
+    metric = report.get("metric")
+    frozen = contract.get("metric")
+    metric_fields = {
+        "name", "direction", "command", "baseline", "final", "minimum_delta",
+    }
+    if (not isinstance(metric, dict) or set(metric) != metric_fields
+            or not isinstance(frozen, dict)
+            or any(metric.get(field) != frozen.get(field) for field in (
+                "name", "direction", "command", "minimum_delta",
+            ))
+            or not finite_number(metric.get("baseline"))
+            or not finite_number(metric.get("final"))):
+        raise SystemExit("error: experiment metric differs from its frozen contract")
+    final_head = git(["rev-parse", f"{report['final_head']}^{{commit}}"], repo).stdout.strip()
+    if final_head != head_sha:
+        raise SystemExit("error: experiment final_head does not cover task HEAD")
+    attempts = report.get("attempts")
+    maximum, plateau = contract["max_attempts"], contract["plateau_window"]
+    if not isinstance(attempts, list) or not 1 <= len(attempts) <= maximum:
+        raise SystemExit("error: experiment attempts violate the frozen budget")
+    attempt_fields = {
+        "number", "hypothesis", "status", "commit", "metric", "delta",
+        "guard_exit_code", "evidence",
+    }
+    incumbent = metric["baseline"]
+    used, kept, no_improvement, plateau_at = set(), 0, 0, None
+    for index, attempt in enumerate(attempts, 1):
+        if plateau_at is not None:
+            raise SystemExit("error: experiment continued after its plateau")
+        if (not isinstance(attempt, dict) or set(attempt) != attempt_fields
+                or attempt.get("number") != index
+                or attempt.get("status") not in {
+                    "kept", "discarded", "crashed", "no-op",
+                }
+                or not isinstance(attempt.get("hypothesis"), str)
+                or not attempt["hypothesis"].strip()
+                or not isinstance(attempt.get("evidence"), str)
+                or not attempt["evidence"].strip()):
+            raise SystemExit("error: experiment attempt is malformed")
+        commit = attempt.get("commit")
+        if commit is not None:
+            commit = git(["rev-parse", f"{commit}^{{commit}}"], repo).stdout.strip()
+            if (commit in used
+                    or git(["merge-base", "--is-ancestor",
+                            task["base_commit"], commit], repo,
+                           check=False).returncode
+                    or git(["merge-base", "--is-ancestor", commit, head_sha],
+                           repo, check=False).returncode):
+                raise SystemExit("error: experiment attempt commit is invalid")
+            used.add(commit)
+        if ((attempt["status"] == "kept" and commit is None)
+                or (attempt["status"] == "no-op" and commit is not None)):
+            raise SystemExit("error: experiment attempt status contradicts its commit")
+        value, delta = attempt.get("metric"), attempt.get("delta")
+        if (value is None) != (delta is None):
+            raise SystemExit("error: experiment metric/delta pair is incomplete")
+        if value is not None:
+            if (not finite_number(value) or not finite_number(delta)
+                    or not same_number(
+                        delta, metric_delta(frozen["direction"], value, incumbent)
+                    )):
+                raise SystemExit("error: experiment attempt delta is invalid")
+        guard = attempt.get("guard_exit_code")
+        if guard is not None and type(guard) is not int:
+            raise SystemExit("error: experiment guard result is malformed")
+        if attempt["status"] == "kept":
+            if value is None or delta < frozen["minimum_delta"] or guard != 0:
+                raise SystemExit("error: kept experiment attempt missed its gate")
+            incumbent, kept, no_improvement = value, kept + 1, 0
+        else:
+            no_improvement += 1
+            if no_improvement == plateau:
+                plateau_at = index
+    stop = report.get("stop_reason")
+    if (kept == 0 or not same_number(metric["final"], incumbent)
+            or stop not in {"goal-met", "budget", "plateau", "blocked"}
+            or plateau_at is not None and stop != "plateau"
+            or stop == "plateau" and plateau_at != len(attempts)
+            or stop == "budget" and len(attempts) != maximum):
+        raise SystemExit("error: experiment stop/final metric is invalid")
+    commands = {
+        "baseline_command": frozen["command"],
+        "metric_command": frozen["command"],
+        "guard_command": contract["guard_command"],
+        "holdout_command": contract["holdout_command"],
+    }
+    if (not isinstance(replay, dict)
+            or replay.get("head_sha") != head_sha
+            or any(replay.get(field) != 0 for field in (
+                "baseline_exit_code", "metric_exit_code", "guard_exit_code",
+                "holdout_exit_code",
+            ))):
+        raise SystemExit("error: experiment replay is not bound to frozen commands")
+    if replay.get("stream_schema_version") is None:
+        return
+    if (replay.get("stream_schema_version") != 1
+            or any(replay.get(field) != value
+                   for field, value in commands.items())):
+        raise SystemExit("error: experiment replay is not bound to frozen commands")
+    for label in ("baseline", "metric", "guard", "holdout"):
+        validate_stream_evidence(run_dir, replay, prefix=f"{label}_")
+    try:
+        baseline = parse_metric(run_regular_file(run_dir, replay["baseline_log"]))
+        final = parse_metric(run_regular_file(run_dir, replay["metric_log"]))
+    except ValueError as exc:
+        raise SystemExit(f"error: invalid experiment metric replay: {exc}")
+    if (not same_number(baseline, replay.get("baseline"))
+            or not same_number(final, replay.get("final"))
+            or not same_number(baseline, metric["baseline"])
+            or not same_number(final, metric["final"])):
+        raise SystemExit("error: experiment replay output contradicts its metrics")
 
 
 def run_at_commit(repo, run_dir, task, commit, command, label):
-    verify_root = run_dir / "verifications"
-    verify_root.mkdir(parents=True, exist_ok=True)
+    verify_root = ensure_run_directory(run_dir, "verifications")
     staging = Path(tempfile.mkdtemp(prefix=f".{task['id']}-{label}.", dir=verify_root))
     checkout = staging / "checkout"
     log_path = verify_root / f"{task['id']}-{label}.log"
@@ -2810,54 +4896,23 @@ def run_at_commit(repo, run_dir, task, commit, command, label):
     return code, log_path
 
 
-def validate_method_evidence(repo, task, head_sha, require_diagnosis_green=True):
+def validate_method_evidence(
+        repo, run_dir, task, head_sha, require_diagnosis_green=True):
     if task.get("work_kind") == "experiment":
-        evidence = task.get("experiment_evidence")
-        replay = task.get("experiment_verification")
-        if not evidence or not replay:
-            raise SystemExit("error: experiment task has no independently replayed evidence")
-        if evidence.get("final_head") != head_sha or replay.get("head_sha") != head_sha:
-            raise SystemExit("error: experiment evidence does not cover task HEAD")
-        if any(replay.get(field) != 0 for field in (
-                "baseline_exit_code", "metric_exit_code", "guard_exit_code",
-                "holdout_exit_code")):
-            raise SystemExit("error: experiment replay did not pass every frozen command")
+        validate_experiment_semantics(repo, run_dir, task, head_sha)
     if task.get("tdd_required"):
-        cycles = task.get("tdd_evidence", [])
-        expected = {seam["id"] for seam in task["test_seams"]}
-        completed = {cycle.get("seam_id") for cycle in cycles}
-        missing = sorted(expected - completed)
-        if missing:
-            raise SystemExit(
-                "error: TDD task has no verified RED/GREEN cycle for seams: "
-                + ", ".join(missing)
-            )
-        for cycle in cycles:
-            if git(["merge-base", "--is-ancestor", cycle["green_commit"], head_sha],
-                   repo, check=False).returncode:
-                raise SystemExit(
-                    f"error: GREEN commit for seam {cycle.get('seam_id')} "
-                    "is absent from task HEAD"
-                )
-            changed_after_green = git(
-                ["diff", "--name-only", cycle["green_commit"], head_sha,
-                 "--", *cycle["test_files"]], repo
-            ).stdout.splitlines()
-            if changed_after_green:
-                raise SystemExit(
-                    f"error: tests proven by seam {cycle.get('seam_id')} changed "
-                    "after GREEN; declare a new seam cycle"
-                )
+        validate_tdd_semantics(repo, run_dir, task, head_sha)
     if task.get("diagnosis_required"):
-        diagnosis = task.get("diagnosis_evidence")
-        if not diagnosis:
-            raise SystemExit("error: diagnosis task has no structured root-cause evidence")
-        if require_diagnosis_green and (
-                diagnosis.get("green_exit_code") != 0
-                or diagnosis.get("green_head") != head_sha):
-            raise SystemExit(
-                "error: diagnosis task has no GREEN original-loop evidence at task HEAD"
-            )
+        validate_diagnosis_semantics(
+            repo, run_dir, task, head_sha, require_diagnosis_green
+        )
+    for receipt in task.get("verification_evidence", []):
+        if (not isinstance(receipt, dict)
+                or receipt.get("command") != task.get("verification")
+                or type(receipt.get("exit_code")) is not int
+                or not isinstance(receipt.get("head_sha"), str)):
+            raise SystemExit("error: malformed task verification evidence")
+        validate_stream_evidence(run_dir, receipt)
 
 
 def cmd_verify_tdd_cycle(args, repo, run_dir):
@@ -2926,7 +4981,9 @@ def cmd_verify_tdd_cycle(args, repo, run_dir):
         red_code, red_log = run_at_commit(repo, run_dir, task, red,
                                           seam["command"],
                                           f"tdd-red-{len(task.get('tdd_evidence', [])) + 1}")
-        red_output = red_log.read_text(encoding="utf-8", errors="replace")
+        red_stderr = red_log.with_name(red_log.name + ".stderr")
+        red_output = (red_log.read_text(encoding="utf-8", errors="replace")
+                      + red_stderr.read_text(encoding="utf-8", errors="replace"))
         if red_code == 0:
             raise SystemExit("error: RED command passed; it did not prove missing behavior")
         if seam["red_pattern"] not in red_output:
@@ -2937,14 +4994,24 @@ def cmd_verify_tdd_cycle(args, repo, run_dir):
         )
         if green_code != 0:
             raise SystemExit("error: GREEN command failed")
+        red_streams = verification_stream_evidence(run_dir, red_log)
+        green_streams = verification_stream_evidence(run_dir, green_log)
         evidence = {
+            "stream_schema_version": 1,
             "seam_id": args.seam, "behavior": seam["behavior"],
             "test_files": sorted(seam["test_paths"]),
             "command": seam["command"], "red_pattern": seam["red_pattern"],
             "red_commit": red, "red_exit_code": red_code,
-            "red_log": str(red_log.relative_to(run_dir)),
+            "red_log": red_streams["log"],
+            "red_log_sha256": red_streams["log_sha256"],
+            "red_stderr_log": red_streams["stderr_log"],
+            "red_stderr_sha256": red_streams["stderr_sha256"],
             "green_commit": green, "green_exit_code": green_code,
-            "green_log": str(green_log.relative_to(run_dir)), "verified_at": now(),
+            "green_log": green_streams["log"],
+            "green_log_sha256": green_streams["log_sha256"],
+            "green_stderr_log": green_streams["stderr_log"],
+            "green_stderr_sha256": green_streams["stderr_sha256"],
+            "verified_at": now(),
         }
         task.setdefault("tdd_evidence", []).append(evidence)
         task["updated_at"] = now()
@@ -2952,7 +5019,8 @@ def cmd_verify_tdd_cycle(args, repo, run_dir):
                            {"event": "tdd_cycle_verified", "task": args.task,
                             "seam_id": args.seam,
                             "red_commit": red, "green_commit": green,
-                            "command": seam["command"]})
+                            "command": seam["command"],
+                            "receipt_sha256": object_sha256(evidence)})
     print(json.dumps(evidence, sort_keys=True))
 
 
@@ -3135,25 +5203,43 @@ def cmd_experiment_put(args, repo, run_dir):
             raise SystemExit("error: held-out experiment acceptance failed")
 
         task["experiment_evidence"] = report
-        task["experiment_verification"] = {
+        experiment_verification = {
+            "stream_schema_version": 1,
             "head_sha": head,
+            "baseline_command": frozen_metric["command"],
+            "metric_command": frozen_metric["command"],
+            "guard_command": contract["guard_command"],
+            "holdout_command": contract["holdout_command"],
             "baseline": baseline,
             "final": final_metric,
             "baseline_exit_code": baseline_code,
-            "baseline_log": str(baseline_log.relative_to(run_dir)),
             "metric_exit_code": replay_results["metric"][0],
-            "metric_log": str(replay_results["metric"][1].relative_to(run_dir)),
             "guard_exit_code": replay_results["guard"][0],
-            "guard_log": str(replay_results["guard"][1].relative_to(run_dir)),
             "holdout_exit_code": replay_results["holdout"][0],
-            "holdout_log": str(replay_results["holdout"][1].relative_to(run_dir)),
             "recorded_at": now(),
         }
+        for label, log in (
+                ("baseline", baseline_log),
+                ("metric", replay_results["metric"][1]),
+                ("guard", replay_results["guard"][1]),
+                ("holdout", replay_results["holdout"][1])):
+            streams = verification_stream_evidence(run_dir, log)
+            experiment_verification.update({
+                f"{label}_log": streams["log"],
+                f"{label}_log_sha256": streams["log_sha256"],
+                f"{label}_stderr_log": streams["stderr_log"],
+                f"{label}_stderr_sha256": streams["stderr_sha256"],
+            })
+        task["experiment_verification"] = experiment_verification
         task["updated_at"] = now()
         commit_transaction(
             run_dir, {task_path: task},
             {"event": "experiment_recorded", "task": args.task,
-             "base": baseline, "final": final_metric, "head": head},
+             "base": baseline, "final": final_metric, "head": head,
+             "receipt_sha256": object_sha256({
+                 "experiment_evidence": report,
+                 "experiment_verification": experiment_verification,
+             })},
         )
         report_path.unlink()
         fd_dir = os.open(report_path.parent, os.O_RDONLY)
@@ -3227,23 +5313,35 @@ def cmd_diagnosis_put(args, _repo, run_dir):
         repro_code, repro_log = run_at_commit(
             _repo, run_dir, task, repro, task["diagnosis_command"], "diagnosis-red"
         )
-        repro_output = repro_log.read_text(encoding="utf-8", errors="replace")
+        repro_stderr = repro_log.with_name(repro_log.name + ".stderr")
+        repro_output = (repro_log.read_text(encoding="utf-8", errors="replace")
+                        + repro_stderr.read_text(
+                            encoding="utf-8", errors="replace"
+                        ))
         if repro_code == 0:
             raise SystemExit("error: diagnosis feedback loop passed at repro_commit")
         if task["failure_pattern"] not in repro_output:
             raise SystemExit("error: diagnosis output lacks the approved failure_pattern")
+        repro_streams = verification_stream_evidence(run_dir, repro_log)
         task["diagnosis_evidence"] = {
             **report,
+            "stream_schema_version": 1,
             "repro_commit": repro,
             "repro_exit_code": repro_code,
-            "repro_log": str(repro_log.relative_to(run_dir)),
+            "repro_log": repro_streams["log"],
+            "repro_log_sha256": repro_streams["log_sha256"],
+            "repro_stderr_log": repro_streams["stderr_log"],
+            "repro_stderr_sha256": repro_streams["stderr_sha256"],
             "failure_pattern": task["failure_pattern"],
             "recorded_at": now(),
         }
         task["updated_at"] = now()
         commit_transaction(run_dir, {task_path: task},
                            {"event": "diagnosis_recorded", "task": args.task,
-                            "root_cause": report["root_cause"]})
+                            "root_cause": report["root_cause"],
+                            "receipt_sha256": object_sha256(
+                                task["diagnosis_evidence"]
+                            )})
         report_path.unlink()
         fd_dir = os.open(report_path.parent, os.O_RDONLY)
         try:
@@ -3275,27 +5373,36 @@ def cmd_verify_task(args, repo, run_dir):
         if branch != task["branch"]:
             raise SystemExit("error: task worktree is on the wrong branch")
         head = git(["rev-parse", "HEAD"], worktree).stdout.strip()
-        validate_method_evidence(repo, task, head, require_diagnosis_green=False)
+        validate_method_evidence(
+            repo, run_dir, task, head, require_diagnosis_green=False
+        )
         env = os.environ.copy()
         env.update({key: str(value) for key, value in task.get("env", {}).items()
                     if key in TASK_ENV_KEYS})
         diagnosis_result = None
+        verify_root = ensure_run_directory(run_dir, "verifications")
         if task.get("diagnosis_required"):
-            diagnosis_log = run_dir / "verifications" / f"{args.task}-diagnosis-green.log"
+            diagnosis_log = verify_root / f"{args.task}-diagnosis-green.log"
             diagnosis_code = run_verification(
                 task["diagnosis_command"], worktree, env, diagnosis_log
+            )
+            diagnosis_streams = verification_stream_evidence(
+                run_dir, diagnosis_log
             )
             diagnosis_result = {
                 "command": task["diagnosis_command"],
                 "exit_code": diagnosis_code,
                 "head_sha": head,
-                "log": str(diagnosis_log.relative_to(run_dir)),
+                **diagnosis_streams,
                 "ts": now(),
             }
             task["diagnosis_evidence"].update({
                 "green_exit_code": diagnosis_code,
                 "green_head": head,
                 "green_log": diagnosis_result["log"],
+                "green_log_sha256": diagnosis_result["log_sha256"],
+                "green_stderr_log": diagnosis_result["stderr_log"],
+                "green_stderr_sha256": diagnosis_result["stderr_sha256"],
                 "green_verified_at": diagnosis_result["ts"],
             })
             if diagnosis_code:
@@ -3304,7 +5411,10 @@ def cmd_verify_task(args, repo, run_dir):
                     run_dir, {task_path: task},
                     {"event": "diagnosis_green", "task": args.task,
                      "exit_code": diagnosis_code, "head_sha": head,
-                     "log": diagnosis_result["log"]},
+                     "log": diagnosis_result["log"],
+                     "receipt_sha256": object_sha256(
+                         task["diagnosis_evidence"]
+                     )},
                 )
                 failure_code = diagnosis_code
             else:
@@ -3314,12 +5424,12 @@ def cmd_verify_task(args, repo, run_dir):
         if failure_code:
             evidence = {"diagnosis": diagnosis_result}
         else:
-            log_path = run_dir / "verifications" / f"{args.task}.log"
+            log_path = verify_root / f"{args.task}.log"
             code = run_verification(task["verification"], worktree, env, log_path)
             verification_evidence = {
                 "command": task["verification"], "exit_code": code,
                 "head_sha": head, "ts": now(),
-                "log": str(log_path.relative_to(run_dir)),
+                **verification_stream_evidence(run_dir, log_path),
             }
             evidence = dict(verification_evidence)
             if diagnosis_result:
@@ -3330,12 +5440,390 @@ def cmd_verify_task(args, repo, run_dir):
                                {"event": "task_verification", "task": args.task,
                                 "exit_code": code, "head_sha": head,
                                 "log": verification_evidence["log"],
-                                "diagnosis_log": (diagnosis_result or {}).get("log")})
+                                "diagnosis_log": (diagnosis_result or {}).get("log"),
+                                "receipt_sha256": object_sha256(
+                                    verification_evidence
+                                ),
+                                "diagnosis_sha256": (
+                                    object_sha256(task["diagnosis_evidence"])
+                                    if isinstance(task.get("diagnosis_evidence"), dict)
+                                    else None
+                                )})
     print(json.dumps(evidence, sort_keys=True))
     if failure_code:
         raise SystemExit(failure_code)
     if evidence["exit_code"]:
         raise SystemExit(evidence["exit_code"])
+
+
+def cmd_quality_check(args, repo, run_dir):
+    if args.lane not in QUALITY_LANES or args.wave < 1:
+        raise SystemExit("error: invalid quality lane or wave")
+    verify_root = ensure_run_directory(run_dir, "verifications")
+    quality_lock = verify_root / f".quality-wave-{args.wave}-{args.lane}.lock"
+    try:
+        lock_context = locked_regular(quality_lock, "quality lane lock")
+        with lock_context:
+            with locked(run_dir):
+                state_path = run_dir / "state.json"
+                state = load_json(state_path)
+                if state.get("finished") or state.get("phase") not in {
+                    "INTEGRATION_TESTING", "FIXING", "RE_REVIEWING", "LEARNING_EXPORT",
+                }:
+                    raise SystemExit(
+                        "error: quality checks require an integration quality phase"
+                    )
+                lane = state.get("quality_lanes", {}).get(
+                    str(args.wave), {}
+                ).get(args.lane)
+                if not isinstance(lane, dict) or not lane.get("commands"):
+                    raise SystemExit(
+                        "error: requested quality lane is not required by frozen policy"
+                    )
+                attempts = lane.get("attempts", [])
+                if not isinstance(attempts, list) or len(attempts) >= 64:
+                    raise SystemExit(
+                        "error: quality lane reached its 64-attempt retention limit; "
+                        "replan instead of retrying"
+                    )
+                integration_worktree = (
+                    run_dir / "worktrees" / "integration"
+                ).resolve()
+                if (not integration_worktree.is_dir()
+                        or Path(git([
+                            "rev-parse", "--show-toplevel"
+                        ], integration_worktree).stdout.strip()).resolve()
+                        != integration_worktree
+                        or git([
+                            "branch", "--show-current"
+                        ], integration_worktree).stdout.strip()
+                        != state["integration_branch"]):
+                    raise SystemExit(
+                        "error: missing exact integration worktree for quality check"
+                    )
+                head = git(["rev-parse", "HEAD"], integration_worktree).stdout.strip()
+                if head != integration_head(repo, state):
+                    raise SystemExit(
+                        "error: integration worktree differs from frozen integration head"
+                    )
+                if git([
+                        "status", "--porcelain=v1", "--untracked-files=all",
+                        ], integration_worktree).stdout:
+                    raise SystemExit(
+                        "error: integration worktree must be clean for quality checks"
+                    )
+                frozen_lane = json.loads(json.dumps(lane))
+                assessment = frozen_lane.get("assessment")
+                if args.lane == "refactor":
+                    if (not isinstance(assessment, dict)
+                            or assessment.get("head_sha") != head):
+                        raise SystemExit(
+                            "error: refactor lane needs quality-assess at the "
+                            "current post-GREEN integration head"
+                        )
+                    if assessment.get("outcome") == "task-created" and (
+                            state.get("tasks", {}).get(
+                                assessment.get("task_id"), {}
+                            ).get("status") not in {
+                                "merged", "artifact_complete",
+                            }):
+                        raise SystemExit(
+                            "error: assessed refactor task is not integrated"
+                        )
+                frozen_phase = state["phase"]
+                attempt = len(attempts) + 1
+            staging = Path(tempfile.mkdtemp(
+                prefix=f".quality-{args.wave}-{args.lane}-{attempt}.",
+                dir=verify_root,
+            ))
+            checkout = staging / "checkout"
+            added = False
+            results = []
+            failure = 0
+            lane_deadline = (
+                -1 if os.environ.get("QTEAM_TEST_FORCE_QUALITY_TIMEOUT") == "1"
+                else time.monotonic() + QUALITY_LANE_TIMEOUT_SECONDS
+            )
+            try:
+                git(["worktree", "add", "--detach", str(checkout), head], repo)
+                added = True
+                for index, command in enumerate(frozen_lane["commands"], start=1):
+                    log_path = (
+                        verify_root
+                        / f"quality-wave-{args.wave}-{args.lane}-attempt-"
+                        f"{attempt}-{index}.log"
+                    )
+                    remaining = lane_deadline - time.monotonic()
+                    if remaining <= 0:
+                        code = 124
+                        try:
+                            with regular_output(
+                                    log_path, "verification stdout log"):
+                                pass
+                            with regular_output(
+                                    log_path.with_name(log_path.name + ".stderr"),
+                                    "verification stderr log") as error_log:
+                                error_log.write(
+                                    "quality lane aggregate timeout reached\n"
+                                )
+                        except ValueError as exc:
+                            raise SystemExit(f"error: {exc}")
+                    else:
+                        try:
+                            code = run_verification(
+                                command, checkout, os.environ.copy(), log_path,
+                                timeout_seconds=min(
+                                    VERIFICATION_TIMEOUT_SECONDS, remaining
+                                ),
+                            )
+                        except SystemExit as exc:
+                            stderr_candidate = log_path.with_name(
+                                log_path.name + ".stderr"
+                            )
+                            if ("exceeded" not in str(exc)
+                                    or not log_path.is_file()
+                                    or not stderr_candidate.is_file()):
+                                raise
+                            # Timeout/retention overflow is a real failed attempt,
+                            # not missing evidence. Keep its bounded streams and a
+                            # conventional infrastructure exit code.
+                            code = 124
+                    stderr_path = log_path.with_name(log_path.name + ".stderr")
+                    results.append({
+                        "command": command, "exit_code": code, "head_sha": head,
+                        "log": str(log_path.relative_to(run_dir)),
+                        "log_sha256": file_sha256(log_path),
+                        "stderr_log": str(stderr_path.relative_to(run_dir)),
+                        "stderr_sha256": file_sha256(stderr_path),
+                        "ts": now(),
+                    })
+                    failure = failure or code
+                    if code == 124:
+                        break
+                if (git(["rev-parse", "HEAD"], checkout).stdout.strip() != head
+                        or git(["diff", "--quiet", "HEAD", "--"], checkout,
+                               check=False).returncode
+                        or git(["diff", "--cached", "--quiet", "HEAD", "--"],
+                               checkout, check=False).returncode):
+                    raise SystemExit(
+                        "error: quality command mutated tracked integration content"
+                    )
+            finally:
+                try:
+                    if added:
+                        git(["worktree", "remove", "--force", str(checkout)], repo)
+                finally:
+                    shutil.rmtree(staging, ignore_errors=True)
+            receipt = {
+                "attempt": attempt,
+                "status": "passed" if not failure else "failed",
+                "head_sha": head,
+                "commands": list(frozen_lane["commands"]),
+                "results": results, "updated_at": now(),
+            }
+            with locked(run_dir):
+                state = load_json(state_path)
+                lane = state.get("quality_lanes", {}).get(
+                    str(args.wave), {}
+                ).get(args.lane)
+                live_worktree = (run_dir / "worktrees" / "integration").resolve()
+                if (state.get("phase") != frozen_phase
+                        or integration_head(repo, state) != head
+                        or lane != frozen_lane
+                        or not live_worktree.is_dir()
+                        or git(["rev-parse", "HEAD"], live_worktree).stdout.strip() != head
+                        or git([
+                            "status", "--porcelain=v1", "--untracked-files=all",
+                        ], live_worktree).stdout):
+                    raise SystemExit(
+                        "error: quality policy, phase, or authoritative integration "
+                        "worktree changed during isolated execution; discard and retry"
+                    )
+                previous = lane.get("status", "pending")
+                lane.setdefault("attempts", []).append(receipt)
+                lane.update({key: receipt[key] for key in (
+                    "status", "head_sha", "results", "updated_at"
+                )})
+                state["updated_at"] = now()
+                commit_transaction(
+                    run_dir, {state_path: state},
+                    {
+                        "event": "quality_lane", "wave": args.wave,
+                        "lane": args.lane, "from": previous,
+                        "to": lane["status"], "head_sha": head,
+                        "attempt": attempt,
+                    },
+                )
+    except ArtifactError as exc:
+        raise SystemExit(f"error: {exc}")
+    print(json.dumps({
+        "wave": args.wave, "lane": args.lane, "attempt": attempt,
+        "status": receipt["status"], "head_sha": head,
+        "exit_codes": [item["exit_code"] for item in results],
+    }, sort_keys=True))
+    if failure:
+        raise SystemExit(failure)
+
+
+def cmd_quality_assess(args, repo, run_dir):
+    if (args.wave < 1 or args.lane != "refactor"
+            or args.outcome not in {"not-needed", "task-created"}
+            or not args.rationale.strip() or len(args.rationale.strip()) > 2048
+            or (args.outcome == "task-created") != bool(args.task)):
+        raise SystemExit("error: invalid bounded refactor assessment")
+    if args.task and not safe_task_id(args.task):
+        raise SystemExit("error: unsafe refactor task id")
+    with locked(run_dir):
+        state_path = run_dir / "state.json"
+        state = load_json(state_path)
+        if state.get("finished") or state.get("phase") not in {
+                "WAVE_MERGING", "INTEGRATION_TESTING", "REVIEWING", "FIXING",
+                "RE_REVIEWING"}:
+            raise SystemExit("error: quality assessment is invalid in this phase")
+        lane = state.get("quality_lanes", {}).get(
+            str(args.wave), {}
+        ).get(args.lane)
+        if not isinstance(lane, dict):
+            raise SystemExit("error: quality lane was not triggered")
+        head = integration_head(repo, state)
+        assessment = {
+            "outcome": args.outcome, "rationale": args.rationale.strip(),
+            "head_sha": head, "assessed_at": now(),
+        }
+        if args.task:
+            task = load_json(run_dir / "tasks" / f"{args.task}.json")
+            if (task.get("work_kind") != "refactor"
+                    or task.get("wave") != args.wave
+                    or task.get("status") not in {"merged", "artifact_complete"}):
+                raise SystemExit(
+                    "error: assessment task must be an integrated refactor task "
+                    "owned by the assessed wave"
+                )
+            assessment["task_id"] = args.task
+        lane["assessment"] = assessment
+        state["updated_at"] = now()
+        commit_transaction(
+            run_dir, {state_path: state},
+            {"event": "quality_assessed", "wave": args.wave,
+             "lane": args.lane, "outcome": args.outcome,
+             "task_id": args.task, "head_sha": head},
+        )
+    print(json.dumps(assessment, sort_keys=True))
+
+
+def cmd_queue_put(args, _repo, run_dir):
+    candidate = load_json(Path(args.file))
+    if not isinstance(candidate, dict):
+        raise SystemExit("error: queue item file must contain an object")
+    item = dict(candidate)
+    item.setdefault("schema_version", 1)
+    item.setdefault("status", "pending")
+    item.setdefault("created_at", now())
+    with locked(run_dir):
+        state_path = run_dir / "state.json"
+        state = load_json(state_path)
+        if state.get("finished"):
+            raise SystemExit("error: finished run is immutable")
+        validate_queue_item(item, state)
+        queue = state.setdefault("work_queue", [])
+        if len(queue) >= MAX_QUEUE_ITEMS:
+            raise SystemExit("error: coordinator queue item limit reached")
+        if any(existing.get("id") == item["id"] for existing in queue
+               if isinstance(existing, dict)):
+            raise SystemExit(f"error: queue item {item['id']} already exists")
+        queue.append(item)
+        state["updated_at"] = now()
+        commit_transaction(
+            run_dir, {state_path: state},
+            {"event": "queue_put", "item": item["id"], "kind": item["kind"]},
+        )
+    print(item["id"])
+
+
+def cmd_queue_claim(args, _repo, run_dir):
+    if args.consumer != "coordinator" or not 1 <= args.limit <= 16:
+        raise SystemExit("error: queue claims require consumer=coordinator and a valid batch limit")
+    if args.kind is not None and args.kind not in QUEUE_KINDS:
+        raise SystemExit("error: invalid queue kind")
+    with locked(run_dir):
+        state_path = run_dir / "state.json"
+        state = load_json(state_path)
+        if state.get("finished") or state.get("phase") == "DONE":
+            raise SystemExit("error: finished run is immutable")
+        queue = state.setdefault("work_queue", [])
+        for item in queue:
+            validate_queue_item(item, state)
+        candidates = sorted(
+            (item for item in queue
+             if item["status"] == "pending"
+             and (args.kind is None or item["kind"] == args.kind)),
+            key=lambda item: (item["priority"], item["created_at"], item["id"]),
+        )
+        claimed = []
+        if candidates:
+            priority = candidates[0]["priority"]
+            stamp = now()
+            for item in [value for value in candidates if value["priority"] == priority][
+                    :args.limit]:
+                item.update({
+                    "status": "claimed", "claimed_by": args.consumer,
+                    "claimed_at": stamp,
+                })
+                claimed.append(item)
+            state["updated_at"] = now()
+            commit_transaction(
+                run_dir, {state_path: state},
+                {
+                    "event": "queue_claim", "consumer": args.consumer,
+                    "items": [item["id"] for item in claimed], "priority": priority,
+                    "kind": args.kind, "limit": args.limit,
+                },
+            )
+    print(json.dumps(claimed, sort_keys=True))
+
+
+def cmd_queue_complete(args, _repo, run_dir):
+    if (not safe_task_id(args.item) or args.consumer != "coordinator"
+            or not args.evidence.strip()
+            or len(args.evidence.strip()) > MAX_QUEUE_EVIDENCE):
+        raise SystemExit("error: invalid queue completion input")
+    with locked(run_dir):
+        state_path = run_dir / "state.json"
+        state = load_json(state_path)
+        if state.get("finished") or state.get("phase") == "DONE":
+            raise SystemExit("error: finished run is immutable")
+        matches = [item for item in state.setdefault("work_queue", [])
+                   if isinstance(item, dict) and item.get("id") == args.item]
+        if len(matches) != 1:
+            raise SystemExit("error: queue item not found")
+        item = matches[0]
+        validate_queue_item(item, state)
+        if item.get("status") != "claimed" or item.get("claimed_by") != args.consumer:
+            raise SystemExit("error: queue item is not claimed by this consumer")
+        item.update({
+            "status": args.outcome, "completed_at": now(),
+            "evidence": args.evidence.strip(),
+        })
+        state["updated_at"] = now()
+        commit_transaction(
+            run_dir, {state_path: state},
+            {
+                "event": "queue_complete", "item": args.item,
+                "consumer": args.consumer, "outcome": args.outcome,
+            },
+        )
+    print(args.outcome)
+
+
+def cmd_queue_status(_args, _repo, run_dir):
+    with locked(run_dir, allow_sealed=True):
+        state = load_json(run_dir / "state.json")
+        queue = state.get("work_queue", [])
+        if not isinstance(queue, list):
+            raise SystemExit("error: malformed coordinator queue")
+        for item in queue:
+            validate_queue_item(item, state)
+    print(json.dumps(queue, sort_keys=True))
 
 
 def cmd_verify_final(args, repo, run_dir):
@@ -3350,13 +5838,14 @@ def cmd_verify_final(args, repo, run_dir):
         if git(["branch", "--show-current"], worktree).stdout.strip() != state["integration_branch"]:
             raise SystemExit("error: integration worktree is on the wrong branch")
         head = git(["rev-parse", "HEAD"], worktree).stdout.strip()
-        log_path = run_dir / "verifications" / "final.log"
+        log_path = ensure_run_directory(run_dir, "verifications") / "final.log"
         code = run_verification(args.command, worktree, os.environ.copy(), log_path)
         old = state.setdefault("gates", {}).get("final_verification", {}).get("status", "pending")
         state["gates"]["final_verification"] = {
             "status": "passed" if code == 0 else "failed", "command": args.command,
             "exit_code": code, "head_sha": head,
-            "log": str(log_path.relative_to(run_dir)), "updated_at": now(),
+            **verification_stream_evidence(run_dir, log_path),
+            "updated_at": now(),
         }
         state["updated_at"] = now()
         commit_transaction(run_dir, {state_path: state},
@@ -3380,6 +5869,9 @@ def cmd_reviews_checked(args, repo, run_dir):
         if args.require_risk:
             state["risk_forced"] = True
             state["risk_required"] = True
+        validate_quality_lanes(
+            repo, run_dir, state, through_wave=args.wave, head_sha=head
+        )
         axes = validate_reviews(repo, run_dir, state, head, args.require_risk,
                                 through_wave=args.wave)
         old = state.setdefault("gates", {}).get("reviews", {}).get("status", "pending")
@@ -3842,6 +6334,50 @@ def cmd_status(_args, repo, run_dir):
             "run_id": state["run_id"], "phase": state["phase"],
             "current_wave": state.get("current_wave", 0), "integration_head": head,
             "tasks": tasks, "open_decisions": sorted(decisions, key=lambda item: item["id"]),
+            "workflow_shapes": {
+                wave: policy.get("workflow_shape", "lean")
+                for wave, policy in sorted(state.get("waves", {}).items())
+            },
+            "quality_lanes": {
+                wave: {
+                    name: {
+                        "status": lane.get("status"),
+                        "head_sha": lane.get("head_sha"),
+                        "required_by": lane.get("required_by", []),
+                        "command_count": len(lane.get("commands", [])),
+                        "attempt_count": len(lane.get("attempts", [])),
+                    }
+                    for name, lane in lanes.items()
+                }
+                for wave, lanes in state.get("quality_lanes", {}).items()
+            },
+            "work_queue": {
+                "counts": {
+                    status: sum(1 for item in state.get("work_queue", [])
+                                if item.get("status") == status)
+                    for status in sorted(QUEUE_STATUSES)
+                },
+                "next_pending": [
+                    {key: item.get(key) for key in (
+                        "id", "kind", "targets", "priority", "created_at",
+                    )}
+                    for item in sorted(
+                        (entry for entry in state.get("work_queue", [])
+                         if entry.get("status") == "pending"),
+                        key=lambda entry: (
+                            entry["priority"], entry["created_at"], entry["id"]
+                        ),
+                    )[:8]
+                ],
+                "claimed": [
+                    {key: item.get(key) for key in (
+                        "id", "kind", "targets", "priority", "claimed_by",
+                        "claimed_at",
+                    )}
+                    for item in state.get("work_queue", [])
+                    if item.get("status") == "claimed"
+                ][:16],
+            },
             "ready_tasks": ready_tasks,
             "dependency_blockers": dependency_waits,
             "blocking_decisions": current_blockers,
@@ -3900,6 +6436,7 @@ def validate_ready_invariants(repo, run_dir, state, head):
     final_gate = gates.get("final_verification", {})
     if final_gate.get("status") != "passed" or final_gate.get("head_sha") != head:
         raise SystemExit("error: stale or failed final verification")
+    validate_stream_evidence(run_dir, final_gate)
     if gates.get("learning", {}).get("status") not in {"passed", "skipped"}:
         raise SystemExit("error: learning gate is not passed or explicitly skipped")
     require_no_decision_blockers(run_dir, state, "finish", action="finish")
@@ -3919,6 +6456,13 @@ def validate_ready_invariants(repo, run_dir, state, head):
         )
     validate_merged_tasks(repo, run_dir, state, head)
     validate_integration_provenance(repo, run_dir, state, head)
+    validate_quality_lanes(
+        repo, run_dir, state,
+        through_wave=max(
+            (int(value) for value in state.get("waves", {})), default=0
+        ),
+        head_sha=head,
+    )
     validate_reviews(repo, run_dir, state, head)
     if (gates.get("public_boundary", {}).get("status") != "passed"
             or gates["public_boundary"].get("head_sha") != head):
@@ -4058,6 +6602,34 @@ def parser():
     p = sub.add_parser("verify-task")
     p.add_argument("task")
     p.set_defaults(func=cmd_verify_task)
+    p = sub.add_parser("quality-check")
+    p.add_argument("--wave", type=int, required=True)
+    p.add_argument("--lane", required=True, choices=list(QUALITY_LANES))
+    p.set_defaults(func=cmd_quality_check)
+    p = sub.add_parser("quality-assess")
+    p.add_argument("--wave", type=int, required=True)
+    p.add_argument("--lane", required=True, choices=["refactor"])
+    p.add_argument(
+        "--outcome", required=True, choices=["not-needed", "task-created"]
+    )
+    p.add_argument("--rationale", required=True)
+    p.add_argument("--task")
+    p.set_defaults(func=cmd_quality_assess)
+    p = sub.add_parser("queue-put")
+    p.add_argument("--file", required=True)
+    p.set_defaults(func=cmd_queue_put)
+    p = sub.add_parser("queue-claim")
+    p.add_argument("--consumer", required=True)
+    p.add_argument("--kind", choices=sorted(QUEUE_KINDS))
+    p.add_argument("--limit", type=int, default=1)
+    p.set_defaults(func=cmd_queue_claim)
+    p = sub.add_parser("queue-complete")
+    p.add_argument("item")
+    p.add_argument("--consumer", required=True)
+    p.add_argument("--outcome", choices=["completed", "failed"], required=True)
+    p.add_argument("--evidence", required=True)
+    p.set_defaults(func=cmd_queue_complete)
+    sub.add_parser("queue-status").set_defaults(func=cmd_queue_status)
     p = sub.add_parser("verify-tdd-cycle")
     p.add_argument("task")
     p.add_argument("--seam", required=True)
@@ -4135,10 +6707,12 @@ def main():
             raise SystemExit(
                 f"error: run schema {version!r} is unsupported; run migrate-run first"
             )
+        if args.command not in {"show", "status"}:
+            require_current_runtime_contract(run_dir, existing_state)
         if (existing_state.get("publication_seal")
                 and args.command not in {
                     "decision-check", "reversibility-subject",
-                    "finish", "show", "status",
+                    "finish", "show", "status", "queue-status",
                 }):
             raise SystemExit(
                 "error: publication seal freezes READY state and gate mutations"

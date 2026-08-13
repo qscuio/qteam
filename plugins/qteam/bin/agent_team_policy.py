@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Deterministic QTeam task risk, model-tier, and review policy derivation."""
+"""Deterministic QTeam task risk, workflow-shape, and review derivation."""
 
+import ast
 import hashlib
+import json
 import re
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 from agent_team_eval import execution_profile
 
 
-POLICY_VERSION = 2
+POLICY_VERSION = 3
 WORK_KINDS = {
     "feature", "bugfix", "debug", "refactor", "test", "integration",
     "docs", "config", "generated", "learning", "experiment",
@@ -18,6 +20,36 @@ RISK_FLAGS = {
     "authentication", "compatibility", "public-api",
 }
 MODEL_TIERS = ("economy", "standard", "deep")
+WORKFLOW_SHAPES = ("lean", "standard", "hardened")
+WORKFLOW_SHAPE_ORDER = {
+    name: index for index, name in enumerate(WORKFLOW_SHAPES)
+}
+QUALITY_LANES = ("refactor", "hardening", "public-surface-qa")
+PROJECT_POLICY_VERSION = 1
+DEFAULT_PROJECT_POLICY = {
+    "schema_version": PROJECT_POLICY_VERSION,
+    "workflow_shape_floor": "lean",
+    "required_quality_lanes": {
+        lane: {"work_kinds": [], "risk_flags": []} for lane in QUALITY_LANES
+    },
+}
+CORE_POLICY_CONTRACT = {
+    "policy_version": POLICY_VERSION,
+    "workflow_shapes": list(WORKFLOW_SHAPES),
+    "quality_lanes": list(QUALITY_LANES),
+    "default_project_policy": DEFAULT_PROJECT_POLICY,
+    "default_shape_rules": {
+        "hardened_tier": "deep",
+        "standard_work_kinds": [
+            "feature", "bugfix", "debug", "refactor", "integration", "experiment",
+        ],
+        "refactor_lane_work_kinds": [
+            "feature", "bugfix", "debug", "refactor", "integration", "experiment",
+        ],
+        "hardening_shape": "hardened",
+        "public_surface_risks": ["compatibility", "public-api"],
+    },
+}
 MODEL_PROFILES = {
     "economy": execution_profile("gpt-5.6-terra", "low"),
     "standard": execution_profile("gpt-5.6-terra", "medium"),
@@ -88,6 +120,7 @@ REVIEW_CLOSURE_INSTRUCTIONS = (
 
 def safe_identifier(value):
     return (isinstance(value, str) and bool(value)
+            and len(value) <= 128
             and value[0].isascii() and value[0].isalnum()
             and value not in {".", ".."} and ".." not in value
             and all(ch.isascii() and (ch.isalnum() or ch in "._-") for ch in value))
@@ -99,6 +132,62 @@ def review_contract_digest(axis, intensity):
                 + REVIEW_FINDING_INSTRUCTIONS + "\n"
                 + REVIEW_CLOSURE_INSTRUCTIONS)
     return hashlib.sha256(contract.encode()).hexdigest()
+
+
+def validate_project_policy(value):
+    """Validate a project layer that may only strengthen core QTeam policy."""
+    if value is None:
+        return json.loads(json.dumps(DEFAULT_PROJECT_POLICY))
+    if (not isinstance(value, dict)
+            or set(value) != {
+                "schema_version", "workflow_shape_floor",
+                "required_quality_lanes",
+            }
+            or type(value.get("schema_version")) is not int
+            or value.get("schema_version") != PROJECT_POLICY_VERSION
+            or value.get("workflow_shape_floor") not in WORKFLOW_SHAPES
+            or not isinstance(value.get("required_quality_lanes"), dict)
+            or set(value["required_quality_lanes"]) != set(QUALITY_LANES)):
+        raise ValueError("invalid QTeam project policy")
+    normalized = {
+        "schema_version": PROJECT_POLICY_VERSION,
+        "workflow_shape_floor": value["workflow_shape_floor"],
+        "required_quality_lanes": {},
+    }
+    for lane in QUALITY_LANES:
+        rule = value["required_quality_lanes"][lane]
+        if (not isinstance(rule, dict)
+                or set(rule) != {"work_kinds", "risk_flags"}
+                or not isinstance(rule["work_kinds"], list)
+                or not isinstance(rule["risk_flags"], list)
+                or any(not isinstance(item, str) or item not in WORK_KINDS
+                       for item in rule["work_kinds"])
+                or any(not isinstance(item, str) or item not in RISK_FLAGS
+                       for item in rule["risk_flags"])
+                or len(rule["work_kinds"]) != len(set(rule["work_kinds"]))
+                or len(rule["risk_flags"]) != len(set(rule["risk_flags"]))):
+            raise ValueError(f"invalid project policy rule for {lane}")
+        normalized["required_quality_lanes"][lane] = {
+            "work_kinds": sorted(rule["work_kinds"]),
+            "risk_flags": sorted(rule["risk_flags"]),
+        }
+    return normalized
+
+
+def project_policy_digest(value):
+    normalized = validate_project_policy(value)
+    payload = json.dumps(
+        normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def core_policy_digest():
+    # Bind every transitive constant and code path that participates in policy
+    # derivation while keeping comment/whitespace-only plugin updates compatible.
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    semantic = ast.dump(tree, annotate_fields=True, include_attributes=False)
+    return hashlib.sha256(semantic.encode("utf-8")).hexdigest()
 
 
 def _path_risks(patterns):
@@ -122,7 +211,7 @@ def _path_risks(patterns):
     return inferred
 
 
-def derive_task_policy(task):
+def derive_task_policy(task, project_policy=None):
     work_kind = task.get("work_kind")
     if work_kind not in WORK_KINDS:
         raise ValueError("work_kind must be one of: " + ", ".join(sorted(WORK_KINDS)))
@@ -186,6 +275,32 @@ def derive_task_policy(task):
     else:
         tier = "economy"
         reasons.append("bounded low-risk vertical slice")
+    if tier == "deep":
+        workflow_shape = "hardened"
+    elif (tier == "standard"
+          or work_kind in {"feature", "bugfix", "debug", "refactor",
+                           "integration", "experiment"}):
+        workflow_shape = "standard"
+    else:
+        workflow_shape = "lean"
+    project = validate_project_policy(project_policy)
+    floor = project["workflow_shape_floor"]
+    if WORKFLOW_SHAPE_ORDER[floor] > WORKFLOW_SHAPE_ORDER[workflow_shape]:
+        workflow_shape = floor
+        reasons.append(f"project workflow floor: {floor}")
+    quality_lanes = set()
+    if (workflow_shape in {"standard", "hardened"}
+            and work_kind in {"feature", "bugfix", "debug", "refactor",
+                              "integration", "experiment"}):
+        quality_lanes.add("refactor")
+    if workflow_shape == "hardened":
+        quality_lanes.add("hardening")
+    if effective & {"public-api", "compatibility"}:
+        quality_lanes.add("public-surface-qa")
+    for lane, rule in project["required_quality_lanes"].items():
+        if work_kind in rule["work_kinds"] or effective & set(rule["risk_flags"]):
+            quality_lanes.add(lane)
+            reasons.append(f"project policy requires {lane}")
     return {
         "policy_version": POLICY_VERSION,
         "work_kind": work_kind,
@@ -209,6 +324,8 @@ def derive_task_policy(task):
             "economy": "compact", "standard": "full", "deep": "risk"
         }[tier],
         "require_risk_review": tier == "deep",
+        "workflow_shape": workflow_shape,
+        "required_quality_lanes": sorted(quality_lanes),
         "tdd_required": work_kind in {"feature", "bugfix"},
         "diagnosis_required": work_kind in {"bugfix", "debug"},
         "reasons": reasons,

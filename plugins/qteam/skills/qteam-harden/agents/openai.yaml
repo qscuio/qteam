@@ -1,0 +1,4 @@
+interface:
+  display_name: "QTeam Harden"
+  short_description: "Run conditional refactor, hardening, and public-surface QA gates"
+  default_prompt: "Use $qteam-harden to define and execute the quality lanes required by the frozen QTeam policy."

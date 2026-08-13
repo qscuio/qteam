@@ -34,6 +34,10 @@ Route in this order:
 6. Sufficient approved context: use `to-spec`, then `to-tickets`, then
    `agent-team-dev` execution.
 
+Inside execution, route only policy-triggered quality lanes to `qteam-harden`.
+Do not invoke it as a blanket extra review. The Web UI and optional Herdr pane
+are operator displays over the same run; neither changes this routing order.
+
 Do not invoke Superpowers `executing-plans`, `subagent-driven-development`, or
 Matt-style issue implementation as a second coordinator. During QTeam runs,
 `agent-team-dev` owns phases, workers, merging, reviews, and finish.

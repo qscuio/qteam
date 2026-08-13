@@ -22,7 +22,10 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 
-from agent_team_policy import effective_execution, safe_identifier
+from agent_team_policy import (
+    DEFAULT_PROJECT_POLICY, core_policy_digest, effective_execution,
+    project_policy_digest, safe_identifier,
+)
 from agent_team_artifact import ArtifactError, locked_regular, safe_regular
 from agent_team_eval import (
     codex_version, parse_codex_trace, regular_output, validate_eval_case,
@@ -257,9 +260,21 @@ def cmd_spawn(args, repo, run_dir):
     if task.get("id") != args.task:
         raise SystemExit("error: task record identity mismatch")
     state = read_json(run_dir / "state.json")
-    if state.get("schema_version") != 6:
+    if (state.get("schema_version") != 6
+            or task.get("policy", {}).get("policy_version") != 3
+            or any(field not in state for field in (
+                "project_policy", "policy_layers", "quality_lanes", "work_queue",
+            ))):
         raise SystemExit(
-            "error: run state schema is not current; run migrate-run first"
+            "error: run state/policy contract is not current; run migrate-run first"
+        )
+    core = state.get("policy_layers", [{}])[0]
+    if (not isinstance(core, dict)
+            or core.get("sha256") != core_policy_digest()
+            or core.get("defaults_sha256")
+            != project_policy_digest(DEFAULT_PROJECT_POLICY)):
+        raise SystemExit(
+            "error: frozen core policy differs from this runtime; run migrate-run first"
         )
     allowed_phases = {
         "developer": {"WAVE_RUNNING", "FIXING"},

@@ -138,8 +138,9 @@ The lifecycle command forms are:
 .codex/bin/agent-team-state --run <run> phase READY_TO_FINISH
 ```
 
-`migrate-run` is only for an unfinished schema-version-2/3/4/5 run; current
-schema-version-6 runs do not need it. Every unfinished migrated task must be
+`migrate-run` handles unfinished schema-version-2/3/4/5 runs and schema-version-6
+runs with legacy policy-v2/additive/core-layer identity. It rejects finished,
+publication-sealed, or actively executing runs. Every unfinished migrated task must be
 replanned with explicit dependencies before execution resumes.
 
 `agent-team-check-task` records a passing task as `completed`; do not duplicate

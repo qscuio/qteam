@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qteam.local/schemas/quality-lane.schema.json",
+  "type": "object",
+  "required": ["lane", "required_by", "commands", "status"],
+  "properties": {
+    "lane": {"enum": ["refactor", "hardening", "public-surface-qa"]},
+    "required_by": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}},
+    "commands": {"type": "array", "minItems": 1, "maxItems": 64, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 2048}},
+    "status": {"enum": ["pending", "passed", "failed"]},
+    "head_sha": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+    "results": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"$ref": "#/$defs/result"}},
+    "updated_at": {"type": "string", "minLength": 1},
+    "assessment": {
+      "type": "object",
+      "required": ["outcome", "rationale", "head_sha", "assessed_at"],
+      "properties": {
+        "outcome": {"enum": ["not-needed", "task-created"]},
+        "rationale": {"type": "string", "minLength": 1, "maxLength": 2048},
+        "head_sha": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+        "assessed_at": {"type": "string", "minLength": 1},
+        "task_id": {"type": "string", "pattern": "^(?!.*\\.\\.)(?=.{1,128}$)[A-Za-z0-9][A-Za-z0-9._-]*$"}
+      },
+      "allOf": [{
+        "if": {"properties": {"outcome": {"const": "task-created"}}},
+        "then": {"required": ["task_id"]},
+        "else": {"not": {"required": ["task_id"]}}
+      }],
+      "additionalProperties": false
+    }
+    ,"attempts": {
+      "type": "array", "minItems": 1, "maxItems": 64,
+      "items": {
+        "type": "object",
+        "required": ["attempt", "status", "head_sha", "commands", "results", "updated_at"],
+        "properties": {
+          "attempt": {"type": "integer", "minimum": 1},
+          "status": {"enum": ["passed", "failed"]},
+          "head_sha": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+          "commands": {"type": "array", "minItems": 1, "maxItems": 64, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 2048}},
+          "results": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"$ref": "#/$defs/result"}},
+          "updated_at": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "pending"}}},
+      "then": {"not": {"anyOf": [
+        {"required": ["head_sha"]}, {"required": ["results"]}, {"required": ["updated_at"]}, {"required": ["attempts"]}
+      ]}},
+      "else": {"required": ["head_sha", "results", "updated_at", "attempts"]}
+    }
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "result": {
+      "type": "object",
+      "required": ["command", "exit_code", "head_sha", "log", "log_sha256", "stderr_log", "stderr_sha256", "ts"],
+      "properties": {
+        "command": {"type": "string", "minLength": 1, "maxLength": 2048},
+        "exit_code": {"type": "integer"},
+        "head_sha": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+        "log": {"type": "string", "pattern": "^verifications/quality-wave-[^/]+$"},
+        "log_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "stderr_log": {"type": "string", "pattern": "^verifications/quality-wave-[^/]+\\.stderr$"},
+        "stderr_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "ts": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    }
+  }
+}

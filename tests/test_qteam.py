@@ -9,6 +9,8 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,8 +27,11 @@ EVAL = PLUGIN / "bin/agent_team_eval.py"
 FINISH = PLUGIN / "bin/agent-team-finish.py"
 IMPORT = PLUGIN / "bin/import-agent-learning.py"
 WAKE = PLUGIN / "bin/wake-agent-team.sh"
+WEB = PLUGIN / "bin/agent-team-web.py"
+SESSION = PLUGIN / "bin/agent-team-session.py"
 PROJECT_SETUP = PLUGIN / "scripts/project-setup.py"
 PROJECT_UNINSTALL = PLUGIN / "scripts/project-uninstall.py"
+PROJECT_REFRESH = PLUGIN / "scripts/project-refresh.py"
 QTEAM = SOURCE / "qteam"
 
 
@@ -74,6 +79,10 @@ class RepoCase(unittest.TestCase):
             "depends_on": depends_on, "write_set": write_set,
             "read_set": ["README.md"], "forbidden_paths": ["README.md"],
             "verification": "true", "work_kind": "test", "risk_flags": [],
+            "quality_commands": {
+                "refactor": ["true"], "hardening": ["true"],
+                "public-surface-qa": ["true"],
+            },
         }
 
     def make_task(self, run, task="T01", artifact_kind=None, work_kind=None,
@@ -81,7 +90,8 @@ class RepoCase(unittest.TestCase):
                   test_seams=None, diagnosis_command=None, failure_pattern=None,
                   base_commit=None, wave=1, parallel_group="wave-1",
                   finding_ids=None, experiment=None, required_decisions=None,
-                  handoff=None, depends_on=None, reversibility=None):
+                  handoff=None, depends_on=None, reversibility=None,
+                  quality_commands=None):
         branch = f"agent/{run.name}/{task}"
         worktree = run / "worktrees" / task
         worktree.parent.mkdir(parents=True, exist_ok=True)
@@ -99,6 +109,10 @@ class RepoCase(unittest.TestCase):
             "verification_evidence": [],
             "work_kind": work_kind or ("learning" if artifact_kind else "test"),
             "risk_flags": risk_flags or [],
+            "quality_commands": quality_commands or {
+                "refactor": ["true"], "hardening": ["true"],
+                "public-surface-qa": ["true"],
+            },
         }
         if reversibility is not None:
             record["reversibility"] = reversibility
@@ -147,6 +161,44 @@ class RepoCase(unittest.TestCase):
         self.run_tool(STATE, "--run", str(run), "phase", "PLAN_READY", check=True)
         self.run_tool(STATE, "--run", str(run), "phase", "WAVE_RUNNING",
                       "--wave", "1", check=True)
+
+    def mark_quality_lanes(self, run, head):
+        """Fixture helper for review tests that synthesize merged history."""
+        logs = run / "verifications"
+        logs.mkdir(exist_ok=True)
+        stdout = logs / "quality-wave-fixture.log"
+        stderr = logs / "quality-wave-fixture.log.stderr"
+        stdout.write_bytes(b"")
+        stderr.write_bytes(b"")
+        empty_sha = hashlib.sha256(b"").hexdigest()
+        state_path = run / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        for lanes in state.get("quality_lanes", {}).values():
+            for lane in lanes.values():
+                results = [
+                    {
+                        "command": command, "exit_code": 0,
+                        "head_sha": head,
+                        "log": "verifications/quality-wave-fixture.log",
+                        "log_sha256": empty_sha,
+                        "stderr_log":
+                            "verifications/quality-wave-fixture.log.stderr",
+                        "stderr_sha256": empty_sha,
+                        "ts": "fixture",
+                    }
+                    for command in lane["commands"]
+                ]
+                lane.update({
+                    "status": "passed", "head_sha": head,
+                    "results": results,
+                    "attempts": [{
+                        "attempt": 1, "status": "passed", "head_sha": head,
+                        "commands": list(lane["commands"]),
+                        "results": results, "updated_at": "fixture",
+                    }],
+                    "updated_at": "fixture",
+                })
+        state_path.write_text(json.dumps(state), encoding="utf-8")
 
     def complete_review(self, run, ledger, axis, reviewer, session_id,
                         result_payload=None, check=True, complete_env=None,
@@ -1427,6 +1479,63 @@ class StateTests(RepoCase):
         self.assertEqual(current["tasks"]["T01"]["status"], "pending")
         self.assertEqual(current["policy_migration_pending"], [])
 
+    def test_v6_legacy_immutable_policy_migration_is_monotonic_and_coherent(self):
+        run = self.init_run("legacy-immutable-policy")
+        self.make_task(run, task="T01", work_kind="test")
+        self.run_tool(
+            STATE, "--run", str(run), "task-status", "T01", "superseded",
+            check=True,
+        )
+        task_path = run / "tasks/T01.json"
+        task = json.loads(task_path.read_text(encoding="utf-8"))
+        task["policy"].update({
+            "policy_version": 2,
+            "declared_risk_flags": ["data-loss"],
+            "inferred_risk_flags": ["migration"],
+            "effective_risk_flags": ["data-loss", "migration"],
+            "declared_reversibility": "hard-to-reverse",
+            "inferred_reversibility": "hard-to-reverse",
+            "reversibility": "hard-to-reverse",
+            "blast_radius": "wide", "integration_lane": "human-only",
+            "require_user_finish_decision": True,
+            "execution_tier": "deep", "review_intensity": "risk",
+            "require_risk_review": True, "workflow_shape": "hardened",
+            "required_quality_lanes": ["hardening"],
+            "tdd_required": True, "diagnosis_required": True,
+            "reasons": ["legacy irreversible migration evidence"],
+        })
+        task_path.write_text(json.dumps(task), encoding="utf-8")
+        policy = self.repo / ".qteam/policy.json"
+        policy.parent.mkdir()
+        policy.write_text(json.dumps({
+            "schema_version": 1, "workflow_shape_floor": "standard",
+            "required_quality_lanes": {
+                lane: {"work_kinds": [], "risk_flags": []}
+                for lane in ("refactor", "hardening", "public-surface-qa")
+            },
+        }), encoding="utf-8")
+
+        migrated = self.run_tool(STATE, "--run", str(run), "migrate-run")
+        self.assertEqual(migrated.returncode, 0, migrated.stderr)
+        current = json.loads(task_path.read_text(encoding="utf-8"))["policy"]
+        self.assertEqual(current["policy_version"], 3)
+        self.assertEqual(current["execution_tier"], "deep")
+        self.assertEqual(current["review_intensity"], "risk")
+        self.assertEqual(current["workflow_shape"], "hardened")
+        self.assertEqual(current["reversibility"], "hard-to-reverse")
+        self.assertEqual(current["blast_radius"], "wide")
+        self.assertEqual(current["integration_lane"], "human-only")
+        self.assertTrue(current["require_user_finish_decision"])
+        self.assertTrue(current["require_risk_review"])
+        self.assertTrue(current["tdd_required"])
+        self.assertTrue(current["diagnosis_required"])
+        self.assertEqual(
+            current["effective_risk_flags"], ["data-loss", "migration"]
+        )
+        self.assertIn(
+            "legacy irreversible migration evidence", current["reasons"]
+        )
+
     def test_v2_migration_rebuilds_verified_merged_provenance(self):
         run = self.init_run()
         worktree, _ = self.make_task(run, task="T01", work_kind="test")
@@ -2135,6 +2244,594 @@ class PolicyTests(RepoCase):
         self.assertEqual(event["item_sha256"], hashlib.sha256(encoded).hexdigest())
 
 
+class AdaptiveQualityTests(RepoCase):
+    def project_policy(self, floor="lean", overrides=None):
+        rules = {
+            lane: {"work_kinds": [], "risk_flags": []}
+            for lane in ("refactor", "hardening", "public-surface-qa")
+        }
+        for lane, value in (overrides or {}).items():
+            rules[lane] = value
+        return {
+            "schema_version": 1, "workflow_shape_floor": floor,
+            "required_quality_lanes": rules,
+        }
+
+    def test_adaptive_shapes_and_project_layer_are_frozen_and_monotonic(self):
+        policy_root = self.repo / ".qteam"
+        policy_root.mkdir()
+        policy_path = policy_root / "policy.json"
+        policy_path.write_text(json.dumps(self.project_policy(
+            "standard", {"hardening": {"work_kinds": ["docs"], "risk_flags": []}}
+        )), encoding="utf-8")
+        run = self.init_run("policy-layer")
+        self.make_task(run, task="T01", work_kind="docs",
+                       write_set=["docs/a.md"])
+        first = json.loads((run / "tasks/T01.json").read_text(encoding="utf-8"))
+        state = json.loads((run / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(first["policy"]["workflow_shape"], "standard")
+        self.assertEqual(first["policy"]["required_quality_lanes"], ["hardening"])
+        self.assertEqual([item["kind"] for item in state["policy_layers"]],
+                         ["core", "project"])
+        frozen = state["policy_layers"]
+
+        policy_path.write_text(json.dumps(self.project_policy("hardened")),
+                               encoding="utf-8")
+        self.make_task(run, task="T02", work_kind="docs",
+                       write_set=["docs/b.md"])
+        second = json.loads((run / "tasks/T02.json").read_text(encoding="utf-8"))
+        current = json.loads((run / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(second["policy"]["workflow_shape"], "standard")
+        self.assertEqual(current["policy_layers"], frozen)
+
+        secure = self.init_run("secure-default")
+        self.make_task(secure, task="S01", work_kind="config",
+                       write_set=["src/auth/session.py"])
+        hardened = json.loads((secure / "tasks/S01.json").read_text(encoding="utf-8"))
+        self.assertEqual(hardened["policy"]["workflow_shape"], "hardened")
+        self.assertIn("hardening", hardened["policy"]["required_quality_lanes"])
+
+        policy_path.unlink()
+        refactor = self.init_run("refactor-default")
+        self.make_task(refactor, task="R01", work_kind="refactor",
+                       write_set=["src/model.py"])
+        refactored = json.loads(
+            (refactor / "tasks/R01.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(refactored["policy"]["workflow_shape"], "standard")
+        self.assertEqual(refactored["policy"]["required_quality_lanes"],
+                         ["refactor"])
+
+    def test_project_policy_rejects_boolean_version_and_unhashable_rules_cleanly(self):
+        policy_root = self.repo / ".qteam"
+        policy_root.mkdir()
+        for index, malformed in enumerate((
+            {**self.project_policy(), "schema_version": True},
+            {
+                **self.project_policy(),
+                "required_quality_lanes": {
+                    **self.project_policy()["required_quality_lanes"],
+                    "hardening": {"work_kinds": [{}], "risk_flags": []},
+                },
+            },
+        )):
+            (policy_root / "policy.json").write_text(
+                json.dumps(malformed), encoding="utf-8"
+            )
+            rejected = self.run_tool(
+                STATE, "--run", f"bad-project-policy-{index}", "init", "--goal", "x"
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertNotIn("Traceback", rejected.stderr)
+            self.assertFalse(
+                (self.repo / f".agents/runs/bad-project-policy-{index}").exists()
+            )
+
+    def test_quality_lane_blocks_review_until_current_head_replay_passes(self):
+        run = self.init_run("quality-run")
+        worktree, _ = self.make_task(
+            run, task="T01", work_kind="integration",
+            quality_commands={"refactor": ["test -f app.txt"]},
+        )
+        integration = "agent/quality-run/integration"
+        integration_worktree = run / "worktrees/integration"
+        self.run_git("worktree", "add", "-b", integration,
+                     str(integration_worktree), "HEAD")
+        self.start_wave(run)
+        self.run_tool(STATE, "--run", str(run), "task-status", "T01", "running",
+                      check=True)
+        (worktree / "app.txt").write_text("quality\n", encoding="utf-8")
+        self.run_git("add", "app.txt", cwd=worktree)
+        self.run_git("commit", "-m", "quality task", cwd=worktree)
+        task_head = self.run_git("rev-parse", "HEAD", cwd=worktree).stdout.strip()
+        self.run_tool(STATE, "--run", str(run), "verify-task", "T01", check=True)
+        self.run_tool(STATE, "--run", str(run), "phase", "WAVE_VALIDATING", check=True)
+        self.run_tool(CHECK, "--run", str(run), "--task", "T01", check=True)
+        self.run_tool(STATE, "--run", str(run), "phase", "WAVE_MERGING", check=True)
+        self.run_git("cherry-pick", task_head, cwd=integration_worktree)
+        head = self.run_git("rev-parse", "HEAD", cwd=integration_worktree).stdout.strip()
+        self.run_tool(STATE, "--run", str(run), "task-status", "T01", "merged",
+                      "--commit", head, check=True)
+        self.run_tool(STATE, "--run", str(run), "phase", "INTEGRATION_TESTING",
+                      check=True)
+        blocked = self.run_tool(
+            STATE, "--run", str(run), "phase", "REVIEWING"
+        )
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn("lacks required quality lanes", blocked.stderr)
+        self.run_tool(
+            STATE, "--run", str(run), "quality-assess", "--wave", "1",
+            "--lane", "refactor", "--outcome", "not-needed",
+            "--rationale", "post-GREEN inspection found no simpler ownership boundary",
+            check=True,
+        )
+        checked = self.run_tool(
+            STATE, "--run", str(run), "quality-check", "--wave", "1",
+            "--lane", "refactor",
+        )
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        evidence = json.loads(checked.stdout)
+        self.assertEqual(evidence["head_sha"], head)
+        self.assertEqual(evidence["status"], "passed")
+        persisted = json.loads((run / "state.json").read_text(encoding="utf-8"))
+        log = run / persisted["quality_lanes"]["1"]["refactor"]["results"][0]["log"]
+        original_log = log.read_bytes()
+        log.write_bytes(original_log + b"tampered\n")
+        stale = self.run_tool(
+            STATE, "--run", str(run), "phase", "REVIEWING"
+        )
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertIn("evidence digest changed", stale.stderr)
+        log.write_bytes(original_log)
+        self.run_tool(STATE, "--run", str(run), "phase", "REVIEWING", check=True)
+        state = json.loads((run / "state.json").read_text(encoding="utf-8"))
+        for axis, source_flag in (("spec", "--spec-source"),
+                                  ("standards", "--standards-source")):
+            self.run_tool(
+                REVIEW, "--run", str(run), "create", "--wave", "1",
+                "--axis", axis, "--base", state["base_commit"],
+                "--head", integration, source_flag, "README.md", check=True,
+            )
+            ledger = run / f"reviews/wave-1-{axis}.json"
+            self.complete_review(
+                run, ledger, axis, f"{axis}-reviewer", f"{axis}-quality-session"
+            )
+        self.run_tool(
+            REVIEW, "--run", str(run), "check", "--wave", "1",
+            "--head", integration, check=True,
+        )
+        self.run_tool(STATE, "--run", str(run), "phase", "LEARNING_EXPORT",
+                      check=True)
+        self.run_tool(STATE, "--run", str(run), "verify-final", "--command", "true",
+                      check=True)
+        self.run_tool(STATE, "--run", str(run), "boundary-check", check=True)
+        self.run_tool(
+            STATE, "--run", str(run), "gate", "learning", "skipped",
+            "--evidence", "quality lifecycle test", check=True,
+        )
+        self.run_tool(STATE, "--run", str(run), "phase", "READY_TO_FINISH",
+                      check=True)
+        log.write_bytes(original_log + b"tampered after READY\n")
+        finish = self.run_tool(
+            STATE, "--run", str(run), "finish", "--check-only"
+        )
+        self.assertNotEqual(finish.returncode, 0)
+        self.assertIn("evidence digest changed", finish.stderr)
+
+    def test_quality_log_symlink_is_rejected_without_clobber(self):
+        run = self.init_run("quality-symlink")
+        self.make_task(
+            run, task="T01", work_kind="integration",
+            quality_commands={"refactor": ["true"]},
+        )
+        integration = "agent/quality-symlink/integration"
+        integration_worktree = run / "worktrees/integration"
+        self.run_git("worktree", "add", "-b", integration,
+                     str(integration_worktree), "HEAD")
+        state_path = run / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["phase"] = "INTEGRATION_TESTING"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        outside = Path(self.tmp.name) / "outside.log"
+        outside.write_text("preserve", encoding="utf-8")
+        logs = run / "verifications"
+        logs.mkdir()
+        (logs / "quality-wave-1-refactor-attempt-1-1.log").symlink_to(outside)
+        self.run_tool(
+            STATE, "--run", str(run), "quality-assess", "--wave", "1",
+            "--lane", "refactor", "--outcome", "not-needed",
+            "--rationale", "no behavior-preserving simplification remains", check=True,
+        )
+        result = self.run_tool(
+            STATE, "--run", str(run), "quality-check", "--wave", "1",
+            "--lane", "refactor",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(outside.read_text(encoding="utf-8"), "preserve")
+
+    def test_quality_aggregate_timeout_is_a_durable_failed_attempt(self):
+        run = self.init_run("quality-timeout")
+        self.make_task(
+            run, task="T01", work_kind="refactor",
+            quality_commands={"refactor": ["printf should-not-run"]},
+        )
+        integration = "agent/quality-timeout/integration"
+        integration_worktree = run / "worktrees/integration"
+        self.run_git(
+            "worktree", "add", "-b", integration,
+            str(integration_worktree), "HEAD",
+        )
+        state_path = run / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["phase"] = "INTEGRATION_TESTING"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        self.run_tool(
+            STATE, "--run", str(run), "quality-assess", "--wave", "1",
+            "--lane", "refactor", "--outcome", "not-needed",
+            "--rationale", "bounded inspection found no simplification",
+            check=True,
+        )
+        env = os.environ.copy()
+        env["QTEAM_TEST_FORCE_QUALITY_TIMEOUT"] = "1"
+        timed_out = self.run_tool(
+            STATE, "--run", str(run), "quality-check", "--wave", "1",
+            "--lane", "refactor", env=env,
+        )
+        self.assertEqual(timed_out.returncode, 124)
+        self.assertNotIn("Traceback", timed_out.stderr)
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        lane = state["quality_lanes"]["1"]["refactor"]
+        self.assertEqual(lane["status"], "failed")
+        self.assertEqual(lane["attempts"][0]["attempt"], 1)
+        self.assertEqual(lane["attempts"][0]["results"][0]["exit_code"], 124)
+        error_log = run / lane["results"][0]["stderr_log"]
+        self.assertIn("aggregate timeout", error_log.read_text(encoding="utf-8"))
+
+    def test_quality_command_cannot_pass_by_mutating_integration_checkout(self):
+        run = self.init_run("quality-mutation")
+        self.make_task(
+            run, task="T01", work_kind="integration",
+            quality_commands={"refactor": ["echo mutation >> README.md; true"]},
+        )
+        integration = "agent/quality-mutation/integration"
+        integration_worktree = run / "worktrees/integration"
+        self.run_git("worktree", "add", "-b", integration,
+                     str(integration_worktree), "HEAD")
+        state_path = run / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["phase"] = "INTEGRATION_TESTING"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        self.run_tool(
+            STATE, "--run", str(run), "quality-assess", "--wave", "1",
+            "--lane", "refactor", "--outcome", "not-needed",
+            "--rationale", "no behavior-preserving simplification remains", check=True,
+        )
+        rejected = self.run_tool(
+            STATE, "--run", str(run), "quality-check", "--wave", "1",
+            "--lane", "refactor",
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("mutated tracked integration content", rejected.stderr)
+        self.assertEqual(
+            self.run_git("status", "--porcelain=v1", cwd=integration_worktree).stdout,
+            "",
+        )
+
+    def test_coordinator_queue_claims_only_one_highest_priority_batch(self):
+        run = self.init_run("queue-run")
+        self.make_task(run, task="T01", work_kind="test")
+
+        def put(item_id, priority):
+            path = self.repo / f"{item_id}.json"
+            path.write_text(json.dumps({
+                "id": item_id, "kind": "task", "targets": ["T01"],
+                "priority": priority,
+            }), encoding="utf-8")
+            result = self.run_tool(
+                STATE, "--run", str(run), "queue-put", "--file", str(path)
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+        put("Q-low", 5)
+        put("Q-high-a", 1)
+        put("Q-high-b", 1)
+        claimed = self.run_tool(
+            STATE, "--run", str(run), "queue-claim", "--consumer", "coordinator",
+            "--limit", "8",
+        )
+        self.assertEqual(claimed.returncode, 0, claimed.stderr)
+        values = json.loads(claimed.stdout)
+        self.assertEqual([item["id"] for item in values], ["Q-high-a", "Q-high-b"])
+        self.run_tool(
+            STATE, "--run", str(run), "queue-complete", "Q-high-a",
+            "--consumer", "coordinator", "--outcome", "completed",
+            "--evidence", "task was integrated", check=True,
+        )
+        status = json.loads(self.run_tool(
+            STATE, "--run", str(run), "queue-status", check=True
+        ).stdout)
+        self.assertEqual({item["id"]: item["status"] for item in status}, {
+            "Q-low": "pending", "Q-high-a": "completed", "Q-high-b": "claimed",
+        })
+        rejected = self.run_tool(
+            STATE, "--run", str(run), "queue-claim",
+            "--consumer", "worker-T01", "--limit", "1",
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("consumer=coordinator", rejected.stderr)
+
+    def test_refactor_assessment_is_current_head_and_wave_owned(self):
+        run = self.init_run("refactor-assessment")
+        self.make_task(
+            run, task="R01", wave=1, work_kind="refactor",
+            quality_commands={"refactor": ["true"]},
+        )
+        self.make_task(
+            run, task="R02", wave=2, work_kind="refactor",
+            quality_commands={"refactor": ["true"]},
+        )
+        integration = "agent/refactor-assessment/integration"
+        integration_worktree = run / "worktrees/integration"
+        self.run_git("worktree", "add", "-b", integration,
+                     str(integration_worktree), "HEAD")
+        task_path = run / "tasks/R02.json"
+        task = json.loads(task_path.read_text(encoding="utf-8"))
+        task["status"] = "merged"
+        task_path.write_text(json.dumps(task), encoding="utf-8")
+        state_path = run / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["phase"] = "INTEGRATION_TESTING"
+        state["tasks"]["R02"]["status"] = "merged"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        cross_wave = self.run_tool(
+            STATE, "--run", str(run), "quality-assess", "--wave", "1",
+            "--lane", "refactor", "--outcome", "task-created",
+            "--task", "R02", "--rationale", "reuse wave two cleanup",
+        )
+        self.assertNotEqual(cross_wave.returncode, 0)
+        accepted = self.run_tool(
+            STATE, "--run", str(run), "quality-assess", "--wave", "1",
+            "--lane", "refactor", "--outcome", "not-needed",
+            "--rationale", "bounded inspection found ownership already local",
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertEqual(
+            json.loads(accepted.stdout)["head_sha"],
+            self.run_git("rev-parse", "HEAD", cwd=integration_worktree).stdout.strip(),
+        )
+
+    def test_quality_attempt_history_survives_owned_refactor_task_addition(self):
+        run = self.init_run("quality-history")
+        self.make_task(
+            run, task="R01", work_kind="refactor",
+            quality_commands={"refactor": ["true"]},
+        )
+        logs = run / "verifications"
+        logs.mkdir()
+        stdout = logs / "quality-wave-1-refactor-attempt-1-1.log"
+        stderr = logs / "quality-wave-1-refactor-attempt-1-1.log.stderr"
+        stdout.write_text("failed\n", encoding="utf-8")
+        stderr.write_text("", encoding="utf-8")
+        state_path = run / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        lane = state["quality_lanes"]["1"]["refactor"]
+        result = {
+            "command": "true", "exit_code": 1,
+            "head_sha": state["base_commit"],
+            "log": str(stdout.relative_to(run)),
+            "log_sha256": hashlib.sha256(stdout.read_bytes()).hexdigest(),
+            "stderr_log": str(stderr.relative_to(run)),
+            "stderr_sha256": hashlib.sha256(stderr.read_bytes()).hexdigest(),
+            "ts": "attempt-1",
+        }
+        receipt = {
+            "attempt": 1, "status": "failed", "head_sha": state["base_commit"],
+            "commands": ["true"], "results": [result],
+            "updated_at": "attempt-1",
+        }
+        lane.update({
+            "status": "failed", "head_sha": state["base_commit"],
+            "results": [result], "attempts": [receipt],
+            "updated_at": "attempt-1",
+        })
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        self.make_task(
+            run, task="R02", work_kind="refactor",
+            quality_commands={"refactor": ["true", "printf extra"]},
+        )
+        rebuilt = json.loads(state_path.read_text(encoding="utf-8"))[
+            "quality_lanes"
+        ]["1"]["refactor"]
+        self.assertEqual(rebuilt["required_by"], ["R01", "R02"])
+        self.assertEqual(rebuilt["commands"], ["true", "printf extra"])
+        self.assertEqual(rebuilt["attempts"], [receipt])
+        self.assertEqual(stdout.read_text(encoding="utf-8"), "failed\n")
+
+    def test_queue_rejects_unhashable_targets_without_traceback(self):
+        run = self.init_run("queue-malformed")
+        source = self.repo / "bad-queue.json"
+        source.write_text(json.dumps({
+            "id": "Q-bad", "kind": "research", "targets": [{}], "priority": 1,
+        }), encoding="utf-8")
+        result = self.run_tool(
+            STATE, "--run", str(run), "queue-put", "--file", str(source)
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+
+
+class OperatorSurfaceTests(RepoCase):
+    def start_web(self, run, *extra):
+        process = subprocess.Popen(
+            [sys.executable, str(WEB), "--repo", str(self.repo), "--run", run.name,
+             "--port", "0", *extra], cwd=self.repo, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        line = process.stdout.readline().strip()
+        self.assertIn("QTeam Web: http://", line)
+        return process, line.split("QTeam Web: ", 1)[1]
+
+    def test_web_serves_redacted_snapshot_and_requires_csrf_for_actions(self):
+        run = self.init_run("web-run")
+        self.make_task(run, task="T01", work_kind="integration")
+        queue_file = self.repo / "web-queue.json"
+        queue_file.write_text(json.dumps({
+            "id": "Q-web", "kind": "task", "targets": ["T01"], "priority": 1,
+        }), encoding="utf-8")
+        self.run_tool(
+            STATE, "--run", str(run), "queue-put", "--file", str(queue_file),
+            check=True,
+        )
+        self.run_tool(
+            STATE, "--run", str(run), "queue-claim", "--consumer", "coordinator",
+            check=True,
+        )
+        self.run_tool(
+            STATE, "--run", str(run), "queue-complete", "Q-web",
+            "--consumer", "coordinator", "--outcome", "completed",
+            "--evidence", "sensitive bounded evidence", check=True,
+        )
+        process, url = self.start_web(run)
+        try:
+            runs = json.loads(urllib.request.urlopen(
+                url + "api/runs", timeout=3).read().decode("utf-8"))
+            self.assertEqual([item["run_id"] for item in runs["runs"]], ["web-run"])
+            snap = json.loads(urllib.request.urlopen(
+                url + "api/runs/web-run/snapshot", timeout=3).read().decode("utf-8"))
+            self.assertFalse(snap["raw_logs_enabled"])
+            self.assertEqual(snap["tasks"][0]["id"], "T01")
+            self.assertNotIn("stdout", snap["workers"])
+            self.assertNotIn("commands", snap["quality_lanes"]["1"]["refactor"])
+            self.assertEqual(snap["quality_lanes"]["1"]["refactor"]["command_count"], 1)
+            self.assertNotIn("evidence", snap["work_queue"][0])
+
+            origin = url.rstrip("/")
+            request = urllib.request.Request(
+                url + "api/runs/web-run/actions/finish-check", data=b"{}",
+                method="POST", headers={
+                    "Content-Type": "application/json", "Origin": origin,
+                },
+            )
+            with self.assertRaises(urllib.error.HTTPError) as blocked:
+                urllib.request.urlopen(request, timeout=3)
+            self.assertEqual(blocked.exception.code, 401)
+
+            config = json.loads(urllib.request.urlopen(
+                url + "api/config", timeout=3).read().decode("utf-8"))
+            self.assertFalse(config["controls_enabled"])
+            request.add_header("X-QTeam-CSRF", config["csrf"])
+            with self.assertRaises(urllib.error.HTTPError) as gated:
+                urllib.request.urlopen(request, timeout=3)
+            self.assertEqual(gated.exception.code, 401)
+        finally:
+            process.terminate()
+            process.wait(timeout=5)
+            process.stdout.close()
+            process.stderr.close()
+
+    def test_web_requires_private_token_for_non_loopback_bind(self):
+        run = self.init_run("remote-web")
+        result = self.run_tool(
+            WEB, "--repo", str(self.repo), "--run", run.name,
+            "--host", "0.0.0.0", "--snapshot-once",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("binds loopback only", result.stderr)
+
+    def test_web_token_enables_bounded_control_action(self):
+        run = self.init_run("web-control")
+        token = "qteam-test-token-0123456789abcdef"
+        token_path = Path(self.tmp.name) / "qteam.token"
+        token_path.write_text(token + "\n", encoding="utf-8")
+        token_path.chmod(0o600)
+        process, url = self.start_web(
+            run, "--token-file", str(token_path)
+        )
+        try:
+            headers = {"Authorization": f"Bearer {token}"}
+            config = json.loads(urllib.request.urlopen(
+                urllib.request.Request(url + "api/config", headers=headers),
+                timeout=3,
+            ).read().decode("utf-8"))
+            self.assertTrue(config["controls_enabled"])
+            action = urllib.request.Request(
+                url + "api/runs/web-control/actions/finish-check", data=b"{}",
+                method="POST", headers={
+                    **headers, "Content-Type": "application/json",
+                    "Origin": url.rstrip("/"), "X-QTeam-CSRF": config["csrf"],
+                },
+            )
+            with self.assertRaises(urllib.error.HTTPError) as gated:
+                urllib.request.urlopen(action, timeout=3)
+            self.assertEqual(gated.exception.code, 409)
+            self.assertFalse(json.loads(
+                gated.exception.read().decode("utf-8")
+            )["ok"])
+        finally:
+            process.terminate()
+            process.wait(timeout=5)
+            process.stdout.close()
+            process.stderr.close()
+
+    def test_web_refuses_hardlinked_state_instead_of_disclosing_it(self):
+        run = self.init_run("hardlink-web")
+        outside = Path(self.tmp.name) / "state-copy.json"
+        os.link(run / "state.json", outside)
+        rejected = self.run_tool(
+            WEB, "--repo", str(self.repo), "--run", run.name, "--snapshot-once"
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("singly-linked regular file", rejected.stderr)
+        outside.unlink()
+
+    def test_herdr_adapter_is_display_only_and_never_falls_back_to_tmux(self):
+        run = self.init_run("herdr-run")
+        fake_root = Path(self.tmp.name) / "herdr-bin"
+        fake_root.mkdir()
+        log = Path(self.tmp.name) / "herdr-calls.jsonl"
+        fake = fake_root / "herdr"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "args=sys.argv[1:]\n"
+            "with Path(os.environ['HERDR_TEST_LOG']).open('a') as out: out.write(json.dumps(args)+'\\n')\n"
+            "if args==['--version']: print('herdr 0.test')\n"
+            "elif args[:2]==['pane','split']: print(json.dumps({'result':{'pane':{'pane_id':'w1:p2'}}}))\n"
+            "elif args[:2]==['pane','wait-output']: print(json.dumps({'result':{'matched':True}}))\n"
+            "else: print(json.dumps({'result':{}}))\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+        env = os.environ.copy()
+        env.update({
+            "PATH": f"{fake_root}:{env['PATH']}", "HERDR_ENV": "1",
+            "HERDR_TEST_LOG": str(log),
+        })
+        opened = self.run_tool(
+            SESSION, "open", "--repo", str(self.repo), "--run", run.name,
+            "--mode", "watch", env=env,
+        )
+        self.assertEqual(opened.returncode, 0, opened.stderr)
+        payload = json.loads(opened.stdout)
+        self.assertEqual(payload["authority"], "display-only")
+        calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        launched = next(call for call in calls if call[:2] == ["pane", "run"])
+        self.assertIn("agent-team-web", launched[3])
+        self.assertIn("--watch", launched[3])
+        self.assertNotIn("codex exec", launched[3])
+        self.assertNotIn("tmux", " ".join(" ".join(call) for call in calls))
+
+        outside = dict(env)
+        outside.pop("HERDR_ENV")
+        rejected = self.run_tool(
+            SESSION, "open", "--repo", str(self.repo), "--run", run.name,
+            env=outside,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("Herdr-managed pane", rejected.stderr)
+
+
 class WorkerTests(RepoCase):
     def test_worker_rejects_symlinked_workers_root_before_writing(self):
         run = self.init_run("worker-root-symlink")
@@ -2661,6 +3358,33 @@ class WorkerTests(RepoCase):
 
 
 class MethodEvidenceTests(RepoCase):
+    def test_shared_stream_receipt_rejects_stdout_or_stderr_tampering(self):
+        run = self.init_run("stream-receipt")
+        logs = run / "verifications"
+        logs.mkdir()
+        stdout = logs / "receipt.log"
+        stderr = logs / "receipt.log.stderr"
+        stdout.write_text("green\n", encoding="utf-8")
+        stderr.write_text("warning\n", encoding="utf-8")
+        receipt = {
+            "stream_schema_version": 1,
+            "log": str(stdout.relative_to(run)),
+            "log_sha256": hashlib.sha256(stdout.read_bytes()).hexdigest(),
+            "stderr_log": str(stderr.relative_to(run)),
+            "stderr_sha256": hashlib.sha256(stderr.read_bytes()).hexdigest(),
+        }
+        spec = importlib.util.spec_from_file_location("qteam_state_stream_test", STATE)
+        module = importlib.util.module_from_spec(spec)
+        sys.path.insert(0, str(PLUGIN / "bin"))
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            sys.path.pop(0)
+        module.validate_stream_evidence(run, receipt)
+        stderr.write_text("tampered\n", encoding="utf-8")
+        with self.assertRaises(SystemExit):
+            module.validate_stream_evidence(run, receipt)
+
     def test_experiment_establishes_pending_baseline_and_replays_final_controls(self):
         (self.repo / "score.txt").write_text("1\n", encoding="utf-8")
         self.run_git("add", "score.txt")
@@ -2937,7 +3661,7 @@ class MethodEvidenceTests(RepoCase):
         (worktree / "tests/check.sh").write_text(
             "#!/bin/sh\n"
             "if test -f app.txt; then exit 0; fi\n"
-            "echo APP_MISSING\n"
+            "echo APP_MISSING >&2\n"
             "exit 1\n",
             encoding="utf-8",
         )
@@ -2958,6 +3682,7 @@ class MethodEvidenceTests(RepoCase):
         self.assertEqual(evidence["seam_id"], "app-exists")
         self.assertNotEqual(evidence["red_exit_code"], 0)
         self.assertEqual(evidence["green_exit_code"], 0)
+        self.assertIn("red_stderr_log", evidence)
         verified = self.run_tool(STATE, "--run", str(run), "verify-task", "T01")
         self.assertEqual(verified.returncode, 0, verified.stderr)
         self.run_tool(STATE, "--run", str(run), "phase", "WAVE_VALIDATING",
@@ -2968,7 +3693,7 @@ class MethodEvidenceTests(RepoCase):
     def test_diagnosis_replays_frozen_repro_and_records_ranked_chain(self):
         run = self.init_run()
         command = ("if test -f app.txt; then exit 0; fi; "
-                   "echo BUG_REPRO; exit 1")
+                   "echo BUG_REPRO >&2; exit 1")
         worktree, record = self.make_task(
             run, work_kind="debug", verification="test -f app.txt",
             diagnosis_command=command, failure_pattern="BUG_REPRO",
@@ -3010,6 +3735,7 @@ class MethodEvidenceTests(RepoCase):
         task = json.loads((run / "tasks/T01.json").read_text(encoding="utf-8"))
         self.assertNotEqual(task["diagnosis_evidence"]["repro_exit_code"], 0)
         self.assertEqual(task["diagnosis_evidence"]["failure_pattern"], "BUG_REPRO")
+        self.assertIn("repro_stderr_log", task["diagnosis_evidence"])
         (worktree / "app.txt").write_text("fixed\n", encoding="utf-8")
         self.run_git("add", "app.txt", cwd=worktree)
         self.run_git("commit", "-m", "fix: create app", cwd=worktree)
@@ -3986,6 +4712,7 @@ class ReviewTests(RepoCase):
         state = json.loads(state_path.read_text(encoding="utf-8"))
         state["tasks"]["T01"]["status"] = "merged"
         state_path.write_text(json.dumps(state), encoding="utf-8")
+        self.mark_quality_lanes(run, merge_commit)
         for axis, flag in (("spec", "--spec-source"),
                            ("standards", "--standards-source")):
             self.run_tool(
@@ -4063,6 +4790,9 @@ class ReviewTests(RepoCase):
                        write_set=["docs/guide.md"], wave=2)
         integration = "agent/test-run/integration"
         self.run_git("branch", integration, "HEAD")
+        self.mark_quality_lanes(
+            run, self.run_git("rev-parse", integration).stdout.strip()
+        )
         for wave, axes in ((1, ("spec", "standards", "risk")),
                            (2, ("spec", "standards"))):
             for axis in axes:
@@ -4089,6 +4819,9 @@ class ReviewTests(RepoCase):
         self.make_task(run, work_kind="config", write_set=["src/auth/**"])
         integration = "agent/test-run/integration"
         self.run_git("branch", integration, "HEAD")
+        self.mark_quality_lanes(
+            run, self.run_git("rev-parse", integration).stdout.strip()
+        )
         for axis, source_flag, reviewer in (
             ("spec", "--spec-source", "spec-reviewer"),
             ("standards", "--standards-source", "standards-reviewer"),
@@ -4599,6 +5332,18 @@ class FinishTests(RepoCase):
 
 
 class InvariantTests(RepoCase):
+    def write_prepared_v2_intent(self, run, intent):
+        digest = hashlib.sha256(json.dumps(
+            intent, sort_keys=True, separators=(",", ":")
+        ).encode()).hexdigest()
+        with (run / "events.jsonl").open("a", encoding="utf-8") as events:
+            events.write(json.dumps({
+                "event": "transaction_prepared",
+                "prepared_txid": intent["txid"],
+                "transaction_sha256": digest,
+            }) + "\n")
+        (run / ".transaction.json").write_text(json.dumps(intent), encoding="utf-8")
+
     def test_schema6_wal_cannot_drop_security_and_execution_core(self):
         run = self.init_run("v6-wal-core")
         state_path = run / "state.json"
@@ -4641,6 +5386,223 @@ class InvariantTests(RepoCase):
         self.assertIn("legacy run transactions", rejected.stderr)
         self.assertEqual(json.loads(state_path.read_text(encoding="utf-8")), original)
         self.assertTrue(intent_path.exists())
+
+    def test_prepared_v2_wal_cannot_hide_unrelated_phase_or_queue_mutation(self):
+        run = self.init_run("forged-v2-modes")
+        state_path = run / "state.json"
+        original = json.loads(state_path.read_text(encoding="utf-8"))
+        phase = json.loads(json.dumps(original))
+        phase["phase"] = "SPEC_READY"
+        phase["risk_forced"] = True
+        intent = {
+            "schema_version": 2, "txid": "forged-v2-phase",
+            "writes": {"state.json": phase},
+            "event": {"event": "phase", "from": "INIT", "to": "SPEC_READY"},
+        }
+        self.write_prepared_v2_intent(run, intent)
+        rejected = self.run_tool(STATE, "--run", str(run), "show")
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("cannot mutate risk_forced", rejected.stderr)
+        self.assertEqual(json.loads(state_path.read_text(encoding="utf-8")), original)
+
+        (run / ".transaction.json").unlink()
+        queue = json.loads(json.dumps(original))
+        queue["phase"] = "SPEC_READY"
+        queue["work_queue"] = [{
+            "schema_version": 1, "id": "Q1", "kind": "research",
+            "targets": ["frontier"], "priority": 1, "status": "pending",
+            "created_at": "fixture",
+        }]
+        intent = {
+            "schema_version": 2, "txid": "forged-v2-queue",
+            "writes": {"state.json": queue},
+            "event": {"event": "queue_put", "item": "Q1", "kind": "research"},
+        }
+        self.write_prepared_v2_intent(run, intent)
+        rejected = self.run_tool(STATE, "--run", str(run), "show")
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("cannot mutate phase", rejected.stderr)
+        self.assertEqual(json.loads(state_path.read_text(encoding="utf-8")), original)
+
+    def test_prepared_v2_wal_cannot_inject_legacy_task_evidence(self):
+        run = self.init_run("forged-task-evidence")
+        self.make_task(run, work_kind="test")
+        self.start_wave(run)
+        self.run_tool(
+            STATE, "--run", str(run), "task-status", "T01", "running",
+            check=True,
+        )
+        task_path = run / "tasks/T01.json"
+        original = json.loads(task_path.read_text(encoding="utf-8"))
+        forged = json.loads(json.dumps(original))
+        forged["verification_evidence"] = [{
+            "command": "true", "exit_code": 0,
+            "head_sha": self.run_git("rev-parse", "HEAD").stdout.strip(),
+            "log": "verifications/forged.log", "ts": "forged",
+        }]
+        receipt = forged["verification_evidence"][0]
+        intent = {
+            "schema_version": 2, "txid": "forged-task-evidence",
+            "writes": {"tasks/T01.json": forged},
+            "event": {
+                "event": "task_verification", "task": "T01",
+                "exit_code": 0, "head_sha": receipt["head_sha"],
+                "log": receipt["log"],
+                "receipt_sha256": hashlib.sha256(json.dumps(
+                    receipt, sort_keys=True, separators=(",", ":")
+                ).encode()).hexdigest(),
+                "diagnosis_sha256": None,
+            },
+        }
+        self.write_prepared_v2_intent(run, intent)
+        rejected = self.run_tool(STATE, "--run", str(run), "show")
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("versioned stream evidence", rejected.stderr)
+        self.assertEqual(json.loads(task_path.read_text(encoding="utf-8")), original)
+
+    def test_prepared_v2_wal_cannot_inject_wrong_versioned_verification(self):
+        run = self.init_run("forged-versioned-evidence")
+        self.make_task(run, work_kind="test", verification="true")
+        self.start_wave(run)
+        self.run_tool(
+            STATE, "--run", str(run), "task-status", "T01", "running",
+            check=True,
+        )
+        task_path = run / "tasks/T01.json"
+        original = json.loads(task_path.read_text(encoding="utf-8"))
+        logs = run / "verifications"
+        logs.mkdir()
+        stdout = logs / "forged-versioned.log"
+        stderr = logs / "forged-versioned.log.stderr"
+        stdout.write_text("invented\n", encoding="utf-8")
+        stderr.write_text("", encoding="utf-8")
+        head = self.run_git("rev-parse", original["branch"]).stdout.strip()
+        receipt = {
+            "stream_schema_version": 1, "command": "false",
+            "exit_code": 0, "head_sha": head, "ts": "forged",
+            "log": str(stdout.relative_to(run)),
+            "log_sha256": hashlib.sha256(stdout.read_bytes()).hexdigest(),
+            "stderr_log": str(stderr.relative_to(run)),
+            "stderr_sha256": hashlib.sha256(stderr.read_bytes()).hexdigest(),
+        }
+        forged = json.loads(json.dumps(original))
+        forged["verification_evidence"] = [receipt]
+        intent = {
+            "schema_version": 2, "txid": "forged-versioned-evidence",
+            "writes": {"tasks/T01.json": forged},
+            "event": {
+                "event": "task_verification", "task": "T01",
+                "exit_code": 0, "head_sha": head, "log": receipt["log"],
+                "receipt_sha256": hashlib.sha256(json.dumps(
+                    receipt, sort_keys=True, separators=(",", ":")
+                ).encode()).hexdigest(),
+                "diagnosis_sha256": None,
+            },
+        }
+        self.write_prepared_v2_intent(run, intent)
+        rejected = self.run_tool(STATE, "--run", str(run), "show")
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("malformed task verification evidence", rejected.stderr)
+        self.assertEqual(json.loads(task_path.read_text(encoding="utf-8")), original)
+
+    def test_prepared_v2_task_check_binds_exact_check_receipt(self):
+        run = self.init_run("forged-task-check")
+        self.make_task(run, work_kind="test")
+        self.start_wave(run)
+        self.run_tool(
+            STATE, "--run", str(run), "task-status", "T01", "running",
+            check=True,
+        )
+        task_path = run / "tasks/T01.json"
+        state_path = run / "state.json"
+        original_task = json.loads(task_path.read_text(encoding="utf-8"))
+        original_state = json.loads(state_path.read_text(encoding="utf-8"))
+        head = self.run_git("rev-parse", "HEAD").stdout.strip()
+        updated_task = json.loads(json.dumps(original_task))
+        check = {
+            "status": "passed", "base_sha": head, "head_sha": head,
+            "evidence": "forged evidence", "checked_at": "forged",
+        }
+        updated_task.update({"status": "completed", "check_result": check})
+        updated_state = json.loads(json.dumps(original_state))
+        updated_state["tasks"]["T01"]["status"] = "completed"
+        intent = {
+            "schema_version": 2, "txid": "forged-task-check",
+            "writes": {
+                "tasks/T01.json": updated_task, "state.json": updated_state,
+            },
+            "event": {
+                "event": "task_check", "task": "T01", "result": "passed",
+                "base": head, "head": head, "from": "running",
+                "to": "completed", "evidence": "different evidence",
+                "check_sha256": hashlib.sha256(json.dumps(
+                    check, sort_keys=True, separators=(",", ":")
+                ).encode()).hexdigest(),
+            },
+        }
+        self.write_prepared_v2_intent(run, intent)
+        rejected = self.run_tool(STATE, "--run", str(run), "show")
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("receipt differs from its event", rejected.stderr)
+        self.assertEqual(
+            json.loads(task_path.read_text(encoding="utf-8")), original_task
+        )
+        self.assertEqual(
+            json.loads(state_path.read_text(encoding="utf-8")), original_state
+        )
+
+    def test_prepared_v2_task_check_rejects_obsolete_verified_head(self):
+        run = self.init_run("stale-task-check")
+        worktree, _ = self.make_task(run, work_kind="test")
+        self.start_wave(run)
+        self.run_tool(
+            STATE, "--run", str(run), "task-status", "T01", "running",
+            check=True,
+        )
+        (worktree / "app.txt").write_text("verified\n", encoding="utf-8")
+        self.run_git("add", "app.txt", cwd=worktree)
+        self.run_git("commit", "-m", "verified head", cwd=worktree)
+        self.run_tool(STATE, "--run", str(run), "verify-task", "T01", check=True)
+        verified_head = self.run_git(
+            "rev-parse", "HEAD", cwd=worktree
+        ).stdout.strip()
+        (worktree / "app.txt").write_text("advanced\n", encoding="utf-8")
+        self.run_git("add", "app.txt", cwd=worktree)
+        self.run_git("commit", "-m", "advance after verify", cwd=worktree)
+        task_path = run / "tasks/T01.json"
+        state_path = run / "state.json"
+        original_task = json.loads(task_path.read_text(encoding="utf-8"))
+        original_state = json.loads(state_path.read_text(encoding="utf-8"))
+        check = {
+            "status": "passed", "base_sha": original_task["base_commit"],
+            "head_sha": verified_head, "evidence": "forged stale check",
+            "checked_at": "forged",
+        }
+        updated_task = json.loads(json.dumps(original_task))
+        updated_task.update({"status": "completed", "check_result": check})
+        updated_state = json.loads(json.dumps(original_state))
+        updated_state["tasks"]["T01"]["status"] = "completed"
+        intent = {
+            "schema_version": 2, "txid": "stale-task-check",
+            "writes": {
+                "tasks/T01.json": updated_task, "state.json": updated_state,
+            },
+            "event": {
+                "event": "task_check", "task": "T01", "result": "passed",
+                "base": check["base_sha"], "head": verified_head,
+                "from": "running", "to": "completed",
+                "evidence": check["evidence"],
+                "check_sha256": hashlib.sha256(json.dumps(
+                    check, sort_keys=True, separators=(",", ":")
+                ).encode()).hexdigest(),
+            },
+        }
+        self.write_prepared_v2_intent(run, intent)
+        rejected = self.run_tool(STATE, "--run", str(run), "show")
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("stale for its task branch", rejected.stderr)
+        self.assertEqual(json.loads(task_path.read_text()), original_task)
+        self.assertEqual(json.loads(state_path.read_text()), original_state)
 
     def test_v5_migration_preserves_custom_profiles_and_risk_override(self):
         run = self.init_run("v5-custom")
@@ -4744,10 +5706,12 @@ class InvariantTests(RepoCase):
     def test_wal_intent_is_recovered_before_read(self):
         run = self.init_run()
         state = json.loads((run / "state.json").read_text(encoding="utf-8"))
-        state["goal"] = "recovered goal"
+        state["phase"] = "SPEC_READY"
+        state["updated_at"] = "recovered"
         intent = {"schema_version": 2, "txid": "recovery-test",
                   "writes": {"state.json": state},
-                  "event": {"event": "recovered_test"}}
+                  "event": {"event": "phase", "from": "INIT",
+                            "to": "SPEC_READY", "reason": "recovery test"}}
         digest = hashlib.sha256(json.dumps(
             intent, sort_keys=True, separators=(",", ":")
         ).encode()).hexdigest()
@@ -4759,7 +5723,7 @@ class InvariantTests(RepoCase):
         (run / ".transaction.json").write_text(json.dumps(intent), encoding="utf-8")
         shown = self.run_tool(STATE, "--run", str(run), "show")
         self.assertEqual(shown.returncode, 0, shown.stderr)
-        self.assertEqual(json.loads(shown.stdout)["goal"], "recovered goal")
+        self.assertEqual(json.loads(shown.stdout)["phase"], "SPEC_READY")
         self.assertFalse((run / ".transaction.json").exists())
 
     def test_truncated_final_event_is_repaired_before_public_command(self):
@@ -5123,14 +6087,17 @@ class InstallerTests(RepoCase):
         fake = fake_bin / "codex"
         fake.write_text(
             "#!/usr/bin/env python3\n"
-            "import json, sys\n"
+            "import json, os, sys\n"
             "print(json.dumps({'installed':[{'pluginId':'qteam@qteam',"
-            "'installed':True,'enabled':True}]}))\n",
+            "'installed':True,'enabled':True,'version':os.environ['QTEAM_EXPECTED_PLUGIN_VERSION']}]}))\n",
             encoding="utf-8",
         )
         fake.chmod(0o755)
         env = os.environ.copy()
         env["PATH"] = f"{fake_bin}:{env['PATH']}"
+        env["QTEAM_EXPECTED_PLUGIN_VERSION"] = json.loads(
+            (PLUGIN / ".codex-plugin/plugin.json").read_text(encoding="utf-8")
+        )["version"]
         return env
 
     def test_project_setup_installs_runtime_without_copying_plugin_skills(self):
@@ -5168,6 +6135,14 @@ class InstallerTests(RepoCase):
         self.assertTrue((self.repo / ".codex/bin/agent_team_policy.py").is_file())
         self.assertTrue((self.repo / ".codex/bin/agent_team_eval.py").is_file())
         self.assertTrue((self.repo / ".codex/bin/import-agent-learning").is_file())
+        self.assertTrue((self.repo / ".codex/bin/agent-team-web").is_file())
+        self.assertTrue((self.repo / ".codex/bin/agent-team-session").is_file())
+        self.assertTrue((self.repo / ".codex/qteam-ui/index.html").is_file())
+        self.assertTrue((self.repo / ".codex/qteam-ui/app.js").is_file())
+        self.assertTrue((self.repo / ".codex/qteam-ui/styles.css").is_file())
+        self.assertTrue((self.repo / ".codex/schemas/project-policy.schema.json").is_file())
+        self.assertTrue((self.repo / ".codex/schemas/quality-lane.schema.json").is_file())
+        self.assertTrue((self.repo / ".codex/schemas/queue-item.schema.json").is_file())
         self.assertTrue((self.repo /
                          ".codex/schemas/review-receipt.schema.json").is_file())
         self.assertTrue((self.repo /
@@ -5463,6 +6438,7 @@ class InstallerTests(RepoCase):
         for required in (
             ".agents/runs/", ".agents/tmp/", "*.bak.*",
             ".codex/qteam-backups/", ".codex/qteam-project.json",
+            ".codex/qteam-refresh/",
             ".codex/agent-team-template.version",
         ):
             self.assertIn(required, installed)
@@ -5508,6 +6484,45 @@ class InstallerTests(RepoCase):
 
 
 class PluginTests(RepoCase):
+    def test_atomic_write_fsyncs_mode_before_publication(self):
+        spec = importlib.util.spec_from_file_location(
+            "qteam_project_atomic_write_test",
+            PLUGIN / "scripts/qteam_project.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        events = []
+        real_fsync = module.os.fsync
+        real_chmod = module.os.chmod
+        real_replace = module.os.replace
+
+        def recorded_fsync(descriptor):
+            events.append("fsync")
+            return real_fsync(descriptor)
+
+        def recorded_chmod(path, mode):
+            events.append("chmod")
+            return real_chmod(path, mode)
+
+        def recorded_replace(source, destination):
+            events.append("replace")
+            return real_replace(source, destination)
+
+        module.os.fsync = recorded_fsync
+        module.os.chmod = recorded_chmod
+        module.os.replace = recorded_replace
+        try:
+            destination = Path(self.tmp.name) / "atomic-mode"
+            module.atomic_write(destination, b"payload", 0o700)
+        finally:
+            module.os.fsync = real_fsync
+            module.os.chmod = real_chmod
+            module.os.replace = real_replace
+        chmod_index = events.index("chmod")
+        replace_index = events.index("replace")
+        self.assertIn("fsync", events[chmod_index + 1:replace_index])
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o700)
+
     def test_marketplace_points_to_valid_versioned_qteam_plugin(self):
         marketplace = json.loads(
             (SOURCE / ".agents/plugins/marketplace.json").read_text(encoding="utf-8")
@@ -5523,8 +6538,11 @@ class PluginTests(RepoCase):
             "category": "Developer Tools",
         }])
         self.assertEqual(manifest["name"], "qteam")
-        self.assertEqual(manifest["version"],
-                         (PLUGIN / "VERSION").read_text(encoding="utf-8").strip())
+        self.assertEqual(
+            manifest["version"].split("+", 1)[0],
+            (PLUGIN / "VERSION").read_text(encoding="utf-8").strip(),
+        )
+        self.assertRegex(manifest["version"], r"^0\.12\.0\+codex\.[0-9]+$")
 
     def fake_codex_env(self):
         fake_bin = Path(self.tmp.name) / "plugin-bin"
@@ -5550,9 +6568,14 @@ class PluginTests(RepoCase):
             "elif args[:3]==['plugin','marketplace','add']:\n"
             "  state['marketplace']=True\n"
             "elif args==['plugin','add','qteam@qteam']:\n"
+            "  if os.environ.get('QTEAM_FAKE_PARTIAL_PLUGIN_ADD')=='1':\n"
+            "    state['plugin']=False; state['marketplace']=False; state_path.write_text(json.dumps(state)); raise SystemExit(8)\n"
+            "  if os.environ.get('QTEAM_FAKE_FAIL_PLUGIN_ADD')=='1': raise SystemExit(7)\n"
             "  state['plugin']=True\n"
             "elif args==['plugin','list','--json']:\n"
-            "  items=[{'pluginId':'qteam@qteam'}] if state['plugin'] else []\n"
+            "  version='stale-version' if os.environ.get('QTEAM_FAKE_STALE_PLUGIN_VERSION')=='1' else os.environ['QTEAM_EXPECTED_PLUGIN_VERSION']\n"
+            "  flags={} if os.environ.get('QTEAM_FAKE_OMIT_PLUGIN_FLAGS')=='1' else {'installed':True,'enabled':True}\n"
+            "  items=[dict({'pluginId':'qteam@qteam','version':version},**flags)] if state['plugin'] else []\n"
             "  print(json.dumps({'installed':items}))\n"
             "elif args==['plugin','remove','qteam@qteam']:\n"
             "  state['plugin']=False\n"
@@ -5569,6 +6592,9 @@ class PluginTests(RepoCase):
         env["QTEAM_FAKE_STATE"] = str(state)
         env["QTEAM_FAKE_LOG"] = str(log)
         env["QTEAM_ROOT"] = str(SOURCE.resolve())
+        env["QTEAM_EXPECTED_PLUGIN_VERSION"] = json.loads(
+            (PLUGIN / ".codex-plugin/plugin.json").read_text(encoding="utf-8")
+        )["version"]
         return env, state, log
 
     def test_simple_plugin_setup_and_uninstall_commands_are_symmetric(self):
@@ -5615,6 +6641,253 @@ class PluginTests(RepoCase):
         self.assertFalse((self.repo / ".codex/qteam-project.json").exists())
         self.assertEqual(json.loads(state.read_text()),
                          {"marketplace": False, "plugin": False})
+
+    def test_failed_project_refresh_restores_previous_runtime(self):
+        env, _state, _log = self.fake_codex_env()
+        first = subprocess.run(
+            [str(QTEAM), "setup", str(self.repo)], cwd=SOURCE, env=env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        manifest = self.repo / ".codex/qteam-project.json"
+        runtime = self.repo / ".codex/bin/agent-team-state"
+        before_manifest = manifest.read_bytes()
+        before_runtime = runtime.read_bytes()
+        failed_env = dict(env)
+        failed_env["QTEAM_TEST_FAIL_AFTER_INSTALLS"] = "1"
+        failed = subprocess.run(
+            [str(QTEAM), "setup", str(self.repo)], cwd=SOURCE, env=failed_env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("previous runtime was restored", failed.stderr)
+        self.assertEqual(manifest.read_bytes(), before_manifest)
+        self.assertEqual(runtime.read_bytes(), before_runtime)
+
+    def test_failed_plugin_update_leaves_a_resumable_refresh(self):
+        env, state, _log = self.fake_codex_env()
+        first = subprocess.run(
+            [str(QTEAM), "setup", str(self.repo)], cwd=SOURCE, env=env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        manifest = self.repo / ".codex/qteam-project.json"
+        runtime = self.repo / ".codex/bin/agent-team-state"
+        before_manifest = manifest.read_bytes()
+        before_runtime = runtime.read_bytes()
+        failed_env = dict(env)
+        failed_env["QTEAM_FAKE_FAIL_PLUGIN_ADD"] = "1"
+        failed = subprocess.run(
+            [str(QTEAM), "setup", str(self.repo)], cwd=SOURCE, env=failed_env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(failed.returncode, 1)
+        self.assertIn("plugin installation is incomplete", failed.stderr)
+        self.assertNotEqual(manifest.read_bytes(), before_manifest)
+        self.assertEqual(runtime.read_bytes(), before_runtime)
+        intent = self.repo / ".codex/qteam-refresh/intent.json"
+        self.assertTrue(intent.is_file())
+        self.assertEqual(json.loads(state.read_text()), {
+            "marketplace": True, "plugin": True,
+        })
+        resumed = subprocess.run(
+            [str(QTEAM), "setup", str(self.repo)], cwd=SOURCE, env=env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertFalse(intent.exists())
+
+    def test_partial_plugin_update_is_durably_rolled_forward(self):
+        env, state, _log = self.fake_codex_env()
+        first = subprocess.run(
+            [str(QTEAM), "setup", str(self.repo)], cwd=SOURCE, env=env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        failed_env = dict(env)
+        failed_env["QTEAM_FAKE_PARTIAL_PLUGIN_ADD"] = "1"
+        failed = subprocess.run(
+            [str(QTEAM), "setup", str(self.repo)], cwd=SOURCE, env=failed_env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(failed.returncode, 1)
+        self.assertEqual(json.loads(state.read_text()), {
+            "marketplace": False, "plugin": False,
+        })
+        intent = self.repo / ".codex/qteam-refresh/intent.json"
+        self.assertTrue(intent.is_file())
+        wrong = self.run_tool(
+            PROJECT_REFRESH, str(self.repo), "/usr/bin/true"
+        )
+        self.assertNotEqual(wrong.returncode, 0)
+        self.assertIn("differs from the frozen command", wrong.stderr)
+        self.assertTrue(intent.is_file())
+        self.assertEqual(json.loads(state.read_text()), {
+            "marketplace": False, "plugin": False,
+        })
+        resumed = subprocess.run(
+            [str(QTEAM), "setup", str(self.repo)], cwd=SOURCE, env=env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertEqual(json.loads(state.read_text()), {
+            "marketplace": True, "plugin": True,
+        })
+        self.assertFalse(intent.exists())
+
+    def test_plugin_postcondition_must_match_the_frozen_version(self):
+        env, _state, _log = self.fake_codex_env()
+        first = subprocess.run(
+            [str(QTEAM), "setup", str(self.repo)], cwd=SOURCE, env=env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        stale_env = dict(env)
+        stale_env["QTEAM_FAKE_STALE_PLUGIN_VERSION"] = "1"
+        failed = subprocess.run(
+            [str(QTEAM), "setup", str(self.repo)], cwd=SOURCE, env=stale_env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(failed.returncode, 1)
+        self.assertIn("plugin installation is incomplete", failed.stderr)
+        intent = self.repo / ".codex/qteam-refresh/intent.json"
+        frozen = json.loads(intent.read_text(encoding="utf-8"))
+        self.assertEqual(
+            frozen["plugin_version"], env["QTEAM_EXPECTED_PLUGIN_VERSION"]
+        )
+        resumed = subprocess.run(
+            [str(QTEAM), "setup", str(self.repo)], cwd=SOURCE, env=env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertFalse(intent.exists())
+
+    def test_plugin_postcondition_requires_explicit_installed_and_enabled(self):
+        env, _state, _log = self.fake_codex_env()
+        first = subprocess.run(
+            [str(QTEAM), "setup", str(self.repo)], cwd=SOURCE, env=env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        incomplete_env = dict(env)
+        incomplete_env["QTEAM_FAKE_OMIT_PLUGIN_FLAGS"] = "1"
+        failed = subprocess.run(
+            [str(QTEAM), "setup", str(self.repo)], cwd=SOURCE,
+            env=incomplete_env, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(failed.returncode, 1)
+        self.assertIn("plugin installation is incomplete", failed.stderr)
+        intent = self.repo / ".codex/qteam-refresh/intent.json"
+        self.assertTrue(intent.is_file())
+        resumed = subprocess.run(
+            [str(QTEAM), "setup", str(self.repo)], cwd=SOURCE, env=env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertFalse(intent.exists())
+
+    def test_interrupted_project_refresh_recovers_from_durable_snapshot(self):
+        env, _state, _log = self.fake_codex_env()
+        first = subprocess.run(
+            [str(QTEAM), "setup", str(self.repo)], cwd=SOURCE, env=env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        old_manifest = (
+            self.repo / ".codex/qteam-project.json"
+        ).read_bytes()
+        crash_env = dict(env)
+        crash_env["QTEAM_TEST_HARD_EXIT_AFTER_REFRESH_UNINSTALL"] = "1"
+        crashed = subprocess.run(
+            [str(QTEAM), "setup", str(self.repo)], cwd=SOURCE, env=crash_env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(crashed.returncode, 87)
+        intent = self.repo / ".codex/qteam-refresh/intent.json"
+        self.assertTrue(intent.is_file())
+        recovered = subprocess.run(
+            [str(QTEAM), "setup", str(self.repo)], cwd=SOURCE, env=env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(
+            recovered.returncode, 0, recovered.stdout + recovered.stderr
+        )
+        self.assertFalse(intent.exists())
+        current = self.repo / ".codex/qteam-project.json"
+        self.assertTrue(current.is_file())
+        self.assertNotEqual(current.read_bytes(), old_manifest)
+        self.assertTrue((self.repo / ".codex/bin/agent-team-state").is_file())
+
+    def test_refresh_recovery_rejects_a_tampered_durable_snapshot(self):
+        env, _state, _log = self.fake_codex_env()
+        first = subprocess.run(
+            [str(QTEAM), "setup", str(self.repo)], cwd=SOURCE, env=env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        crash_env = dict(env)
+        crash_env["QTEAM_TEST_HARD_EXIT_AFTER_REFRESH_UNINSTALL"] = "1"
+        crashed = subprocess.run(
+            [str(QTEAM), "setup", str(self.repo)], cwd=SOURCE, env=crash_env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(crashed.returncode, 87)
+        intent_path = self.repo / ".codex/qteam-refresh/intent.json"
+        intent = json.loads(intent_path.read_text(encoding="utf-8"))
+        state_item = next(
+            item for item in intent["files"]
+            if item["path"] == ".codex/bin/agent-team-state"
+        )
+        snapshot = self.repo / ".codex/qteam-refresh" / state_item["saved"]
+        snapshot.write_text("#!/bin/sh\necho tampered\n", encoding="utf-8")
+        rejected = self.run_tool(PROJECT_REFRESH, "--recover", str(self.repo))
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("failed integrity check", rejected.stderr)
+        self.assertTrue(intent_path.is_file())
+        self.assertFalse((self.repo / ".codex/bin/agent-team-state").exists())
+
+    def test_refresh_cleans_a_pre_intent_orphan_then_retries(self):
+        env, _state, _log = self.fake_codex_env()
+        first = subprocess.run(
+            [str(QTEAM), "setup", str(self.repo)], cwd=SOURCE, env=env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        crash_env = dict(env)
+        crash_env["QTEAM_TEST_HARD_EXIT_DURING_REFRESH_SNAPSHOT"] = "1"
+        crashed = subprocess.run(
+            [str(QTEAM), "setup", str(self.repo)], cwd=SOURCE, env=crash_env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(crashed.returncode, 88)
+        refresh = self.repo / ".codex/qteam-refresh"
+        self.assertTrue(refresh.is_dir())
+        self.assertFalse((refresh / "intent.json").exists())
+        resumed = subprocess.run(
+            [str(QTEAM), "setup", str(self.repo)], cwd=SOURCE, env=env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertFalse(refresh.exists())
+        self.assertTrue((self.repo / ".codex/bin/agent-team-state").is_file())
+
+    def test_setup_refuses_local_hardening_skill_before_plugin_mutation(self):
+        env, state, log = self.fake_codex_env()
+        local = self.repo / ".agents/skills/qteam-harden"
+        local.mkdir(parents=True)
+        (local / "SKILL.md").write_text("user owned\n", encoding="utf-8")
+        blocked = subprocess.run(
+            [str(QTEAM), "setup", str(self.repo)], cwd=SOURCE, env=env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(blocked.returncode, 3)
+        self.assertIn("qteam-harden", blocked.stderr)
+        self.assertEqual(json.loads(state.read_text()),
+                         {"marketplace": False, "plugin": False})
+        self.assertFalse(log.exists())
+        self.assertEqual((local / "SKILL.md").read_text(encoding="utf-8"),
+                         "user owned\n")
 
     def test_setup_recovers_durable_preparing_intent_after_hard_exit(self):
         config = self.repo / ".codex/config.toml"
@@ -5691,6 +6964,14 @@ class PluginTests(RepoCase):
                     ".codex/schemas/decision-gate.schema.json",
                     ".codex/schemas/handoff.schema.json",
                     ".codex/schemas/scenario-coverage.schema.json",
+                    ".codex/bin/agent-team-web",
+                    ".codex/bin/agent-team-session",
+                    ".codex/schemas/project-policy.schema.json",
+                    ".codex/schemas/quality-lane.schema.json",
+                    ".codex/schemas/queue-item.schema.json",
+                    ".codex/qteam-ui/index.html",
+                    ".codex/qteam-ui/app.js",
+                    ".codex/qteam-ui/styles.css",
                 }
                 if schema_version == 2:
                     previous_paths.add(importer_path)
@@ -5758,6 +7039,14 @@ class PluginTests(RepoCase):
             ".codex/schemas/decision-gate.schema.json",
             ".codex/schemas/handoff.schema.json",
             ".codex/schemas/scenario-coverage.schema.json",
+            ".codex/bin/agent-team-web",
+            ".codex/bin/agent-team-session",
+            ".codex/schemas/project-policy.schema.json",
+            ".codex/schemas/quality-lane.schema.json",
+            ".codex/schemas/queue-item.schema.json",
+            ".codex/qteam-ui/index.html",
+            ".codex/qteam-ui/app.js",
+            ".codex/qteam-ui/styles.css",
         }
         manifest["installed_files"] = [
             record for record in manifest["installed_files"]

@@ -23,21 +23,23 @@ WORKER_PROMPTS = (
 )
 SCHEMAS = (
     "artifact-lint", "code-index", "decision-gate", "diagnosis", "epic",
-    "eval-case", "experiment", "finding", "handoff", "review-receipt", "review-result",
+    "eval-case", "experiment", "experiment-verification", "finding", "handoff", "review-receipt", "review-result",
     "run-state", "scenario-coverage", "spec-drift", "task-policy", "task",
-    "tdd-cycle", "trajectory", "verification", "worker-result",
+    "project-policy", "quality-lane", "queue-item", "tdd-cycle", "trajectory",
+    "verification", "worker-result",
 )
+UI_FILES = ("index.html", "app.js", "styles.css")
 PLUGIN_SKILLS = (
     "agent-team-dev", "brainstorming", "domain-modeling",
     "goal-execution-discipline", "grill-me", "grill-with-docs", "grilling",
     "qteam-diagnose", "qteam-explore", "qteam-review", "qteam-router",
-    "qteam-tdd", "to-spec", "to-tickets", "verification-before-completion",
-    "wayfinder", "writing-plans",
+    "qteam-harden", "qteam-tdd", "to-spec", "to-tickets",
+    "verification-before-completion", "wayfinder", "writing-plans",
 )
 LEGACY_OWNED_PLUGIN_SKILLS = tuple(
-    name for name in PLUGIN_SKILLS if name != "qteam-explore"
+    name for name in PLUGIN_SKILLS if name not in {"qteam-explore", "qteam-harden"}
 )
-LOCAL_SKILL_CONFLICTS = ("qteam-explore",)
+LOCAL_SKILL_CONFLICTS = ("qteam-explore", "qteam-harden")
 LEGACY_ORCHESTRATION_SKILLS = (
     "using-superpowers", "executing-plans", "subagent-driven-development",
     "requesting-code-review", "receiving-code-review",
@@ -48,8 +50,9 @@ LEGACY_ORCHESTRATION_SKILLS = (
 BINARIES = (
     "wake-agent-team", "agent-team-artifact", "agent-team-finish",
     "agent-team-check-task", "agent-team-doctor", "agent-team-state",
-    "agent-team-worker", "agent-team-review", "agent_team_artifact.py",
-    "agent_team_eval.py", "agent_team_policy.py", "import-agent-learning", "qteam-project-uninstall",
+    "agent-team-worker", "agent-team-review", "agent-team-web",
+    "agent-team-session", "agent_team_artifact.py", "agent_team_eval.py",
+    "agent_team_policy.py", "import-agent-learning", "qteam-project-uninstall",
     "qteam_project.py",
 )
 
@@ -59,6 +62,7 @@ INSTALLED_PATHS = frozenset(
     + [".codex/worker-prompts/wake-prompt.md"]
     + [f".codex/schemas/{name}.schema.json" for name in SCHEMAS]
     + [f".codex/bin/{name}" for name in BINARIES]
+    + [f".codex/qteam-ui/{name}" for name in UI_FILES]
     + [
         ".codex/QTEAM-THIRD-PARTY-NOTICES.md",
         ".codex/licenses/Matt-Pocock-MIT.txt",
@@ -76,8 +80,20 @@ MOVED_PATHS = frozenset(
     + [f".agents/skills/{name}" for name in LEGACY_ORCHESTRATION_SKILLS]
     + [".codex/bin/__pycache__"]
 )
-V010_INSTALLED_PATHS = frozenset(
+V011_INSTALLED_PATHS = frozenset(
     INSTALLED_PATHS - {
+        ".codex/bin/agent-team-web",
+        ".codex/bin/agent-team-session",
+        ".codex/schemas/project-policy.schema.json",
+        ".codex/schemas/quality-lane.schema.json",
+        ".codex/schemas/queue-item.schema.json",
+        ".codex/qteam-ui/index.html",
+        ".codex/qteam-ui/app.js",
+        ".codex/qteam-ui/styles.css",
+    }
+)
+V010_INSTALLED_PATHS = frozenset(
+    V011_INSTALLED_PATHS - {
         ".codex/bin/agent_team_eval.py",
         ".codex/schemas/eval-case.schema.json",
         ".codex/schemas/trajectory.schema.json",
@@ -201,6 +217,14 @@ def atomic_write(path, data, mode=0o644):
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(temporary, mode)
+        # chmod mutates inode metadata after the content fsync. Persist that
+        # metadata before publishing the file so a power loss cannot leave a
+        # content-valid snapshot or restored executable with mkstemp's 0600.
+        mode_descriptor = os.open(temporary, os.O_RDONLY)
+        try:
+            os.fsync(mode_descriptor)
+        finally:
+            os.close(mode_descriptor)
         os.replace(temporary, path)
         directory = os.open(path.parent, os.O_RDONLY)
         try:
@@ -297,6 +321,8 @@ def validate_manifest(root, manifest):
         supported_sets = (V09_INSTALLED_PATHS,)
     elif version_tuple < (0, 11, 0):
         supported_sets = (V010_INSTALLED_PATHS,)
+    elif version_tuple < (0, 12, 0):
+        supported_sets = (V011_INSTALLED_PATHS,)
     else:
         supported_sets = (INSTALLED_PATHS,)
     if installed_set not in supported_sets:

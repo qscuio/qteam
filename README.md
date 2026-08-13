@@ -7,6 +7,32 @@ Autoresearch while keeping exactly one orchestration authority.
 The core rule is simple: roles are created only for distinct permission,
 context, output, or lifecycle boundaries; reusable practices remain skills.
 
+## What changed in 0.12
+
+- Task facts now derive a `lean`, `standard`, or `hardened` workflow shape in
+  addition to model/review policy. The shape conditionally triggers refactor,
+  mutation/property/fault hardening, and public-surface QA lanes. Each lane is
+  a frozen, deduplicated command set replayed on the exact integration HEAD;
+  it is not another per-task LLM review. A project `.qteam/policy.json` may
+  only raise the shape floor or add lane triggers, and init freezes both core
+  and project policy digests.
+- A coordinator-owned durable priority queue can claim equal-priority work in
+  bounded batches. It improves scheduling and visibility without enabling
+  peer-to-peer agent routing: the existing dependency DAG, phases, WAL, task
+  records, and reviews remain the only delivery authority.
+- QTeam now ships a dependency-free local Web control plane with run/wave/DAG,
+  worker, quality, decision, queue, review, and redacted event views. It uses
+  SSE locally, allows only fixed existing CLI actions, requires CSRF on writes,
+  keeps raw logs off by default, and binds only numeric loopback. Remote use is
+  through an SSH tunnel or exact trusted HTTPS proxy with a mode-0600 token.
+- Herdr is supported as an optional display/session adapter. It can open the
+  QTeam Web UI or compact watch stream in a Herdr pane, but never launches
+  workers/reviewers or owns state. QTeam has no tmux dependency or fallback.
+- These adaptive-shape, batch, and layered-policy ideas are a clean-room
+  adaptation of useful SwarmForge concepts; QTeam keeps its graph execution,
+  isolation, mandatory dual review, and durable gates instead of adopting a
+  fixed linear role pipeline.
+
 ## What changed in 0.11
 
 - Writable workers and reviewer runners now use Codex JSONL mode and retain a
@@ -214,6 +240,65 @@ codex plugin marketplace add <this-qteam-checkout>
 codex plugin add qteam@qteam
 ```
 
+Start the Web UI after project setup:
+
+```bash
+./qteam serve /path/to/target-git-repository --run <run-id>
+```
+
+Without a token this is a redacted, read-only operator view. To enable fixed
+control actions, provide a private token even on loopback:
+
+```bash
+umask 077
+printf '%s\n' '<at-least-32-random-characters>' > /secure/path/qteam.token
+./qteam serve /path/to/repo --run <run-id> \
+  --token-file /secure/path/qteam.token
+```
+
+It binds loopback only and validates Host/Origin to resist DNS rebinding. For a
+remote operator, prefer an SSH tunnel. An HTTPS reverse proxy on the same host
+may be explicitly trusted only with its exact external origin and a private
+token file; the built-in server never becomes an Internet-facing listener:
+
+```bash
+chmod 600 /secure/path/qteam.token
+./qteam serve /path/to/repo --run <run-id> --host 127.0.0.1 \
+  --token-file /secure/path/qteam.token \
+  --trusted-origin https://qteam.example.com
+```
+
+Raw worker logs are intentionally absent unless `--allow-raw-logs` is passed;
+the default UI shows bounded execution identity and lifecycle summaries.
+
+For the optional Herdr display adapter, first verify Herdr and then run QTeam
+from inside a Herdr-managed pane:
+
+```bash
+./qteam herdr doctor
+./qteam herdr open /path/to/repo --run <run-id> --mode web
+```
+
+Use `--mode watch` for a compact terminal stream. Herdr is not installed by
+QTeam and is never an orchestration dependency.
+
+Projects may strengthen the core adaptive policy with `.qteam/policy.json`:
+
+```json
+{
+  "schema_version": 1,
+  "workflow_shape_floor": "standard",
+  "required_quality_lanes": {
+    "refactor": {"work_kinds": [], "risk_flags": []},
+    "hardening": {"work_kinds": [], "risk_flags": ["security"]},
+    "public-surface-qa": {"work_kinds": [], "risk_flags": ["public-api"]}
+  }
+}
+```
+
+The layer cannot disable TDD, diagnosis, review, risk, reversibility, or any
+other core gate.
+
 When a project path is supplied, the project bootstrap records preimages and
 content hashes in `.codex/qteam-project.json` before changing project config or
 runtime paths, then installs only:
@@ -223,6 +308,7 @@ runtime paths, then installs only:
 .codex/worker-prompts/     writable role contracts
 .codex/bin/                wake, state, worker, gate, review, finish, doctor
 .codex/schemas/            run/task/artifact/epic/index/drift/review schemas
+.codex/qteam-ui/           local static Web assets (no external CDN/runtime)
 ```
 
 QTeam and its bounded Superpowers/Matt-derived primitives come from the plugin;
@@ -241,10 +327,20 @@ managed project file changed after setup, uninstall retains it and stops with
 the exact backup directory instead of deleting user work.
 
 Running `setup <project>` again validates and safely removes the previous
-runtime before installing the current plugin version. It also recovers a
-durable `preparing` or `installing` intent left by an interrupted setup. A
-corrupt manifest or locally modified managed file fails closed instead of
-reporting a successful update.
+runtime before installing the current plugin version. The exact old runtime
+is first sealed into a fsynced, content-digested `.codex/qteam-refresh/`
+intent. A later setup verifies every saved file, mode, manifest, and backup
+tree before restoring that snapshot after SIGKILL or power loss. Once the new
+project runtime is installed, plugin installation becomes a durable
+roll-forward phase: a failed or partially applied plugin command leaves the
+intent in place. The exact continuation and expected plugin version are frozen;
+the next setup idempotently completes that command and verifies the installed,
+enabled version before clearing the intent, instead of silently pairing
+different versions. A pre-intent snapshot orphan is removed
+only after the still-installed runtime and its preimage pass full integrity
+checks. Setup also recovers durable `preparing` or `installing` intents left by
+an interrupted first install. A corrupt snapshot, manifest, or locally
+modified managed file fails closed instead of reporting a successful update.
 Recovery backups, the machine-specific manifest, and run state are added to
 the target repository's ignore rules independently so preimages cannot enter a
 normal commit.
@@ -279,11 +375,42 @@ Create and advance durable state through the command, never by editing JSON:
 .codex/bin/agent-team-state --run 20260801-auth experiment-put T02 \
   --file .agents/runs/20260801-auth/worktrees/T02/.qteam-experiment.json
 .codex/bin/agent-team-state --run 20260801-auth verify-task T01
+.codex/bin/agent-team-state --run 20260801-auth quality-assess \
+  --wave 1 --lane refactor --outcome not-needed \
+  --rationale "post-GREEN inspection found no smaller ownership boundary"
+.codex/bin/agent-team-state --run 20260801-auth quality-check \
+  --wave 1 --lane hardening
 .codex/bin/agent-team-state --run 20260801-auth verify-final \
   --command "pytest -q"
 .codex/bin/agent-team-state --run 20260801-auth boundary-check
 .codex/bin/agent-team-state --run 20260801-auth status
 ```
+
+Tasks whose derived policy names a quality lane must freeze that lane's
+deterministic commands in `quality_commands` before execution. `$qteam-harden`
+defines the refactor, adversarial-hardening, and public-consumer evidence
+contract without adding another per-task reviewer. Refactor also requires one
+bounded wave-level post-GREEN assessment, either a durable not-needed rationale
+or an integrated same-wave refactor task. The state manager deduplicates
+wave commands, runs them in a disposable detached checkout of the exact
+integration HEAD, hashes both output streams, and rechecks the files and HEAD
+before review and finish. Commands must bootstrap from tracked sources and
+repository-native caches; ignored integration-only dependencies are not inherited.
+
+For coordinator-owned batch work, enqueue a typed record and claim only the
+highest-priority equal-priority group:
+
+```bash
+.codex/bin/agent-team-state --run 20260801-auth queue-put --file /tmp/Q01.json
+.codex/bin/agent-team-state --run 20260801-auth queue-claim \
+  --consumer coordinator --limit 4
+.codex/bin/agent-team-state --run 20260801-auth queue-complete Q01 \
+  --consumer coordinator --outcome completed --evidence 'merged as T03'
+```
+
+The queue improves scheduling and UI visibility; it cannot bypass task
+dependencies, worker isolation, merge gates, or the mandatory spec and
+standards review axes.
 
 For a multi-run effort, let `wayfinder` create and validate the portfolio, then
 bind each run to its mechanical dependency gate:
@@ -295,14 +422,17 @@ bind each run to its mechanical dependency gate:
 .codex/bin/agent-team-artifact epic-complete-run --epic platform --run foundation
 ```
 
-To resume an unfinished legacy schema-version-2/3/4/5 run,
+To resume an unfinished schema-version-2/3/4/5 run, or a schema-version-6 run
+whose policy-v2/additive/core-layer contract predates the installed runtime,
 migrate it atomically first:
 
 ```bash
 .codex/bin/agent-team-state --run <run-id> migrate-run
 ```
 
-Historical merged tasks retain their durable provenance. Every unfinished task
+Finished or publication-sealed runs cannot migrate, and active workers/reviews
+must be settled first. Historical merged tasks retain their durable provenance
+and previously required quality lanes. Every unfinished task
 is marked `requires_replan` and must be replaced through `task-put` during
 `REPLANNING` with explicit dependencies; workers and phase execution reject it
 until then.

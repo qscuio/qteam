@@ -7,6 +7,7 @@ import subprocess
 import os
 import stat
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -180,9 +181,13 @@ def codex_version(command="codex"):
 
 
 def wait_capped_process(process, stdout_target, stderr_target,
-                        limit=MAX_TRACE_BYTES, process_group=False):
+                        limit=MAX_TRACE_BYTES, process_group=False,
+                        timeout_seconds=None):
     """Drain a child concurrently while never retaining more than ``limit``."""
     overflow = threading.Event()
+    timed_out = threading.Event()
+    deadline = (time.monotonic() + timeout_seconds
+                if timeout_seconds is not None else None)
 
     def stop(kill=False):
         try:
@@ -226,8 +231,13 @@ def wait_capped_process(process, stdout_target, stderr_target,
                 return_code = process.wait(timeout=0.1)
                 break
             except subprocess.TimeoutExpired:
+                if (deadline is not None and time.monotonic() >= deadline
+                        and not timed_out.is_set()):
+                    timed_out.set()
+                    stop()
                 if not overflow.is_set():
-                    continue
+                    if not timed_out.is_set():
+                        continue
                 stop()
                 try:
                     return_code = process.wait(timeout=2)
@@ -247,7 +257,8 @@ def wait_capped_process(process, stdout_target, stderr_target,
         raise
     for thread in threads:
         thread.join()
-    return return_code, overflow.is_set()
+    result = (return_code, overflow.is_set(), timed_out.is_set())
+    return result if timeout_seconds is not None else result[:2]
 
 
 def calibration_suite(axis):

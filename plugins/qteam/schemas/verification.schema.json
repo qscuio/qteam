@@ -8,7 +8,15 @@
     "exit_code": {"type": "integer"},
     "head_sha": {"type": "string", "minLength": 40},
     "ts": {"type": "string"},
-    "log": {"type": "string"}
+    "stream_schema_version": {"const": 1},
+    "log": {"type": "string", "minLength": 1},
+    "log_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "stderr_log": {"type": "string", "minLength": 1},
+    "stderr_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
   },
+  "allOf": [{
+    "if": {"required": ["stream_schema_version"]},
+    "then": {"required": ["log", "log_sha256", "stderr_log", "stderr_sha256"]}
+  }],
   "additionalProperties": false
 }

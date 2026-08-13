@@ -24,7 +24,8 @@ done
 [[ -f ".codex/agents/${AGENTS[0]}.toml" ]] && ok "${#AGENTS[@]} agent TOMLs present (or failures listed above)"
 
 for b in wake-agent-team agent-team-artifact agent-team-finish agent-team-check-task agent-team-doctor \
-         agent-team-state agent-team-worker agent-team-review qteam-project-uninstall; do
+         agent-team-state agent-team-worker agent-team-review agent-team-web \
+         agent-team-session qteam-project-uninstall; do
   if [[ ! -x ".codex/bin/$b" ]]; then fail "missing or non-executable .codex/bin/$b"; fi
 done
 [[ -f ".codex/bin/agent_team_policy.py" ]] || fail "missing policy module: agent_team_policy.py"
@@ -36,7 +37,10 @@ for role in developer debugger frontend-debugger system-debugger test-writer \
             integration-tester fixer knowledge-distiller; do
   [[ -f ".codex/worker-prompts/$role.md" ]] || fail "missing worker prompt: $role"
 done
-for schema in run-state task task-policy tdd-cycle trajectory eval-case diagnosis experiment decision-gate handoff scenario-coverage worker-result verification finding review-result review-receipt artifact-lint code-index epic spec-drift; do
+for schema in run-state task task-policy project-policy quality-lane queue-item \
+              tdd-cycle trajectory eval-case diagnosis experiment decision-gate \
+              handoff scenario-coverage worker-result verification finding \
+              review-result review-receipt artifact-lint code-index epic spec-drift; do
   [[ -f ".codex/schemas/$schema.schema.json" ]] || fail "missing schema: $schema"
 done
 SCHEMA_OK=1
@@ -46,6 +50,7 @@ done
 [[ $SCHEMA_OK -eq 1 ]] && ok "all JSON schemas parse"
 
 for duplicate in agent-team-dev qteam-router qteam-tdd qteam-diagnose qteam-explore qteam-review \
+                 qteam-harden \
                  using-superpowers executing-plans subagent-driven-development \
                  requesting-code-review receiving-code-review \
                  finishing-a-development-branch using-git-worktrees \
@@ -53,6 +58,10 @@ for duplicate in agent-team-dev qteam-router qteam-tdd qteam-diagnose qteam-expl
                  dispatching-parallel-agents; do
   [[ ! -d ".agents/skills/$duplicate" ]] \
     || fail "stale repository-local orchestration skill conflicts with QTeam plugin: $duplicate"
+done
+
+for asset in index.html app.js styles.css; do
+  [[ -f ".codex/qteam-ui/$asset" ]] || fail "missing Web UI asset: $asset"
 done
 
 # --- plugin registration ---
@@ -150,6 +159,30 @@ if [[ -f "$VER_FILE" ]]; then
       warn "plugin source is newer than project runtime; run qteam setup again"
     else
       ok "project runtime matches plugin source version"
+    fi
+    EXPECTED_PLUGIN_VERSION="$(python3 -c '
+import json, sys
+try:
+    print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])
+except (OSError, KeyError, TypeError, json.JSONDecodeError):
+    raise SystemExit(1)
+' "$SRC/.codex-plugin/plugin.json" 2>/dev/null || true)"
+    INSTALLED_PLUGIN_VERSION="$(python3 -c '
+import json, sys
+try:
+    payload = json.load(sys.stdin)
+except (json.JSONDecodeError, TypeError):
+    raise SystemExit(1)
+matches = [item for item in payload.get("installed", [])
+           if item.get("pluginId") == "qteam@qteam"]
+print(matches[0].get("version", "") if len(matches) == 1 else "")
+' <<<"${PLUGIN_LIST:-}" 2>/dev/null || true)"
+    if [[ -z "$EXPECTED_PLUGIN_VERSION" ]]; then
+      warn "could not read source plugin version"
+    elif [[ "$INSTALLED_PLUGIN_VERSION" != "$EXPECTED_PLUGIN_VERSION" ]]; then
+      fail "installed qteam@qteam version '$INSTALLED_PLUGIN_VERSION' differs from source '$EXPECTED_PLUGIN_VERSION'; reinstall the plugin"
+    else
+      ok "installed qteam@qteam version matches plugin source"
     fi
   fi
 else

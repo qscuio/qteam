@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qteam.local/schemas/experiment-verification.schema.json",
+  "type": "object",
+  "required": ["head_sha", "baseline", "final", "baseline_exit_code", "metric_exit_code", "guard_exit_code", "holdout_exit_code", "recorded_at"],
+  "properties": {
+    "stream_schema_version": {"const": 1},
+    "head_sha": {"type": "string", "minLength": 40},
+    "baseline_command": {"type": "string", "minLength": 1},
+    "metric_command": {"type": "string", "minLength": 1},
+    "guard_command": {"type": "string", "minLength": 1},
+    "holdout_command": {"type": "string", "minLength": 1},
+    "baseline": {"type": "number"},
+    "final": {"type": "number"},
+    "baseline_exit_code": {"type": "integer"},
+    "metric_exit_code": {"type": "integer"},
+    "guard_exit_code": {"type": "integer"},
+    "holdout_exit_code": {"type": "integer"},
+    "recorded_at": {"type": "string", "minLength": 1},
+    "baseline_log": {"type": "string", "minLength": 1},
+    "baseline_log_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "baseline_stderr_log": {"type": "string", "minLength": 1},
+    "baseline_stderr_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "metric_log": {"type": "string", "minLength": 1},
+    "metric_log_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "metric_stderr_log": {"type": "string", "minLength": 1},
+    "metric_stderr_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "guard_log": {"type": "string", "minLength": 1},
+    "guard_log_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "guard_stderr_log": {"type": "string", "minLength": 1},
+    "guard_stderr_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "holdout_log": {"type": "string", "minLength": 1},
+    "holdout_log_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "holdout_stderr_log": {"type": "string", "minLength": 1},
+    "holdout_stderr_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "allOf": [{
+    "if": {"required": ["stream_schema_version"]},
+    "then": {"required": ["baseline_command", "metric_command", "guard_command", "holdout_command", "baseline_log", "baseline_log_sha256", "baseline_stderr_log", "baseline_stderr_sha256", "metric_log", "metric_log_sha256", "metric_stderr_log", "metric_stderr_sha256", "guard_log", "guard_log_sha256", "guard_stderr_log", "guard_stderr_sha256", "holdout_log", "holdout_log_sha256", "holdout_stderr_log", "holdout_stderr_sha256"]}
+  }],
+  "additionalProperties": false
+}

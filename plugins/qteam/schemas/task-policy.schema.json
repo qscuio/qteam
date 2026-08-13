@@ -2,9 +2,9 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://qteam.local/schemas/task-policy.schema.json",
   "type": "object",
-  "required": ["policy_version", "work_kind", "declared_risk_flags", "inferred_risk_flags", "effective_risk_flags", "declared_reversibility", "inferred_reversibility", "reversibility", "blast_radius", "integration_lane", "require_user_finish_decision", "execution_tier", "review_intensity", "require_risk_review", "tdd_required", "diagnosis_required", "reasons"],
+  "required": ["policy_version", "work_kind", "declared_risk_flags", "inferred_risk_flags", "effective_risk_flags", "declared_reversibility", "inferred_reversibility", "reversibility", "blast_radius", "integration_lane", "require_user_finish_decision", "execution_tier", "review_intensity", "require_risk_review", "workflow_shape", "required_quality_lanes", "tdd_required", "diagnosis_required", "reasons"],
   "properties": {
-    "policy_version": {"const": 2},
+    "policy_version": {"const": 3},
     "work_kind": {"enum": ["feature", "bugfix", "debug", "refactor", "test", "integration", "docs", "config", "generated", "learning", "experiment"]},
     "declared_risk_flags": {"$ref": "#/$defs/riskFlags"},
     "inferred_risk_flags": {"$ref": "#/$defs/riskFlags"},
@@ -18,6 +18,11 @@
     "execution_tier": {"enum": ["economy", "standard", "deep"]},
     "review_intensity": {"enum": ["compact", "full", "risk"]},
     "require_risk_review": {"type": "boolean"},
+    "workflow_shape": {"enum": ["lean", "standard", "hardened"]},
+    "required_quality_lanes": {
+      "type": "array", "uniqueItems": true,
+      "items": {"enum": ["refactor", "hardening", "public-surface-qa"]}
+    },
     "tdd_required": {"type": "boolean"},
     "diagnosis_required": {"type": "boolean"},
     "reasons": {"type": "array", "minItems": 1, "items": {"type": "string"}}

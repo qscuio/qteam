@@ -5,6 +5,7 @@
   "required": ["schema_version", "repro_commit", "feedback_loop", "observed_red", "minimized_repro", "hypotheses", "root_cause", "causal_chain", "fix_boundary", "cleanup", "preventive_lesson", "repro_exit_code", "repro_log", "failure_pattern", "recorded_at"],
   "properties": {
     "schema_version": {"const": 1},
+    "stream_schema_version": {"const": 1},
     "repro_commit": {"type": "string", "minLength": 40},
     "feedback_loop": {"type": "string", "minLength": 1},
     "observed_red": {"type": "string", "minLength": 1},
@@ -31,12 +32,22 @@
     "preventive_lesson": {"type": "string", "minLength": 1},
     "repro_exit_code": {"type": "integer", "not": {"const": 0}},
     "repro_log": {"type": "string", "minLength": 1},
+    "repro_log_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "repro_stderr_log": {"type": "string", "minLength": 1},
+    "repro_stderr_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "failure_pattern": {"type": "string", "minLength": 1},
     "green_exit_code": {"type": "integer"},
     "green_head": {"type": "string", "minLength": 40},
     "green_log": {"type": "string", "minLength": 1},
+    "green_log_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "green_stderr_log": {"type": "string", "minLength": 1},
+    "green_stderr_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "green_verified_at": {"type": "string", "minLength": 1},
     "recorded_at": {"type": "string", "minLength": 1}
   },
+  "allOf": [{
+    "if": {"required": ["stream_schema_version"]},
+    "then": {"required": ["repro_stderr_log", "repro_log_sha256", "repro_stderr_sha256"], "dependentRequired": {"green_log": ["green_log_sha256", "green_stderr_log", "green_stderr_sha256"]}}
+  }],
   "additionalProperties": true
 }

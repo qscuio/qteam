@@ -55,14 +55,20 @@ Never edit `state.json`, `events.jsonl`, or task status by hand. Use
 `agent-team-state`; its locked atomic writes are the durable source of truth.
 Use its compact `status` packet for operator updates and resume instead of
 dumping the full state.
-If an unfinished run has schema version 2, 3, 4, or 5, run `migrate-run` once. It
-preserves durable provenance, assigns conservative policy where needed, and
+If an unfinished run has schema version 2, 3, 4, or 5, or schema 6 with legacy
+policy-v2/additive/core-layer identity, run `migrate-run` once. Finished or
+publication-sealed runs cannot migrate, and active workers/reviews must first be
+settled. It preserves durable provenance and historical quality duties,
+assigns conservative policy where needed, and
 forces every unfinished task through `REPLANNING`/`task-put` so the coordinator
 must restore explicit dependencies before execution resumes.
 
 ## Intake primitives
 
 - Failure-driven work begins with `qteam-diagnose`.
+- Policy-triggered refactor, hardening, and public-surface QA use
+  `qteam-harden`. It freezes mechanical evidence and never creates another
+  review or orchestration loop.
 - A clear destination with an unknown solution frontier begins with
   `qteam-explore`. Its read-only evidence brief may widen candidate paths, but
   it cannot widen approved scope or launch a write loop.
@@ -112,6 +118,9 @@ DAG. Each machine task record includes:
 - exact `required_decisions`; and when continuation is material,
   `handoff_required: true` plus one typed successor/user-decision/replan/
   no-followup handoff
+- `quality_commands` for every lane in the deterministically derived
+  `required_quality_lanes`; each command proves the lane property on the
+  integration surface rather than merely printing a claim
 
 Shared interfaces, schemas, migrations, lock/build/config/generated files,
 global fixtures, and snapshots are serial. Tests for a behavior live in its
@@ -146,6 +155,12 @@ profiles are Terra/low, Terra/medium, and Sol/high and can be overridden only
 at run `init`; planners and workers do not choose them ad hoc. A wave of four
 or more otherwise-economy tasks upgrades its review to standard/full once,
 without upgrading each isolated worker.
+
+The same facts derive `lean`, `standard`, or `hardened` workflow shape. Standard
+behavior/debug/refactor/integration work adds a refactor gate; hardened work additionally
+adds a hardening gate; compatibility/public API adds public-surface QA. A
+versioned `.qteam/policy.json` may only raise the shape floor or add lane
+triggers. Init freezes the effective project layer and digests in run state.
 
 ## Isolation and wave execution
 
@@ -187,8 +202,19 @@ For each wave:
    focused tests, then `test-writer` for missing focused/regression coverage and
    `integration-tester` for real cross-boundary behavior. These are isolated
    worker tasks too; do not let them write the live integration worktree.
+8. Load `qteam-harden` when the wave policy lists quality lanes. Run
+   `quality-check --wave N --lane <lane>` for each one. This replays only the
+   frozen, deduplicated commands at exact integration HEAD. A failed/stale lane
+   requires an owned task and blocks review; it is not a reason to weaken the
+   command or add a per-task reviewer.
 
 All phase and task status changes go through `agent-team-state`.
+
+The coordinator may maintain a durable priority queue with `queue-put`,
+`queue-claim`, and `queue-complete`. One claim returns only the highest-priority
+pending batch, up to the explicit limit. Queue records improve scheduling and
+observability; dependencies, phases, and run state remain authoritative, and
+workers never route work directly to peers.
 
 ## Review gate
 
@@ -303,6 +329,21 @@ Transition to `READY_TO_FINISH`. `agent-team-finish` is report-only by default.
 without `--integrate`. Default branches require `--allow-default-branch`. After
 successful integration/push, finish atomically marks the run `DONE` and
 `finished: true`.
+
+## Operator surfaces
+
+Run `.codex/bin/agent-team-web --run <run>` (or `./qteam serve <repo> --run
+<run>`) for the local Web operator plane. Without `--token-file` it is read-only.
+With a mode-0600 token it exposes only fixed CLI actions with bearer + CSRF
+protection. It binds numeric loopback only; remote access uses an SSH tunnel or
+exact trusted HTTPS proxy with that token. Raw logs are opt-in because they may contain
+tool output or secrets.
+
+Herdr is an optional display/session backend only. From inside Herdr, use
+`.codex/bin/agent-team-session open --run <run> --mode web|watch`. The adapter
+creates a pane and launches QTeam's own surface; it never starts workers,
+reviews, worktrees, or state transitions. QTeam does not depend on tmux and
+does not fall back to it.
 
 ## Failure and progress rules
 

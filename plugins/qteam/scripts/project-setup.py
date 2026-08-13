@@ -13,7 +13,7 @@ from pathlib import Path
 from qteam_project import (
     AGENTS, BINARIES, INSTALLED_PATHS, LEGACY_ORCHESTRATION_SKILLS,
     LEGACY_OWNED_PLUGIN_SKILLS, LOCAL_SKILL_CONFLICTS, MOVED_PATHS,
-    MUTABLE_PATHS, OBSOLETE_AGENTS, SCHEMAS, WORKER_PROMPTS,
+    MUTABLE_PATHS, OBSOLETE_AGENTS, SCHEMAS, UI_FILES, WORKER_PROMPTS,
     atomic_write, atomic_write_json, bytes_digest, file_digest, safe_path,
     tree_digest, validate_manifest,
 )
@@ -132,6 +132,7 @@ def merge_gitignore(text):
     required = (
         ".agents/runs/", ".agents/tmp/", "*.bak.*",
         ".codex/qteam-backups/", ".codex/qteam-project.json",
+        ".codex/qteam-refresh/",
         ".codex/agent-team-template.version",
     )
     present = set(text.splitlines())
@@ -167,6 +168,10 @@ def installed_payloads(plugin_root, version, source_commit, stamp):
         payloads[f".codex/schemas/{name}.schema.json"] = (
             source_bytes(plugin_root / f"schemas/{name}.schema.json"), 0o644,
         )
+    for name in UI_FILES:
+        payloads[f".codex/qteam-ui/{name}"] = (
+            source_bytes(plugin_root / f"ui/{name}"), 0o644,
+        )
     binary_sources = {
         "wake-agent-team": "bin/wake-agent-team.sh",
         "agent-team-artifact": "bin/agent_team_artifact.py",
@@ -176,6 +181,8 @@ def installed_payloads(plugin_root, version, source_commit, stamp):
         "agent-team-state": "bin/agent-team-state.py",
         "agent-team-worker": "bin/agent-team-worker.py",
         "agent-team-review": "bin/agent-team-review.py",
+        "agent-team-web": "bin/agent-team-web.py",
+        "agent-team-session": "bin/agent-team-session.py",
         "agent_team_artifact.py": "bin/agent_team_artifact.py",
         "agent_team_eval.py": "bin/agent_team_eval.py",
         "agent_team_policy.py": "bin/agent_team_policy.py",

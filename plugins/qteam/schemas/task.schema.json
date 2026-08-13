@@ -17,6 +17,14 @@
     "policy": {"$ref": "task-policy.schema.json"},
     "tdd_required": {"type": "boolean"},
     "diagnosis_required": {"type": "boolean"},
+    "quality_commands": {
+      "type": "object",
+      "propertyNames": {"enum": ["refactor", "hardening", "public-surface-qa"]},
+      "additionalProperties": {
+        "type": "array", "minItems": 1, "maxItems": 8, "uniqueItems": true,
+        "items": {"type": "string", "minLength": 1, "maxLength": 2048}
+      }
+    },
     "review_fix": {"type": "boolean"},
     "finding_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"}},
     "finding_ledgers": {"type": "object"},
@@ -64,6 +72,7 @@
       "additionalProperties": false
     },
     "experiment_evidence": {"$ref": "experiment.schema.json"},
+    "experiment_verification": {"$ref": "experiment-verification.schema.json"},
     "policy_migration": {"type": "object"},
     "test_seams": {
       "type": "array",
@@ -130,6 +139,18 @@
         "required": ["finding_ids", "finding_ledgers"],
         "properties": {"parallel_group": {"const": "serial"}}
       }
+    },
+    {
+      "if": {"properties": {"policy": {"properties": {"required_quality_lanes": {"contains": {"const": "refactor"}}}}}, "required": ["policy"]},
+      "then": {"properties": {"quality_commands": {"required": ["refactor"]}}, "required": ["quality_commands"]}
+    },
+    {
+      "if": {"properties": {"policy": {"properties": {"required_quality_lanes": {"contains": {"const": "hardening"}}}}}, "required": ["policy"]},
+      "then": {"properties": {"quality_commands": {"required": ["hardening"]}}, "required": ["quality_commands"]}
+    },
+    {
+      "if": {"properties": {"policy": {"properties": {"required_quality_lanes": {"contains": {"const": "public-surface-qa"}}}}}, "required": ["policy"]},
+      "then": {"properties": {"quality_commands": {"required": ["public-surface-qa"]}}, "required": ["quality_commands"]}
     }
   ],
   "additionalProperties": true

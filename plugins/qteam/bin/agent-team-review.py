@@ -18,10 +18,12 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 
 from agent_team_policy import (
+    DEFAULT_PROJECT_POLICY,
     REVIEW_AXIS_INSTRUCTIONS, REVIEW_CLOSURE_INSTRUCTIONS,
     REVIEW_FINDING_INSTRUCTIONS,
     REVIEW_INTENSITY_INSTRUCTIONS,
-    review_contract_digest, safe_identifier,
+    core_policy_digest, project_policy_digest, review_contract_digest,
+    safe_identifier,
 )
 from agent_team_artifact import (
     ArtifactError, lint_documents, locked_regular, safe_regular,
@@ -1634,6 +1636,27 @@ def main():
         run = run_dir(repo, run_id)
     if run is not None:
         state = read(run / "state.json")
+        legacy_tasks = [
+            task_id for task_id in state.get("tasks", {})
+            if read(run / "tasks" / f"{task_id}.json").get(
+                "policy", {}
+            ).get("policy_version") != 3
+        ]
+        if (state.get("schema_version") != 6 or legacy_tasks
+                or any(field not in state for field in (
+                    "project_policy", "policy_layers", "quality_lanes", "work_queue",
+                ))):
+            raise SystemExit(
+                "error: run state/policy contract is not current; run migrate-run first"
+            )
+        core = state.get("policy_layers", [{}])[0]
+        if (not isinstance(core, dict)
+                or core.get("sha256") != core_policy_digest()
+                or core.get("defaults_sha256")
+                != project_policy_digest(DEFAULT_PROJECT_POLICY)):
+            raise SystemExit(
+                "error: frozen core policy differs from this runtime; run migrate-run first"
+            )
         if state.get("publication_seal"):
             raise SystemExit(
                 "error: publication seal freezes review packets and findings"

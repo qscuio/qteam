@@ -36,6 +36,7 @@ Typed handoff:       (successor / user-decision / replan / no-followup, when mat
 Diagnosis loop:      (bugfix/debug only; exact command + failure pattern)
 Tests:
 Verification:
+Quality commands:   (one command array per policy-triggered lane)
 Stop rule:
 Done gate:
 ```
@@ -45,6 +46,10 @@ Done gate:
 - Only tasks in the same `parallel_group` may run concurrently.
 - Planners declare work/risk facts. `task-put` derives execution tier and review
   intensity; do not choose models or omit a mandatory review axis manually.
+- The same derivation selects lean/standard/hardened shape and conditional
+  refactor/hardening/public-surface-QA lanes. Freeze deterministic commands for
+  every required lane; review cannot start while their current-head evidence is
+  missing, failed, or stale.
 - Register tasks in topological order. Every `depends_on` ID must already exist
   in a strictly earlier wave; unknown, cyclic, same-wave, and later-wave edges
   are rejected mechanically.

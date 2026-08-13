@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qteam.local/schemas/project-policy.schema.json",
+  "type": "object",
+  "required": ["schema_version", "workflow_shape_floor", "required_quality_lanes"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "workflow_shape_floor": {"enum": ["lean", "standard", "hardened"]},
+    "required_quality_lanes": {
+      "type": "object",
+      "required": ["refactor", "hardening", "public-surface-qa"],
+      "properties": {
+        "refactor": {"$ref": "#/$defs/rule"},
+        "hardening": {"$ref": "#/$defs/rule"},
+        "public-surface-qa": {"$ref": "#/$defs/rule"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "rule": {
+      "type": "object",
+      "required": ["work_kinds", "risk_flags"],
+      "properties": {
+        "work_kinds": {
+          "type": "array", "uniqueItems": true,
+          "items": {"enum": ["feature", "bugfix", "debug", "refactor", "test", "integration", "docs", "config", "generated", "learning", "experiment"]}
+        },
+        "risk_flags": {
+          "type": "array", "uniqueItems": true,
+          "items": {"enum": ["concurrency", "security", "migration", "data-loss", "authorization", "authentication", "compatibility", "public-api"]}
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

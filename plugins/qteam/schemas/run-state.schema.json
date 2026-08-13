@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://qteam.local/schemas/run-state.schema.json",
   "type": "object",
-  "required": ["schema_version", "run_id", "goal", "base_branch", "base_commit", "integration_branch", "integration_provenance_head", "integration_provenance", "phase", "tasks", "waves", "gates", "risk_forced", "risk_required", "hard_to_reverse", "model_profiles", "review_model_profiles", "shared_surfaces", "finished"],
+  "required": ["schema_version", "run_id", "goal", "base_branch", "base_commit", "integration_branch", "integration_provenance_head", "integration_provenance", "phase", "tasks", "waves", "gates", "risk_forced", "risk_required", "hard_to_reverse", "model_profiles", "review_model_profiles", "shared_surfaces", "project_policy", "policy_layers", "quality_lanes", "work_queue", "finished"],
   "properties": {
     "schema_version": {"const": 6},
     "run_id": {"type": "string", "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"},
@@ -35,7 +35,7 @@
       "patternProperties": {
         "^[1-9][0-9]*$": {
           "type": "object",
-          "required": ["tasks", "execution_tier", "review_intensity", "require_risk_review", "risk_flags", "reversibility", "integration_lane", "require_user_finish_decision"],
+          "required": ["tasks", "execution_tier", "review_intensity", "require_risk_review", "risk_flags", "reversibility", "integration_lane", "require_user_finish_decision", "workflow_shape", "required_quality_lanes"],
           "properties": {
             "tasks": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}},
             "execution_tier": {"enum": ["economy", "standard", "deep"]},
@@ -44,6 +44,11 @@
             "reversibility": {"enum": ["contained-reversible", "wide-reversible", "hard-to-reverse"]},
             "integration_lane": {"enum": ["shadow", "reviewed", "human-only"]},
             "require_user_finish_decision": {"type": "boolean"},
+            "workflow_shape": {"enum": ["lean", "standard", "hardened"]},
+            "required_quality_lanes": {
+              "type": "array", "uniqueItems": true,
+              "items": {"enum": ["refactor", "hardening", "public-surface-qa"]}
+            },
             "risk_flags": {
               "type": "array", "uniqueItems": true,
               "items": {"enum": ["concurrency", "security", "migration", "data-loss", "authorization", "authentication", "compatibility", "public-api"]}
@@ -78,6 +83,45 @@
       }
     },
     "shared_surfaces": {"type": "array", "items": {"type": "string"}},
+    "project_policy": {"$ref": "project-policy.schema.json"},
+    "policy_layers": {
+      "type": "array", "minItems": 1, "maxItems": 2,
+      "prefixItems": [
+        {
+          "type": "object",
+          "required": ["name", "kind", "policy_version", "sha256", "defaults_sha256"],
+          "properties": {
+            "name": {"const": "qteam-core"}, "kind": {"const": "core"},
+            "policy_version": {"const": 3},
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "defaults_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }, "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["name", "kind", "path", "sha256", "effective_sha256"],
+          "properties": {
+            "name": {"const": "project"}, "kind": {"const": "project"},
+            "path": {"const": ".qteam/policy.json"},
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "effective_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }, "additionalProperties": false
+        }
+      ],
+      "items": false
+    },
+    "quality_lanes": {
+      "type": "object",
+      "patternProperties": {
+        "^[1-9][0-9]*$": {
+          "type": "object", "minProperties": 1,
+          "propertyNames": {"enum": ["refactor", "hardening", "public-surface-qa"]},
+          "additionalProperties": {"$ref": "quality-lane.schema.json"}
+        }
+      },
+      "additionalProperties": false
+    },
+    "work_queue": {"type": "array", "maxItems": 256, "items": {"$ref": "queue-item.schema.json"}},
     "decisions": {"type": "object"},
     "epic": {
       "type": "object",

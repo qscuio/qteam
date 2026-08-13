@@ -30,7 +30,8 @@ def repository_root(value):
 def cleanup_empty_directories(root):
     for relative in (
         ".codex/licenses", ".codex/schemas", ".codex/worker-prompts",
-        ".codex/agents", ".codex/bin", ".codex/qteam-backups/install",
+        ".codex/agents", ".codex/bin", ".codex/qteam-ui",
+        ".codex/qteam-backups/install",
         ".codex/qteam-backups", ".codex", ".agents/skills", ".agents",
     ):
         path = root / relative
@@ -101,7 +102,7 @@ def verify_preimage_destinations(root, manifest):
             )
 
 
-def uninstall(project):
+def uninstall(project, *, check_only=False):
     root = repository_root(project)
     manifest_path = safe_path(root, ".codex/qteam-project.json")
     if not manifest_path.is_file():
@@ -117,6 +118,9 @@ def uninstall(project):
         # These phases may only discard recovery data after the actual managed
         # destinations prove that no QTeam mutation remains.
         verify_preimage_destinations(root, manifest)
+        if check_only:
+            print(f"QTeam project runtime preflight passed for {root}")
+            return
         if backup_root.exists():
             shutil.rmtree(backup_root)
         manifest_path.unlink()
@@ -148,6 +152,10 @@ def uninstall(project):
             moved_actions.append(("restored", saved, destination))
         else:
             raise ValueError(f"missing QTeam moved backup: {record['backup']}")
+
+    if check_only:
+        print(f"QTeam project runtime preflight passed for {root}")
+        return
 
     # All paths, current content, and backup digests are proven before the first
     # mutation. Operations are idempotent if the process is interrupted.
@@ -186,9 +194,10 @@ def uninstall(project):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("project", nargs="?", default=".")
+    parser.add_argument("--check-only", action="store_true")
     args = parser.parse_args()
     try:
-        uninstall(args.project)
+        uninstall(args.project, check_only=args.check_only)
     except (OSError, UnicodeError, ValueError) as exc:
         raise SystemExit(f"error: {exc}")
 

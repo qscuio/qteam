@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>QTeam Control Plane</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">DURABLE DELIVERY</p>
+      <h1>QTeam Control Plane</h1>
+    </div>
+    <div class="top-actions">
+      <span id="connection" class="pill quiet">connecting</span>
+      <button id="refresh" class="ghost">Refresh</button>
+    </div>
+  </header>
+  <div class="shell">
+    <aside>
+      <div class="aside-title">Runs</div>
+      <nav id="runs" aria-label="QTeam runs"></nav>
+      <div class="legend">
+        <span><i class="dot lean"></i>lean</span>
+        <span><i class="dot standard"></i>standard</span>
+        <span><i class="dot hardened"></i>hardened</span>
+      </div>
+    </aside>
+    <main>
+      <section id="empty" class="empty">Select a durable run.</section>
+      <div id="dashboard" hidden>
+        <section class="hero panel">
+          <div>
+            <p id="run-id" class="eyebrow"></p>
+            <h2 id="goal"></h2>
+          </div>
+          <div class="hero-meta">
+            <div><span>Phase</span><strong id="phase"></strong></div>
+            <div><span>Wave</span><strong id="wave"></strong></div>
+            <div><span>Updated</span><strong id="updated"></strong></div>
+          </div>
+        </section>
+
+        <section class="stats" id="stats"></section>
+
+        <section class="panel">
+          <div class="section-heading">
+            <div><p class="eyebrow">DEPENDENCY GRAPH</p><h3>Delivery waves</h3></div>
+          </div>
+          <div id="graph" class="graph"></div>
+        </section>
+
+        <div class="two-col">
+          <section class="panel">
+            <div class="section-heading"><div><p class="eyebrow">ISOLATED PROCESSES</p><h3>Workers</h3></div></div>
+            <div id="workers" class="stack"></div>
+          </section>
+          <section class="panel">
+            <div class="section-heading"><div><p class="eyebrow">HEAD-BOUND EVIDENCE</p><h3>Delivery gates</h3></div></div>
+            <div id="gates" class="stack"></div>
+          </section>
+        </div>
+
+        <div class="two-col">
+          <section class="panel">
+            <div class="section-heading"><div><p class="eyebrow">POLICY GATES</p><h3>Quality lanes</h3></div></div>
+            <div id="quality" class="stack"></div>
+          </section>
+          <section class="panel">
+            <div class="section-heading">
+              <div><p class="eyebrow">COORDINATOR OWNED</p><h3>Batch queue</h3></div>
+              <button id="claim-queue" class="ghost small">Claim next batch</button>
+            </div>
+            <div id="queue" class="stack"></div>
+          </section>
+        </div>
+
+        <div class="two-col">
+          <section class="panel">
+            <div class="section-heading"><div><p class="eyebrow">HUMAN AUTHORITY</p><h3>Decisions</h3></div></div>
+            <div id="decisions" class="stack"></div>
+          </section>
+          <section class="panel">
+            <div class="section-heading"><div><p class="eyebrow">INDEPENDENT AXES</p><h3>Reviews</h3></div></div>
+            <div id="reviews" class="stack"></div>
+          </section>
+        </div>
+
+        <section class="panel">
+          <div class="section-heading">
+            <div><p class="eyebrow">ALLOWLISTED CONTROL</p><h3>Safe actions</h3></div>
+            <button id="finish-check" class="primary">Check finish gates</button>
+          </div>
+          <pre id="action-output" class="output">No action run.</pre>
+        </section>
+
+        <section class="panel">
+          <div class="section-heading"><div><p class="eyebrow">REDACTED EVENT VIEW</p><h3>Recent lifecycle</h3></div></div>
+          <ol id="events" class="timeline"></ol>
+        </section>
+      </div>
+    </main>
+  </div>
+  <template id="empty-row"><p class="empty-row">Nothing to show.</p></template>
+  <script src="/app.js" defer></script>
+</body>
+</html>

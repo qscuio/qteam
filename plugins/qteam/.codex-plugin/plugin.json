@@ -1,7 +1,7 @@
 {
   "name": "qteam",
-  "version": "0.11.0",
-  "description": "Durable multi-agent delivery with trajectory evidence, calibrated review, reversibility gates, artifact preflight, cross-run dependencies, isolated workers, TDD, diagnosis, and safe finish.",
+  "version": "0.12.0+codex.20260813181320",
+  "description": "Durable graph delivery with adaptive workflow shapes, conditional quality lanes, a local Web control plane, optional Herdr display, calibrated review, isolated workers, TDD, diagnosis, and safe finish.",
   "author": {
     "name": "qscuio",
     "url": "https://github.com/qscuio"
@@ -17,13 +17,15 @@
     "tdd",
     "debugging",
     "code-review",
-    "worktrees"
+    "worktrees",
+    "web-ui",
+    "herdr"
   ],
   "skills": "./skills/",
   "interface": {
     "displayName": "QTeam",
     "shortDescription": "Durable, gated multi-agent software delivery",
-    "longDescription": "Discover evidence-backed solution paths, then deliver through isolated worktrees, typed trajectory evidence, calibrated mandatory review, reversibility-aware decisions, cross-run dependencies, scenario-complete TDD, deterministic policy, and safe finish gates.",
+    "longDescription": "Discover evidence-backed solution paths, then deliver through isolated worktrees, adaptive workflow shapes, conditional quality lanes, a local Web control plane, optional Herdr display, typed trajectory evidence, calibrated mandatory review, reversibility-aware decisions, cross-run dependencies, scenario-complete TDD, deterministic policy, and safe finish gates.",
     "developerName": "qscuio",
     "category": "Developer Tools",
     "capabilities": [

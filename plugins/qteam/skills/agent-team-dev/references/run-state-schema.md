@@ -1,60 +1,49 @@
-# Durable run state (schema version 5)
+# Durable run state (schema version 6)
 
-`.agents/runs/<run-id>/` is runtime state and is gitignored. The coordinator
-must mutate it through `agent-team-state`, never by editing JSON.
+`.agents/runs/<run-id>/` is gitignored runtime state. Only the installed
+`agent-team-*` commands may mutate it; hand-edited JSON and replayed WAL intents
+are untrusted input.
 
 ```text
-state.json                 authoritative small run state
-events.jsonl               append-only audit events
-tasks/<id>.json            full task records
-decisions/<id>.json        exact human question, authority, scope, resolution
-workers/<id>.json          worker identity/lifecycle
-workers/<id>.result.json   durable exit result
-reviews/wave-N-<axis>.json immutable packet + finding ledger
-reviews/sources/<sha>.source content-addressed frozen review input
-reviews/results/*.json     bounded reviewer verdict artifacts
-reviews/receipts/*.json    read-only runner launch/result attestations
-verifications/*-tdd-*.log  replayed RED/GREEN evidence
-verifications/*-diagnosis-red.log replayed failure evidence
-worktrees/integration/     integration checkout
-worktrees/<id>/            task checkouts
-learning-outbox/           reviewed proposals
+state.json                  compact authoritative run projection
+events.jsonl                append-only transaction/event audit log
+tasks/<id>.json             immutable facts, derived policy, evidence
+decisions/<id>.json         scoped human authorization and resolution
+workers/<id>.json           isolated process identity/lifecycle
+reviews/wave-N-<axis>.json  frozen packet + finding ledger
+verifications/              stdout/stderr evidence and SHA-256 receipts
+worktrees/integration/      authoritative integration checkout
+worktrees/<id>/             isolated task checkout
+learning-outbox/            coordinator-decided proposals
 ```
 
-Canonical JSON Schemas are installed under `.codex/schemas/`. State version 5
-requires run identity, base/integration refs, a contiguous per-task integration
-provenance ledger, phase, compact task status map,
-derived wave policies, run model profiles, review-risk state, and `finished`.
-Task records require work/risk facts, a derived immutable policy, branch, exact
-worktree, non-empty write set, forbidden paths, verification command, and an
-immutable `depends_on` list. Each dependency must name an already-registered
-task in a strictly earlier wave. `PLAN_READY`, wave start, and task start
-revalidate the graph; a predecessor satisfies the execution gate only when its
-status is `merged` or `artifact_complete`. Dependency IDs and wave placement
-may change only through task replacement during `REPLANNING`.
-Feature/bugfix records also require structured test seams; bugfix/debug records
-require a frozen diagnosis command and failure pattern. A passing mechanical
-gate requires head-bound verification plus all required replayed TDD and
-diagnosis evidence.
-Feature/bugfix records also carry a deduplicated twelve-dimension scenario
-matrix. Tasks may name exact `required_decisions` and a typed handoff; open
-decision gates block only their declared task/wave/action/global scope, while
-finish rejects unresolved successor, decision, or replan handoffs.
-Fresh tasks created during `FIXING` additionally require unique `finding_ids`,
-serial execution, current integration HEAD as base, and a policy no stronger
-than the frozen wave; otherwise QTeam requires `REPLANNING`.
+State v6 freezes:
 
-State also carries `final_verification`, `reviews`, `learning`, and
-`public_boundary` gates.
-`READY_TO_FINISH` requires the first two `passed` and learning either `passed`
-or explicitly `skipped`; the publication boundary must be `passed` at the same
-integration HEAD. Every non-pending gate update includes evidence.
+- repository/run/base/integration identity and contiguous merge provenance;
+- the versioned core policy digest plus optional `.qteam/policy.json` layer;
+- compact task summaries, wave policy, reversibility/risk, model profiles;
+- conditional `refactor`, `hardening`, and `public-surface-qa` quality lanes;
+- a coordinator-owned bounded priority queue;
+- scoped decision, review, final verification, learning, and public-boundary
+  gates.
 
-Immediately before local integration or publication, finish records a
-purpose-tagged seal bound to the exact reviewed SHA and a digest of decisions,
-gates, task summaries, and review ledgers. State and review writers recheck
-that seal while holding the same run-state lock, preventing a pre-existing
-writer from committing between preflight and the external Git operation.
+Every task freezes its dependency list, exact write set, work/risk facts,
+workflow shape, model/review tier, TDD/debug requirements, conditional quality
+commands, and typed handoff. Dependencies must be earlier-wave tasks and become
+ready only at `merged` or `artifact_complete`. A replacement may change this
+contract only during `REPLANNING`.
+
+Quality lanes are wave-level and token-bounded. Each command runs in a detached
+checkout at the exact integration SHA. Every attempt retains command, exit code,
+stdout/stderr paths and hashes. A refactor lane additionally needs one current-
+head `quality-assess`: either a bounded `not-needed` rationale or an integrated
+same-wave refactor task. Task, TDD, diagnosis, experiment, and final verification
+likewise retain both output streams and bind current receipts by digest; legacy
+combined-stream receipts remain readable.
+
+The coordinator queue has at most 256 items. Only consumer `coordinator` may
+claim the deterministic highest-priority batch and complete it. Queue scheduling
+never bypasses dependency, task, review, or finish gates.
 
 ## State machine
 
@@ -65,68 +54,36 @@ INIT → SPEC_READY → PLAN_READY
 → next WAVE_RUNNING or LEARNING_EXPORT
 → READY_TO_FINISH → DONE
 
-Any active gate may enter REPLANNING, which returns only to SPEC_READY or
+Any active phase may enter REPLANNING, which returns only to SPEC_READY or
 PLAN_READY.
 ```
 
-`agent-team-state` validates every phase/task transition, locks `.state.lock`,
-persists a write-ahead `.transaction.json`, writes projections through fsync +
-atomic rename, appends a transaction-tagged event, then clears the intent.
-Every command recovers an interrupted intent before reading or mutating state.
-`DONE` is available only through its `finish` command; it requires
-`READY_TO_FINISH` and every task `merged` or `superseded`.
+Transactions use a singly-linked regular `.state.lock`, durable prepare record,
+validated `.transaction.json`, fsync + atomic replacement, final event, and
+intent removal. Recovery validates the exact event-specific write set and legal
+transition before replay; an already-finalized transaction may replay only when
+every target already equals its frozen value.
 
-Task statuses:
+`DONE` is available only through `finish`. It revalidates task ownership,
+integration provenance, all historical quality receipts, mandatory independent
+review axes, final verification, public-boundary evidence, typed handoffs,
+decision authorization, and current HEAD. Publication/local integration can be
+sealed to the exact reviewed head and authorization digest.
 
-```text
-pending → running → completed → merged
-   │          ├── blocked → pending/running/failed/superseded
-   │          └── failed → pending/superseded
-   └── superseded
-```
+## Resume and migration
 
-## Resume
+Find unfinished state files, select one unambiguously, read `status`, then
+resume its next action. `status` is the bounded operator projection; `show` is
+the explicit full diagnostic projection.
 
-Find unfinished state files. With one, read state plus the event tail and
-resume its current phase. With multiple, ask the user (or fail unattended).
-With none, call `agent-team-state init` before other work.
+Run `migrate-run` for unfinished schema 2-5 state and for schema-6 state that
+still has task-policy v2, missing additive v0.12 fields, or a changed frozen
+core/project policy identity. Migration is locked and atomic, rejects finished
+or publication-sealed runs and active workers/reviewers, preserves immutable
+historical duties monotonically, and sends active work to `REPLANNING`. It never
+infers authorization or weakens a frozen project floor/quality trigger. Finished
+legacy state remains readable but immutable.
 
-For an unfinished schema-version-2, schema-version-3, or schema-version-4 run, call
-`agent-team-state migrate-run`.
-The migration is one locked transaction across all task records and state.
-Merged/superseded/artifact tasks retain conservative historical policy;
-unfinished tasks are blocked until replaced during `REPLANNING` with explicit
-dependencies. The migration does not infer that a legacy missing field means
-the task had no prerequisites. It validates task identity, task/state status
-projection, and any existing dependency graph before one atomic write, and it
-invalidates a stale publication seal from the older schema.
-Legacy resolved decisions without a typed `allow`/`deny` outcome are reopened;
-QTeam never infers authorization from free-form choice text.
-
-Idempotent resume checks registered worktrees and existing branches before
-creation, task status before worker spawn, commit ancestry before cherry-pick,
-review packet head SHA before reuse, and worker PID start time/result before
-assuming a process still owns a record.
-
-`status` emits the compact operator packet: phase/wave, active and blocked
-tasks, dependency-ready tasks, exact dependency blockers, open questions,
-blocking handoffs, current integration HEAD, freshness of code-bearing gates,
-and one next action. During `WAVE_RUNNING`, that action never starts a task from
-a future wave. `show` remains the full debug projection. `boundary-check`
-ignores deletions and scans resulting
-added/modified text blobs for private runtime paths, recognizable or assigned
-credentials, and user-specific local paths; binary blobs fail closed. Its
-head-bound report records finding kind/path without copying secret values.
-
-Task verification is executed by `agent-team-state verify-task` inside the
-exact task worktree and records command, exit code, log, timestamp, and task
-HEAD SHA. Final verification uses `verify-final` in the exact integration
-worktree. Review and finish gates revalidate the current integration HEAD;
-mandatory axes also require distinct reviewer/session receipts produced by the
-packet-bound read-only runner. Every real wave must be reviewed, and the union
-of valid wave/fix packets must include each recorded merge commit; risk packets
-obey the same range rule. Each integration delta must byte-match the checked
-task diff and is recorded in a contiguous ownership chain; finish rejects any
-commit or change not owned by exactly one gated task. Merged task check/merge
-commits must remain ancestors of the frozen finish SHA.
-Arbitrary evidence strings cannot mark those gates passed.
+Idempotent resume checks worktree/branch identity, task status, commit ancestry,
+worker PID start time/result, packet head and reviewer receipt before taking an
+action. Never infer ownership from a directory or a process name alone.
