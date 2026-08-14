@@ -23,7 +23,7 @@ WORKER_PROMPTS = (
 )
 SCHEMAS = (
     "artifact-lint", "code-index", "decision-gate", "diagnosis", "epic",
-    "eval-case", "experiment", "experiment-verification", "finding", "handoff", "review-receipt", "review-result",
+    "eval-case", "experiment", "experiment-verification", "finding", "goal-status", "handoff", "review-receipt", "review-result",
     "run-state", "scenario-coverage", "spec-drift", "task-policy", "task",
     "project-policy", "quality-lane", "queue-item", "tdd-cycle", "trajectory",
     "verification", "worker-result",
@@ -33,13 +33,14 @@ PLUGIN_SKILLS = (
     "agent-team-dev", "brainstorming", "domain-modeling",
     "goal-execution-discipline", "grill-me", "grill-with-docs", "grilling",
     "qteam-diagnose", "qteam-explore", "qteam-review", "qteam-router",
-    "qteam-harden", "qteam-tdd", "to-spec", "to-tickets",
+    "qteam-goal", "qteam-harden", "qteam-tdd", "to-spec", "to-tickets",
     "verification-before-completion", "wayfinder", "writing-plans",
 )
 LEGACY_OWNED_PLUGIN_SKILLS = tuple(
-    name for name in PLUGIN_SKILLS if name not in {"qteam-explore", "qteam-harden"}
+    name for name in PLUGIN_SKILLS
+    if name not in {"qteam-explore", "qteam-goal", "qteam-harden"}
 )
-LOCAL_SKILL_CONFLICTS = ("qteam-explore", "qteam-harden")
+LOCAL_SKILL_CONFLICTS = ("qteam-explore", "qteam-goal", "qteam-harden")
 LEGACY_ORCHESTRATION_SKILLS = (
     "using-superpowers", "executing-plans", "subagent-driven-development",
     "requesting-code-review", "receiving-code-review",
@@ -50,6 +51,7 @@ LEGACY_ORCHESTRATION_SKILLS = (
 BINARIES = (
     "wake-agent-team", "agent-team-artifact", "agent-team-finish",
     "agent-team-check-task", "agent-team-doctor", "agent-team-state",
+    "agent-team-goal",
     "agent-team-worker", "agent-team-review", "agent-team-web",
     "agent-team-session", "agent_team_artifact.py", "agent_team_eval.py",
     "agent_team_policy.py", "import-agent-learning", "qteam-project-uninstall",
@@ -80,8 +82,14 @@ MOVED_PATHS = frozenset(
     + [f".agents/skills/{name}" for name in LEGACY_ORCHESTRATION_SKILLS]
     + [".codex/bin/__pycache__"]
 )
-V011_INSTALLED_PATHS = frozenset(
+V012_INSTALLED_PATHS = frozenset(
     INSTALLED_PATHS - {
+        ".codex/bin/agent-team-goal",
+        ".codex/schemas/goal-status.schema.json",
+    }
+)
+V011_INSTALLED_PATHS = frozenset(
+    V012_INSTALLED_PATHS - {
         ".codex/bin/agent-team-web",
         ".codex/bin/agent-team-session",
         ".codex/schemas/project-policy.schema.json",
@@ -323,6 +331,8 @@ def validate_manifest(root, manifest):
         supported_sets = (V010_INSTALLED_PATHS,)
     elif version_tuple < (0, 12, 0):
         supported_sets = (V011_INSTALLED_PATHS,)
+    elif version_tuple < (0, 13, 0):
+        supported_sets = (V012_INSTALLED_PATHS,)
     else:
         supported_sets = (INSTALLED_PATHS,)
     if installed_set not in supported_sets:

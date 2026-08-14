@@ -179,6 +179,7 @@ def installed_payloads(plugin_root, version, source_commit, stamp):
         "agent-team-check-task": "bin/agent-team-check-task.py",
         "agent-team-doctor": "bin/agent-team-doctor.sh",
         "agent-team-state": "bin/agent-team-state.py",
+        "agent-team-goal": "bin/agent-team-goal.py",
         "agent-team-worker": "bin/agent-team-worker.py",
         "agent-team-review": "bin/agent-team-review.py",
         "agent-team-web": "bin/agent-team-web.py",

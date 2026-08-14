@@ -227,8 +227,15 @@ def wait_capped_process(process, stdout_target, stderr_target,
         thread.start()
     try:
         while True:
+            poll_timeout = 0.1
+            if deadline is not None:
+                poll_timeout = min(
+                    poll_timeout, max(0.0, deadline - time.monotonic())
+                )
             try:
-                return_code = process.wait(timeout=0.1)
+                if poll_timeout <= 0:
+                    raise subprocess.TimeoutExpired(process.args, poll_timeout)
+                return_code = process.wait(timeout=poll_timeout)
                 break
             except subprocess.TimeoutExpired:
                 if (deadline is not None and time.monotonic() >= deadline
@@ -239,8 +246,13 @@ def wait_capped_process(process, stdout_target, stderr_target,
                     if not timed_out.is_set():
                         continue
                 stop()
+                grace = 2.0
+                if deadline is not None:
+                    grace = min(grace, max(0.0, deadline - time.monotonic()))
                 try:
-                    return_code = process.wait(timeout=2)
+                    if grace <= 0:
+                        raise subprocess.TimeoutExpired(process.args, grace)
+                    return_code = process.wait(timeout=grace)
                 except subprocess.TimeoutExpired:
                     stop(kill=True)
                     return_code = process.wait()

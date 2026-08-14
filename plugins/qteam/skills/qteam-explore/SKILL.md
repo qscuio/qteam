@@ -89,7 +89,10 @@ useful negative knowledge so later agents do not repeat failed searches.
 
 Label every statement as observed fact, source-backed inference, or proposal.
 Repository claims need file/symbol evidence; external claims need direct links
-to primary sources. Confidence reflects evidence quality, not persona count.
+to primary sources. Write the cited evidence to one durable Markdown artifact
+and return a bounded digest plus file pointers; do not paste an entire research
+history into the coordinator transcript. Confidence reflects evidence quality,
+not persona count.
 
 Stop when the selected breadth dimensions and promoted depth candidates satisfy
 the frontier rule, the decision has enough evidence, the packet's probe limit

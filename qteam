@@ -8,8 +8,11 @@ usage() {
   cat <<'USAGE'
 usage: ./qteam setup [project]
        ./qteam uninstall [project]
+       ./qteam runtime-setup <project>
+       ./qteam runtime-uninstall <project>
        ./qteam doctor <project> [--smoke]
        ./qteam serve <project> [web-options]
+       ./qteam goal <project> --run <run-id> <status|condition|wait|cursor-stop> [options]
        ./qteam herdr doctor
        ./qteam herdr open <project> --run <run-id> [session-options]
 
@@ -19,9 +22,15 @@ it also installs the small repository runtime required for isolated workers.
 uninstall removes that project runtime when project is given, then removes the
 QTeam plugin and its marketplace registration.
 
+runtime-setup/runtime-uninstall manage only the host-neutral repository runtime
+for Claude Code, Cursor, or a Codex installation managed separately.
+
 serve starts the local QTeam Web control plane. herdr optionally opens the
 same Web/watch surface in a Herdr pane; neither command changes orchestration
 authority.
+
+goal projects durable QTeam state into a Codex, Claude Code, or Cursor session
+and provides a blocking checkpoint wait without model-turn polling.
 USAGE
 }
 
@@ -169,7 +178,7 @@ main() {
           echo "QTeam setup complete. Start a new Codex task to load the plugin."
           return 0
         fi
-        for local_skill in qteam-explore qteam-harden; do
+        for local_skill in qteam-explore qteam-goal qteam-harden; do
           if [[ -e "$project_root/.agents/skills/$local_skill" || \
                 -L "$project_root/.agents/skills/$local_skill" ]]; then
             echo "error: repository-local .agents/skills/$local_skill conflicts with the QTeam plugin and is not QTeam-owned" >&2
@@ -218,6 +227,25 @@ main() {
       remove_plugin
       echo "QTeam uninstall complete. Start a new Codex task to drop cached skills."
       ;;
+    runtime-setup)
+      [[ $# -eq 2 ]] || { usage >&2; exit 2; }
+      require_command git
+      project_root="$(git -C "$2" rev-parse --show-toplevel)"
+      if [[ -e "$project_root/.codex/qteam-project.json" || \
+            -L "$project_root/.codex/qteam-project.json" || \
+            -e "$project_root/.codex/qteam-refresh" || \
+            -L "$project_root/.codex/qteam-refresh" ]]; then
+        "$ROOT/plugins/qteam/scripts/project-refresh.py" "$project_root"
+      else
+        "$ROOT/plugins/qteam/scripts/project-setup.py" "$project_root"
+      fi
+      echo "QTeam repository runtime setup complete."
+      ;;
+    runtime-uninstall)
+      [[ $# -eq 2 ]] || { usage >&2; exit 2; }
+      "$ROOT/plugins/qteam/scripts/project-uninstall.py" "$2"
+      echo "QTeam repository runtime uninstall complete."
+      ;;
     doctor)
       require_command codex
       [[ $# -ge 2 && $# -le 3 ]] || { usage >&2; exit 2; }
@@ -237,6 +265,17 @@ main() {
       }
       shift 2
       (cd "$project_root" && exec .codex/bin/agent-team-web --repo "$project_root" "$@")
+      ;;
+    goal)
+      [[ $# -ge 5 && "${3:-}" == "--run" ]] || { usage >&2; exit 2; }
+      require_command git
+      project_root="$(git -C "$2" rev-parse --show-toplevel)"
+      [[ -x "$project_root/.codex/bin/agent-team-goal" ]] || {
+        echo "error: QTeam project runtime is not installed; run ./qteam setup '$project_root'" >&2
+        exit 3
+      }
+      shift 2
+      (cd "$project_root" && exec .codex/bin/agent-team-goal "$@")
       ;;
     herdr)
       case "${2:-}" in

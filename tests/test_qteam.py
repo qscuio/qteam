@@ -1,6 +1,8 @@
 import json
 import hashlib
 import importlib.util
+import contextlib
+import io
 import os
 import re
 import shutil
@@ -29,6 +31,7 @@ IMPORT = PLUGIN / "bin/import-agent-learning.py"
 WAKE = PLUGIN / "bin/wake-agent-team.sh"
 WEB = PLUGIN / "bin/agent-team-web.py"
 SESSION = PLUGIN / "bin/agent-team-session.py"
+GOAL = PLUGIN / "bin/agent-team-goal.py"
 PROJECT_SETUP = PLUGIN / "scripts/project-setup.py"
 PROJECT_UNINSTALL = PLUGIN / "scripts/project-uninstall.py"
 PROJECT_REFRESH = PLUGIN / "scripts/project-refresh.py"
@@ -890,6 +893,11 @@ class StateTests(RepoCase):
             STATE, "--run", str(run), "phase", "WAVE_VALIDATING", check=True
         )
         self.run_tool(CHECK, "--run", str(run), "--task", "T01", check=True)
+        goal = json.loads(self.run_tool(
+            GOAL, "--run", str(run.name), "status", check=True,
+        ).stdout)
+        self.assertTrue(goal["waiting_for_human"])
+        self.assertEqual(goal["goal_state"], "waiting-for-human")
         resolved = self.run_tool(
             STATE, "--run", str(run), "decision-resolve", "D-after",
             "--outcome", "allow", "--choice", "publish",
@@ -1589,6 +1597,42 @@ class EvaluationContractTests(RepoCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module
+
+    def test_capped_process_first_poll_uses_remaining_deadline(self):
+        module = self.load_eval_module()
+
+        class FakeProcess:
+            args = ["fake-runner"]
+            pid = 99999999
+
+            def __init__(self):
+                self.stdout = io.BytesIO()
+                self.stderr = io.BytesIO()
+                self.wait_timeouts = []
+
+            def wait(self, timeout=None):
+                self.wait_timeouts.append(timeout)
+                if timeout is None:
+                    return -9
+                time.sleep(timeout)
+                raise subprocess.TimeoutExpired(self.args, timeout)
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+        process = FakeProcess()
+        with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stdout, \
+                tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr:
+            result = module.wait_capped_process(
+                process, stdout, stderr, limit=1024,
+                process_group=False, timeout_seconds=0.01,
+            )
+        self.assertTrue(result[2])
+        self.assertGreater(process.wait_timeouts[0], 0)
+        self.assertLessEqual(process.wait_timeouts[0], 0.01)
 
     def test_cross_family_claim_requires_complete_worker_visibility(self):
         module = self.load_eval_module()
@@ -2833,6 +2877,25 @@ class OperatorSurfaceTests(RepoCase):
 
 
 class WorkerTests(RepoCase):
+    def test_worker_process_identity_requires_a_recorded_start(self):
+        spec = importlib.util.spec_from_file_location(
+            "qteam_worker_identity_test", WORKER
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.path.insert(0, str(WORKER.parent))
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            sys.path.pop(0)
+        for missing in ({"pid": 99999999}, {"pid": 99999999,
+                                             "proc_start": None}):
+            self.assertFalse(module.alive(missing))
+        for missing in (
+            {"launch_owner_pid": 99999999},
+            {"launch_owner_pid": 99999999, "launch_owner_start": None},
+        ):
+            self.assertFalse(module.launching_active(missing))
+
     def test_worker_rejects_symlinked_workers_root_before_writing(self):
         run = self.init_run("worker-root-symlink")
         self.make_task(run)
@@ -6080,6 +6143,284 @@ class LearningImportTests(RepoCase):
         )
 
 
+class GoalAdapterTests(RepoCase):
+    def test_goal_projects_durable_state_and_host_conditions(self):
+        self.init_run("goal-run")
+        result = self.run_tool(GOAL, "--run", "goal-run", "status")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        packet = json.loads(result.stdout)
+        self.assertEqual(packet["goal_state"], "actionable")
+        self.assertRegex(packet["checkpoint"], r"^[0-9a-f]{64}$")
+        self.assertEqual(packet["status"]["run_id"], "goal-run")
+        self.assertEqual(packet["status"]["task_counts"]["pending"], 0)
+        self.assertNotIn("tasks", packet["status"])
+        self.assertLess(len(result.stdout.encode("utf-8")), 16 * 1024)
+        for host, field in (("claude", "native_command"),
+                            ("codex", "native_action"),
+                            ("cursor", "hook_command")):
+            conditioned = self.run_tool(
+                GOAL, "--run", "goal-run", "condition", "--host", host,
+            )
+            self.assertEqual(conditioned.returncode, 0, conditioned.stderr)
+            value = json.loads(conditioned.stdout)
+            self.assertIn(field, value)
+            self.assertIn("goal_state=achieved", value["condition"])
+            if host == "claude":
+                self.assertIn("goal_state=waiting-for-human", value["condition"])
+                self.assertIn("ends only this /goal lease", value["condition"])
+
+    def test_goal_wait_blocks_one_call_until_checkpoint_changes(self):
+        self.init_run("goal-wait")
+        initial = json.loads(self.run_tool(
+            GOAL, "--run", "goal-wait", "status", check=True,
+        ).stdout)
+        waiting = subprocess.Popen(
+            [sys.executable, str(GOAL), "--run", "goal-wait", "wait",
+             "--after", initial["checkpoint"], "--timeout", "5",
+             "--interval", "0.1"],
+            cwd=self.repo, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        time.sleep(0.2)
+        advanced = self.run_tool(
+            STATE, "--run", "goal-wait", "phase", "SPEC_READY",
+        )
+        self.assertEqual(advanced.returncode, 0, advanced.stderr)
+        stdout, stderr = waiting.communicate(timeout=5)
+        self.assertEqual(waiting.returncode, 0, stderr)
+        changed = json.loads(stdout)
+        self.assertNotEqual(changed["checkpoint"], initial["checkpoint"])
+        self.assertEqual(changed["phase"], "SPEC_READY")
+
+    def test_goal_wait_timeout_and_cursor_stop_are_bounded(self):
+        self.init_run("goal-bounds")
+        initial = json.loads(self.run_tool(
+            GOAL, "--run", "goal-bounds", "status", check=True,
+        ).stdout)
+        timeout = self.run_tool(
+            GOAL, "--run", "goal-bounds", "wait", "--after",
+            initial["checkpoint"], "--timeout", "0.5", "--interval", "0.1",
+        )
+        self.assertEqual(timeout.returncode, 124, timeout.stderr)
+        self.assertTrue(json.loads(timeout.stdout)["wait_timed_out"])
+        hook = subprocess.run(
+            [sys.executable, str(GOAL), "--run", "goal-bounds",
+             "cursor-stop", "--max-iterations", "2"],
+            cwd=self.repo, text=True, input=json.dumps({
+                "status": "completed", "loop_count": 0,
+                "conversation_id": "cursor-test",
+            }), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(hook.returncode, 0, hook.stderr)
+        self.assertIn("followup_message", json.loads(hook.stdout))
+        capped = subprocess.run(
+            [sys.executable, str(GOAL), "--run", "goal-bounds",
+             "cursor-stop", "--max-iterations", "2"],
+            cwd=self.repo, text=True, input=json.dumps({
+                "status": "completed", "loop_count": 2,
+            }), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(json.loads(capped.stdout), {})
+
+    def test_goal_rejects_escaped_worker_result_without_traceback(self):
+        run = self.init_run("goal-path")
+        workers = run / "workers"
+        workers.mkdir(exist_ok=True)
+        (workers / "T01.json").write_text(json.dumps({
+            "task": "T01", "state": "running", "result": "../outside.json",
+        }), encoding="utf-8")
+        rejected = self.run_tool(GOAL, "--run", "goal-path", "status")
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("unsafe worker result", rejected.stderr)
+        self.assertNotIn("Traceback", rejected.stderr)
+
+    def test_goal_ignores_dead_external_records_and_detects_live_process(self):
+        run = self.init_run("goal-live")
+        workers = run / "workers"
+        workers.mkdir(exist_ok=True)
+        record = {
+            "task": "T01", "state": "running",
+            "result": "workers/T01.result.json", "pid": 99999999,
+            "proc_start": "not-live",
+        }
+        (workers / "T01.json").write_text(json.dumps(record), encoding="utf-8")
+        stale = json.loads(self.run_tool(
+            GOAL, "--run", "goal-live", "status", check=True,
+        ).stdout)
+        self.assertEqual(stale["goal_state"], "actionable")
+
+        record.update({"pid": os.getpid()})
+        record.pop("proc_start", None)
+        (workers / "T01.json").write_text(json.dumps(record), encoding="utf-8")
+        missing_identity = json.loads(self.run_tool(
+            GOAL, "--run", "goal-live", "status", check=True,
+        ).stdout)
+        self.assertEqual(missing_identity["goal_state"], "actionable")
+        record["proc_start"] = None
+        (workers / "T01.json").write_text(json.dumps(record), encoding="utf-8")
+        null_identity = json.loads(self.run_tool(
+            GOAL, "--run", "goal-live", "status", check=True,
+        ).stdout)
+        self.assertEqual(null_identity["goal_state"], "actionable")
+        (workers / "T01.json").write_text(json.dumps({
+            "task": "T01", "state": "launching",
+            "result": "workers/T01.result.json",
+            "launch_owner_pid": os.getpid(),
+        }), encoding="utf-8")
+        missing_launch_identity = json.loads(self.run_tool(
+            GOAL, "--run", "goal-live", "status", check=True,
+        ).stdout)
+        self.assertEqual(missing_launch_identity["goal_state"], "actionable")
+
+        record["state"] = "running"
+        record.update({
+            "pid": os.getpid(),
+            "proc_start": Path(f"/proc/{os.getpid()}/stat").read_text().split()[21],
+        })
+        (workers / "T01.json").write_text(json.dumps(record), encoding="utf-8")
+        live = json.loads(self.run_tool(
+            GOAL, "--run", "goal-live", "status", check=True,
+        ).stdout)
+        self.assertEqual(live["goal_state"], "waiting-for-external-work")
+
+        (workers / "T01.json").write_text(json.dumps({
+            "task": "T01", "state": "failed", "result": "workers/missing.json",
+        }), encoding="utf-8")
+        receipts = run / "reviews/receipts"
+        receipts.mkdir(parents=True, exist_ok=True)
+        (receipts / "stale.json").write_text(json.dumps({
+            "status": "running", "pid": 99999999, "proc_start": "not-live",
+        }), encoding="utf-8")
+        stale_review = json.loads(self.run_tool(
+            GOAL, "--run", "goal-live", "status", check=True,
+        ).stdout)
+        self.assertEqual(stale_review["goal_state"], "actionable")
+        (receipts / "stale.json").write_text(json.dumps({
+            "status": "running", "pid": os.getpid(), "proc_start": None,
+        }), encoding="utf-8")
+        missing_review_identity = json.loads(self.run_tool(
+            GOAL, "--run", "goal-live", "status", check=True,
+        ).stdout)
+        self.assertEqual(missing_review_identity["goal_state"], "actionable")
+        (receipts / "stale.json").write_text(json.dumps({
+            "status": "running", "pid": os.getpid(),
+            "proc_start": Path(
+                f"/proc/{os.getpid()}/stat"
+            ).read_text().split()[21],
+        }), encoding="utf-8")
+        live_review = json.loads(self.run_tool(
+            GOAL, "--run", "goal-live", "status", check=True,
+        ).stdout)
+        self.assertEqual(live_review["goal_state"], "waiting-for-external-work")
+
+    def test_goal_rejects_symlinked_wake_parent_and_oversized_record(self):
+        run = self.init_run("goal-bounds-path")
+        reviews = run / "reviews"
+        if reviews.exists():
+            reviews.rmdir()
+        outside = Path(self.tmp.name) / "outside-reviews"
+        (outside / "receipts").mkdir(parents=True)
+        os.symlink(outside, reviews)
+        rejected = self.run_tool(GOAL, "--run", "goal-bounds-path", "status")
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("unsafe goal wake directory", rejected.stderr)
+        reviews.unlink()
+        workers = run / "workers"
+        workers.mkdir(exist_ok=True)
+        (workers / "T01.json").write_bytes(b"{" + b"x" * (1024 * 1024 + 1))
+        oversized = self.run_tool(GOAL, "--run", "goal-bounds-path", "status")
+        self.assertNotEqual(oversized.returncode, 0)
+        self.assertIn("exceeds the bounded size", oversized.stderr)
+        (workers / "T01.json").write_text(json.dumps({
+            "task": "T01", "state": "failed", "result": "workers/missing.json",
+        }), encoding="utf-8")
+        receipts = run / "reviews/receipts"
+        receipts.mkdir(parents=True, exist_ok=True)
+        (receipts / "scalar.json").write_text("[]", encoding="utf-8")
+        malformed = self.run_tool(GOAL, "--run", "goal-bounds-path", "status")
+        self.assertNotEqual(malformed.returncode, 0)
+        self.assertIn("review receipt must be an object", malformed.stderr)
+
+    def test_goal_wait_enforces_wall_clock_when_status_hangs(self):
+        self.init_run("goal-timeout")
+        slow = Path(self.tmp.name) / "slow-state.py"
+        slow.write_text(
+            "import signal, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "time.sleep(10)\n",
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        env["QTEAM_STATE_BIN"] = str(slow)
+        started = time.monotonic()
+        result = self.run_tool(
+            GOAL, "--run", "goal-timeout", "wait", "--after", "0" * 64,
+            "--timeout", "0.1", "--interval", "0.1", env=env,
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 124, result.stderr)
+        self.assertLess(elapsed, 1.0)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_goal_wait_never_sleeps_with_a_negative_interval(self):
+        self.init_run("goal-negative-sleep")
+        sys.path.insert(0, str(PLUGIN / "bin"))
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "qteam_goal_negative_sleep_test", GOAL
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        finally:
+            sys.path.pop(0)
+        original_sleep = time.sleep
+
+        def slow_unchanged_packet(_repo, _run, status_timeout=None):
+            del status_timeout
+            original_sleep(0.08)
+            return {
+                "checkpoint": "0" * 64,
+                "goal_state": "actionable",
+            }
+
+        module.goal_packet = slow_unchanged_packet
+        args = SimpleNamespace(
+            run="goal-negative-sleep", after="0" * 64,
+            timeout=0.04, interval=0.1,
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), \
+                self.assertRaises(SystemExit) as stopped:
+            module.cmd_wait(args, self.repo)
+        self.assertEqual(stopped.exception.code, 124)
+        self.assertTrue(json.loads(output.getvalue())["wait_timed_out"])
+
+    def test_goal_treats_resolved_deny_as_coordinator_action(self):
+        run = self.init_run("goal-deny")
+        decision = self.repo / "goal-deny.json"
+        decision.write_text(json.dumps({
+            "schema_version": 1, "id": "D-wave", "status": "open",
+            "question": "Start this wave?", "authority": "user",
+            "scope": {"kind": "action", "targets": ["wave-start"]},
+        }), encoding="utf-8")
+        self.run_tool(STATE, "--run", str(run), "decision-put", "--file",
+                      str(decision), check=True)
+        self.make_task(run)
+        self.run_tool(STATE, "--run", str(run), "phase", "SPEC_READY", check=True)
+        self.run_tool(STATE, "--run", str(run), "phase", "PLAN_READY", check=True)
+        self.run_tool(
+            STATE, "--run", str(run), "decision-resolve", "D-wave",
+            "--outcome", "deny", "--choice", "do not start",
+            "--evidence", "explicit refusal", check=True,
+        )
+        packet = json.loads(self.run_tool(
+            GOAL, "--run", "goal-deny", "status", check=True,
+        ).stdout)
+        self.assertFalse(packet["waiting_for_human"])
+        self.assertEqual(packet["goal_state"], "actionable")
+        self.assertIn("honor denied decision", packet["next_action"])
+
+
 class InstallerTests(RepoCase):
     def fake_plugin_env(self):
         fake_bin = Path(self.tmp.name) / "doctor-bin"
@@ -6137,6 +6478,7 @@ class InstallerTests(RepoCase):
         self.assertTrue((self.repo / ".codex/bin/import-agent-learning").is_file())
         self.assertTrue((self.repo / ".codex/bin/agent-team-web").is_file())
         self.assertTrue((self.repo / ".codex/bin/agent-team-session").is_file())
+        self.assertTrue((self.repo / ".codex/bin/agent-team-goal").is_file())
         self.assertTrue((self.repo / ".codex/qteam-ui/index.html").is_file())
         self.assertTrue((self.repo / ".codex/qteam-ui/app.js").is_file())
         self.assertTrue((self.repo / ".codex/qteam-ui/styles.css").is_file())
@@ -6164,6 +6506,8 @@ class InstallerTests(RepoCase):
                          ".codex/schemas/code-index.schema.json").is_file())
         self.assertTrue((self.repo /
                          ".codex/schemas/spec-drift.schema.json").is_file())
+        self.assertTrue((self.repo /
+                         ".codex/schemas/goal-status.schema.json").is_file())
         self.assertTrue((self.repo / ".codex/licenses/Superpowers-MIT.txt").is_file())
         self.assertTrue((self.repo / ".codex/licenses/Autoresearch-MIT.txt").is_file())
         self.assertTrue((self.repo / ".codex/licenses/LoopX-MIT.txt").is_file())
@@ -6187,6 +6531,16 @@ class InstallerTests(RepoCase):
         self.assertIn("finding.schema.json", doctor.stdout)
         finding_schema.write_text(expected_schema, encoding="utf-8")
 
+        goal_schema = self.repo / ".codex/schemas/goal-status.schema.json"
+        hidden_goal_schema = goal_schema.with_suffix(".hidden")
+        goal_schema.rename(hidden_goal_schema)
+        doctor = subprocess.run([str(self.repo / ".codex/bin/agent-team-doctor")],
+                                cwd=self.repo, text=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, env=self.fake_plugin_env())
+        self.assertNotEqual(doctor.returncode, 0)
+        self.assertIn("goal-status", doctor.stdout)
+        hidden_goal_schema.rename(goal_schema)
+
         conflict = self.repo / ".agents/skills/qteam-explore"
         conflict.mkdir(parents=True)
         (conflict / "SKILL.md").write_text("local discovery\n", encoding="utf-8")
@@ -6196,6 +6550,16 @@ class InstallerTests(RepoCase):
         self.assertNotEqual(doctor.returncode, 0)
         self.assertIn("qteam-explore", doctor.stdout)
         shutil.rmtree(conflict)
+
+        goal_conflict = self.repo / ".agents/skills/qteam-goal"
+        goal_conflict.mkdir(parents=True)
+        (goal_conflict / "SKILL.md").write_text("competing goal\n", encoding="utf-8")
+        doctor = subprocess.run([str(self.repo / ".codex/bin/agent-team-doctor")],
+                                cwd=self.repo, text=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, env=self.fake_plugin_env())
+        self.assertNotEqual(doctor.returncode, 0)
+        self.assertIn("qteam-goal", doctor.stdout)
+        shutil.rmtree(goal_conflict)
 
         removed = self.run_tool(PROJECT_UNINSTALL, str(self.repo))
         self.assertEqual(removed.returncode, 0, removed.stdout + removed.stderr)
@@ -6484,6 +6848,34 @@ class InstallerTests(RepoCase):
 
 
 class PluginTests(RepoCase):
+    def test_host_neutral_runtime_setup_goal_and_uninstall(self):
+        setup = subprocess.run(
+            [str(QTEAM), "runtime-setup", str(self.repo)], cwd=SOURCE,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(setup.returncode, 0, setup.stdout + setup.stderr)
+        self.assertTrue((self.repo / ".codex/bin/agent-team-goal").is_file())
+        state = self.repo / ".codex/bin/agent-team-state"
+        initialized = subprocess.run(
+            [str(state), "--run", "portable", "init", "--goal", "portable"],
+            cwd=self.repo, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
+        projected = subprocess.run(
+            [str(QTEAM), "goal", str(self.repo), "--run", "portable", "status"],
+            cwd=SOURCE, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(projected.returncode, 0, projected.stderr)
+        self.assertEqual(json.loads(projected.stdout)["run_id"], "portable")
+        removed = subprocess.run(
+            [str(QTEAM), "runtime-uninstall", str(self.repo)], cwd=SOURCE,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(removed.returncode, 0, removed.stdout + removed.stderr)
+        self.assertFalse((self.repo / ".codex/qteam-project.json").exists())
+
     def test_atomic_write_fsyncs_mode_before_publication(self):
         spec = importlib.util.spec_from_file_location(
             "qteam_project_atomic_write_test",
@@ -6542,7 +6934,20 @@ class PluginTests(RepoCase):
             manifest["version"].split("+", 1)[0],
             (PLUGIN / "VERSION").read_text(encoding="utf-8").strip(),
         )
-        self.assertRegex(manifest["version"], r"^0\.12\.0\+codex\.[0-9]+$")
+        self.assertRegex(manifest["version"], r"^0\.13\.0\+codex\.[0-9]+$")
+
+        claude = json.loads((PLUGIN / ".claude-plugin/plugin.json").read_text())
+        cursor = json.loads((PLUGIN / ".cursor-plugin/plugin.json").read_text())
+        claude_marketplace = json.loads(
+            (SOURCE / ".claude-plugin/marketplace.json").read_text()
+        )
+        self.assertEqual(claude["version"], "0.13.0")
+        self.assertEqual(cursor["version"], "0.13.0")
+        self.assertEqual(cursor["skills"], "./skills/")
+        self.assertEqual(claude_marketplace["plugins"][0]["version"], "0.13.0")
+        self.assertEqual(
+            claude_marketplace["plugins"][0]["source"], "./plugins/qteam"
+        )
 
     def fake_codex_env(self):
         fake_bin = Path(self.tmp.name) / "plugin-bin"
@@ -6972,6 +7377,8 @@ class PluginTests(RepoCase):
                     ".codex/qteam-ui/index.html",
                     ".codex/qteam-ui/app.js",
                     ".codex/qteam-ui/styles.css",
+                    ".codex/bin/agent-team-goal",
+                    ".codex/schemas/goal-status.schema.json",
                 }
                 if schema_version == 2:
                     previous_paths.add(importer_path)
@@ -7047,6 +7454,8 @@ class PluginTests(RepoCase):
             ".codex/qteam-ui/index.html",
             ".codex/qteam-ui/app.js",
             ".codex/qteam-ui/styles.css",
+            ".codex/bin/agent-team-goal",
+            ".codex/schemas/goal-status.schema.json",
         }
         manifest["installed_files"] = [
             record for record in manifest["installed_files"]
@@ -7069,6 +7478,31 @@ class PluginTests(RepoCase):
         for relative in additions:
             self.assertTrue((self.repo / relative).is_file())
 
+    def test_setup_upgrades_v012_runtime_with_goal_adapter(self):
+        self.run_tool(PROJECT_SETUP, str(self.repo), check=True)
+        manifest_path = self.repo / ".codex/qteam-project.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        additions = {
+            ".codex/bin/agent-team-goal",
+            ".codex/schemas/goal-status.schema.json",
+        }
+        manifest["installed_files"] = [
+            record for record in manifest["installed_files"]
+            if record["path"] not in additions
+        ]
+        for relative in additions:
+            (self.repo / relative).unlink()
+        manifest["version"] = "0.12.0"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        env, _state, _log = self.fake_codex_env()
+        upgraded = subprocess.run(
+            [str(QTEAM), "setup", str(self.repo)], cwd=SOURCE, env=env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(upgraded.returncode, 0, upgraded.stdout + upgraded.stderr)
+        for relative in additions:
+            self.assertTrue((self.repo / relative).is_file())
+
     def test_uninstall_conflict_makes_no_plugin_or_marketplace_mutation(self):
         env, state, log = self.fake_codex_env()
         state.write_text(json.dumps({"marketplace": True, "plugin": True}),
@@ -7088,6 +7522,23 @@ class PluginTests(RepoCase):
 
 
 class InteractionContractTests(unittest.TestCase):
+    def test_goal_adapter_and_refreshed_upstream_primitives_are_explicit(self):
+        goal = (PLUGIN / "skills/qteam-goal/SKILL.md").read_text(encoding="utf-8")
+        grilling = (PLUGIN / "skills/grilling/SKILL.md").read_text(encoding="utf-8")
+        tickets = (PLUGIN / "skills/to-tickets/SKILL.md").read_text(encoding="utf-8")
+        workflow = (PLUGIN / "skills/agent-team-dev/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        notices = (PLUGIN / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+        self.assertIn("durable goal", goal.lower())
+        self.assertIn("blocking wait", goal.lower())
+        self.assertIn("never makes it mandatory", " ".join(goal.split()))
+        self.assertIn("frontier of independent", grilling)
+        self.assertIn("expand phase", tickets)
+        self.assertIn("one blocking `wait`", workflow)
+        self.assertIn("Superpowers 6.3", notices)
+        self.assertIn("must fix every valid finding", notices)
+
     def test_existing_roles_own_decisions_handoffs_scenarios_and_publication(self):
         workflow = (PLUGIN / "skills/agent-team-dev/SKILL.md").read_text(
             encoding="utf-8"

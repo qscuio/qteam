@@ -6,8 +6,11 @@ adapt workflow ideas from Matt Pocock's skills collection (MIT License,
 copyright 2026 Matt Pocock). They have been rewritten to make QTeam the sole
 orchestration authority. The TDD synthesis retains public behavior seams,
 vertical RED/GREEN slices, independent expected values, and boundary-only
-mocking; diagnosis retains feedback-loop-first, minimized-repro, and ranked
-falsifiable-hypothesis practices.
+mocking; diagnosis retains feedback-loop-first, minimized-repro, ranked
+falsifiable-hypothesis practices, and secret-redacted signal capture. QTeam
+also adapts Matt's dependency-frontier grilling, one-fresh-context ticket size,
+expand/migrate/contract refactors, phase-boundary context choice, primary-source
+research artifacts, and deep-module seam vocabulary.
 
 `qteam-tdd` and `qteam-diagnose` also adapt RED-before-production, verified
 failure, minimal GREEN, root-cause tracing, and cleanup principles from
@@ -16,6 +19,12 @@ snapshot is archived under `upstream/superpowers/`, outside the plugin's
 discoverable `skills/` directory. Only the bounded, QTeam-owned primitives in
 `skills/` are exposed. The upstream license is reproduced in
 `LICENSES/Superpowers-MIT.txt`.
+
+The QTeam coordinator further adapts Superpowers 6.3's spike/bounded/
+architectural design routing, durable file handoffs, bounded blocking waits,
+and same-shape task grouping. It deliberately does not adopt Superpowers'
+independent orchestration loop or its late-round option to park a valid review
+finding: QTeam must fix every valid finding before completion.
 
 `qteam-explore` and the QTeam test-design packet adapt bounded metric iteration,
 evidence logging, scenario-dimension coverage, saturation, guard checks, and

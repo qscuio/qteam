@@ -1,6 +1,6 @@
 ---
 name: domain-modeling
-description: Sharpen ubiquitous language, bounded contexts, and durable architectural decisions during design.
+description: Use when discussing codebase terminology, writing or editing CONTEXT.md, or deciding whether a durable architectural decision needs an ADR.
 ---
 
 # Domain Modeling

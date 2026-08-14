@@ -1,14 +1,19 @@
 ---
 name: grilling
-description: Stress-test an unresolved plan or design branch through a one-question-at-a-time interview.
+description: Stress-test an unresolved plan or design branch through dependency-ordered question frontiers.
 ---
 
 # Grilling
 
-Interview the user one decision at a time until the selected design branch is
-shared and explicit. Walk dependencies in order and include a recommended
-answer with each question. Discover repository facts yourself; ask the user
-only for decisions. Do not ask bundles of questions and do not implement.
+Interview in rounds. In each round, ask the current frontier of independent
+decisions; hold dependent questions for a later round. Number every question,
+give 2–3 mutually exclusive choices, and recommend one with its trade-off.
+Keep the frontier small enough to answer coherently. Wait for the full round
+before advancing.
+
+Discover repository and external facts yourself; ask the user only for choices
+that require their authority. Missing fact research may run in the background
+and must not block an unrelated frontier question. Do not implement.
 
 Inside QTeam this is a decision primitive called by `qteam-router`,
 `brainstorming`, `architect`, or `wayfinder`. When the branch is resolved,

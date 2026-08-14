@@ -130,17 +130,34 @@ def atomic_text(path, value):
 
 
 def proc_start(pid):
+    if type(pid) is not int or pid <= 1:
+        return None
     try:
         return Path(f"/proc/{pid}/stat").read_text().split()[21]
     except (OSError, IndexError):
+        pass
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)], text=True, timeout=1,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired):
         return None
+    value = " ".join(result.stdout.split())
+    return value if result.returncode == 0 and value else None
+
+
+def process_identity_matches(record, pid_key, start_key):
+    pid = record.get(pid_key)
+    expected = record.get(start_key)
+    if type(pid) is not int or pid <= 1:
+        return False
+    return (isinstance(expected, str) and bool(expected)
+            and proc_start(pid) == expected)
 
 
 def alive(record):
-    pid = record.get("pid")
-    if not isinstance(pid, int):
-        return False
-    return proc_start(pid) == record.get("proc_start")
+    return process_identity_matches(record, "pid", "proc_start")
 
 
 def parse_worker_digest(path):
@@ -161,8 +178,9 @@ def parse_worker_digest(path):
 
 
 def launching_active(record):
-    owner = record.get("launch_owner_pid")
-    return isinstance(owner, int) and proc_start(owner) == record.get("launch_owner_start")
+    return process_identity_matches(
+        record, "launch_owner_pid", "launch_owner_start"
+    )
 
 
 def validate_worktree(repo, task):
@@ -575,10 +593,12 @@ def cmd_cancel(args, _repo, run_dir):
                 atomic_json(record_path, record)
                 print("cancelled_stale_launch")
                 return
-    leader_valid = (record.get("pid") == pgid and
-                    proc_start(record.get("pid")) == record.get("proc_start"))
-    child_valid = (isinstance(record.get("child_pid"), int) and
-                   proc_start(record["child_pid"]) == record.get("child_start"))
+    leader_valid = (record.get("pid") == pgid and process_identity_matches(
+        record, "pid", "proc_start"
+    ))
+    child_valid = process_identity_matches(
+        record, "child_pid", "child_start"
+    )
     groups = []
     if leader_valid:
         groups.append(pgid)

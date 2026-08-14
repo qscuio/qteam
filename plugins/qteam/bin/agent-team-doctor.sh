@@ -25,7 +25,7 @@ done
 
 for b in wake-agent-team agent-team-artifact agent-team-finish agent-team-check-task agent-team-doctor \
          agent-team-state agent-team-worker agent-team-review agent-team-web \
-         agent-team-session qteam-project-uninstall; do
+         agent-team-session agent-team-goal qteam-project-uninstall; do
   if [[ ! -x ".codex/bin/$b" ]]; then fail "missing or non-executable .codex/bin/$b"; fi
 done
 [[ -f ".codex/bin/agent_team_policy.py" ]] || fail "missing policy module: agent_team_policy.py"
@@ -40,7 +40,8 @@ done
 for schema in run-state task task-policy project-policy quality-lane queue-item \
               tdd-cycle trajectory eval-case diagnosis experiment decision-gate \
               handoff scenario-coverage worker-result verification finding \
-              review-result review-receipt artifact-lint code-index epic spec-drift; do
+              review-result review-receipt artifact-lint code-index epic spec-drift \
+              goal-status; do
   [[ -f ".codex/schemas/$schema.schema.json" ]] || fail "missing schema: $schema"
 done
 SCHEMA_OK=1
@@ -50,7 +51,7 @@ done
 [[ $SCHEMA_OK -eq 1 ]] && ok "all JSON schemas parse"
 
 for duplicate in agent-team-dev qteam-router qteam-tdd qteam-diagnose qteam-explore qteam-review \
-                 qteam-harden \
+                 qteam-goal qteam-harden \
                  using-superpowers executing-plans subagent-driven-development \
                  requesting-code-review receiving-code-review \
                  finishing-a-development-branch using-git-worktrees \

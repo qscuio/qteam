@@ -1,0 +1,14 @@
+{
+  "name": "qteam",
+  "description": "QTeam durable software delivery",
+  "owner": {"name": "qscuio"},
+  "plugins": [
+    {
+      "name": "qteam",
+      "description": "Durable graph delivery and in-session goal continuation",
+      "version": "0.13.0",
+      "source": "./plugins/qteam",
+      "author": {"name": "qscuio"}
+    }
+  ]
+}

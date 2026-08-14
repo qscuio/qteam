@@ -1,11 +1,37 @@
 # QTeam
 
-QTeam is a local, durable software-development orchestrator for Codex. It
+QTeam is a local, durable software-development orchestrator used inside Codex,
+Claude Code, or Cursor sessions. Its current isolated worker/reviewer backend
+is Codex, while its durable goal and repository runtime are host-neutral. It
 combines bounded practices from Superpowers, Matt Pocock's skills, and
 Autoresearch while keeping exactly one orchestration authority.
 
 The core rule is simple: roles are created only for distinct permission,
 context, output, or lifecycle boundaries; reusable practices remain skills.
+
+## What changed in 0.13
+
+- `qteam-goal` projects the existing durable run into a bounded host completion
+  condition for Codex goals, Claude Code `/goal`, or a Cursor stop hook. The
+  native facility keeps a session taking turns; only QTeam state, Git heads,
+  gates, and evidence can prove completion.
+- `agent-team-goal wait --after <checkpoint>` blocks inside one tool call until
+  durable state, worker output, or review receipts change. This avoids repeated
+  model-turn polling. Native teammate messages/hooks may wake sooner, while the
+  checkpoint makes missed notifications recoverable.
+- Main-session rotation is now an explicit phase-boundary choice, not a long-run
+  requirement. Continue by default; clear, hand off, subagent, or compact only
+  when the next phase actually benefits. Fresh sessions resume from durable
+  status and artifacts rather than transcript memory.
+- The bounded workflow primitives were refreshed from Superpowers 6.3 and the
+  latest Matt Pocock skills: spike/bounded/architectural design routing,
+  dependency-frontier grilling, fresh-context ticket sizing, expand/migrate/
+  contract refactors, durable file handoffs, primary-source research, secret-
+  redacted diagnosis, and deep-module test-seam vocabulary. QTeam deliberately
+  rejects the upstream option to park a valid late review finding.
+- QTeam now ships Claude Code and Cursor plugin manifests plus host-neutral
+  `runtime-setup`/`runtime-uninstall` commands. This does not pretend the current
+  Codex worker backend is already a Claude/Cursor process launcher.
 
 ## What changed in 0.12
 
@@ -233,6 +259,33 @@ For plugin-only installation, omit the project path:
 ./qteam setup
 ```
 
+Claude Code can load the same skill plugin from this checkout, while the
+repository runtime is installed independently:
+
+```bash
+claude plugin marketplace add /path/to/qteam
+claude plugin install qteam@qteam
+/path/to/qteam/qteam runtime-setup /path/to/target-git-repository
+```
+
+Cursor can install `plugins/qteam` as a local plugin from `/add-plugin`; use the
+same `runtime-setup` command. Uninstall only the shared repository runtime with
+`runtime-uninstall`. Host plugin removal remains owned by Claude/Cursor.
+
+For an existing run, generate the exact session adapter instead of duplicating
+the goal in prose:
+
+```bash
+./qteam goal /path/to/repo --run <run-id> condition --host claude
+./qteam goal /path/to/repo --run <run-id> condition --host codex
+./qteam goal /path/to/repo --run <run-id> condition --host cursor
+```
+
+Claude uses the returned `/goal` command. Codex creates/updates its native goal
+with the returned condition when that tool is available. Cursor installs the
+returned command as a project `stop` hook. These are continuation adapters, not
+new state authorities.
+
 The setup command uses Codex's native plugin lifecycle:
 
 ```text
@@ -346,6 +399,30 @@ the target repository's ignore rules independently so preimages cannot enter a
 normal commit.
 
 ## Start or resume
+
+### In-session goals and notifications
+
+QTeam does not require a second supervisor session. The active Codex, Claude
+Code, or Cursor conversation can own coordination while the run remains durable
+on disk. Check it with:
+
+```bash
+.codex/bin/agent-team-goal --run <run-id> status
+```
+
+Notification has two layers. Codex native subagent delivery, Claude Agent Team
+messages, and Cursor hooks are push accelerators when the host supplies them.
+The portable floor is a checkpointed blocking wait:
+
+```bash
+.codex/bin/agent-team-goal --run <run-id> wait \
+  --after <checkpoint> --timeout 300
+```
+
+Internally this is a bounded long-poll over durable files; externally it is one
+sleeping tool call that returns only on a change, terminal human gate, or
+timeout. It therefore consumes no repeated model turns. Every wake is followed
+by a fresh status read, so a missed host push is harmless.
 
 Interactive:
 

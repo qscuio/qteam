@@ -7,7 +7,16 @@ description: Convert an approved spec into independently verifiable vertical sli
 
 Break the spec into tracer-bullet vertical slices, not layer-by-layer work.
 Each slice delivers a narrow complete path through the relevant layers and is
-demoable or verifiable on its own. Put genuinely enabling prefactors first.
+demoable or verifiable on its own and fits one fresh implementation context.
+Put genuinely enabling prefactors first. Group small, independent, same-shape
+changes only when one bounded packet and one verification contract stay
+clearer than repeated tickets.
+
+A wide refactor is the deliberate exception to forced vertical slicing: use an
+expand phase that introduces the new shape compatibly, bounded migrate batches,
+then a contract phase that removes the old path. Each batch must remain
+independently verifiable and reversible; do not hide a repository-wide rewrite
+inside one ticket.
 
 For every slice record title, purpose, user stories, acceptance criteria,
 dependencies, contract, write/read sets, forbidden paths, shared surfaces,

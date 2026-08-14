@@ -55,6 +55,10 @@ Never edit `state.json`, `events.jsonl`, or task status by hand. Use
 `agent-team-state`; its locked atomic writes are the durable source of truth.
 Use its compact `status` packet for operator updates and resume instead of
 dumping the full state.
+For an explicit long-running/autonomous goal, load `qteam-goal`. Generate the
+host-native completion condition from durable run state and use one blocking
+checkpoint wait while external work is active. Host goals/hooks keep the
+current session moving but cannot mark this run done.
 If an unfinished run has schema version 2, 3, 4, or 5, or schema 6 with legacy
 policy-v2/additive/core-layer identity, run `migrate-run` once. Finished or
 publication-sealed runs cannot migrate, and active workers/reviews must first be
@@ -126,6 +130,11 @@ Shared interfaces, schemas, migrations, lock/build/config/generated files,
 global fixtures, and snapshots are serial. Tests for a behavior live in its
 feature slice, not in a concurrent horizontal "tests" task.
 
+Each task must fit one fresh worker context. Group only small independent
+same-shape changes whose shared packet remains bounded. Plan wide refactors as
+expand, bounded migration batches, then contract; do not force them into one
+nominal vertical slice.
+
 Run `test_designer` before workers and fold its public seam, cases, failure
 paths, and acceptance commands into records. Materialize records only with:
 
@@ -176,7 +185,10 @@ For each wave:
    write sets/resources do not overlap.
 2. Idempotently create/reuse branches and registered worktrees.
 3. Launch writable roles with `agent-team-worker spawn`. Give one record and a
-   bounded instruction, then `wait`/`status`; do not pass conversation history.
+   bounded instruction, then one blocking `wait`; do not poll in coordinator
+   turns or pass conversation history. Put task briefs, reports, and review
+   packages in durable files and exchange pointers plus digests, not pasted
+   transcript history.
 4. Workers stay inside their worktree/write set, run focused verification,
    commit locally, and never push or merge. Feature/bugfix work makes a
    test-only RED commit and minimal GREEN commit per approved seam; the

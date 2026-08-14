@@ -44,6 +44,24 @@ def now():
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
+def proc_start(pid):
+    if type(pid) is not int or pid <= 1:
+        return None
+    try:
+        return Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()[21]
+    except (OSError, IndexError):
+        pass
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)], text=True, timeout=1,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    value = " ".join(result.stdout.split())
+    return value if result.returncode == 0 and value else None
+
+
 def git(args, cwd):
     res = subprocess.run(["git", *args], cwd=cwd, text=True,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -580,7 +598,7 @@ def validate_receipt_transition(path, updated):
         "ledger_findings_sha256", "review_contract_sha256",
         "calibration_sha256", "review_head_sha", "reviewer", "session_id",
         "execution", "runner", "result", "stdout_log", "stderr_log",
-        "started_at",
+        "started_at", "pid", "proc_start",
     }
     if (not isinstance(current, dict) or current.get("status") != "running"
             or updated.get("status") != "needs-fix"
@@ -1087,6 +1105,7 @@ def cmd_run(args, repo, _run):
             "result": str(result.relative_to(run)),
             "stdout_log": str(stdout_log.relative_to(run)),
             "stderr_log": str(stderr_log.relative_to(run)),
+            "pid": os.getpid(), "proc_start": proc_start(os.getpid()),
             "started_at": started_at,
         })
     closure_ids = [item["id"] for item in packet.get("closure_findings", [])]
@@ -1212,6 +1231,7 @@ def cmd_run(args, repo, _run):
         "result": str(result.relative_to(run)),
         "stdout_log": str(stdout_log.relative_to(run)),
         "stderr_log": str(stderr_log.relative_to(run)),
+        "pid": os.getpid(), "proc_start": proc_start(os.getpid()),
         "started_at": started_at,
         "exit_code": completed.returncode,
         "completed_at": now(),

@@ -11,6 +11,10 @@ brief without converting low-confidence proposals into requirements. Prefer
 existing public test seams and select the highest stable seam that proves
 observable behavior.
 
+If the public seam or interface shape is materially unresolved, do not invent
+it during synthesis. Return one scoped decision to the coordinator (or an
+architectural design branch) and resume synthesis after it is resolved.
+
 Begin a QTeam-owned spec with `<!-- qteam-artifact: spec-v1 -->`. The spec
 contains: problem statement, user-visible solution, numbered `US-*` user
 stories, acceptance criteria, implementation decisions without brittle code or

@@ -9,6 +9,11 @@ Read `CONTEXT.md` and relevant ADRs when present, plus the exact error/trace,
 recent changes, and one known-working analogue. Do not propose a fix before
 completing the evidence phases.
 
+Redact credentials, tokens, private payloads, and user data from every command,
+captured stream, report, and review packet. Pass secrets through environment
+variables or the repository's secret facility, never command literals. Quote
+only the signal lines needed to prove the symptom and hypothesis.
+
 If the frozen diagnosis command depends on a new regression test that does not
 exist at task base, first follow `qteam-tdd` steps 1–3 to create its test-only
 RED commit, then return here and diagnose at that commit. Do not implement

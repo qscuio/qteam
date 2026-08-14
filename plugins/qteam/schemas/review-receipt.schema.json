@@ -38,6 +38,8 @@
     "result_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "stdout_log": {"type": "string", "minLength": 1},
     "stderr_log": {"type": "string", "minLength": 1},
+    "pid": {"type": "integer", "minimum": 2},
+    "proc_start": {"type": ["string", "null"]},
     "exit_code": {"type": "integer"},
     "started_at": {"type": "string", "minLength": 1},
     "completed_at": {"type": "string", "minLength": 1},
@@ -50,7 +52,7 @@
     },
     {
       "if": {"properties": {"status": {"const": "running"}}},
-      "then": {"required": ["started_at"]}
+      "then": {"required": ["started_at", "pid", "proc_start"]}
     },
     {
       "if": {"properties": {"status": {"const": "failed"}}},

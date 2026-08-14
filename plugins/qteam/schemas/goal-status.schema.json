@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qteam.local/schemas/goal-status.schema.json",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run_id",
+    "goal_state",
+    "phase",
+    "checkpoint",
+    "next_action",
+    "waiting_for_human",
+    "waiting_for_external",
+    "external_work",
+    "proof",
+    "status",
+    "generated_at"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "run_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "goal_state": {
+      "enum": [
+        "actionable",
+        "waiting-for-external-work",
+        "waiting-for-human",
+        "achieved"
+      ]
+    },
+    "phase": {"type": "string", "minLength": 1},
+    "checkpoint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "next_action": {"type": ["string", "null"]},
+    "waiting_for_human": {"type": "boolean"},
+    "waiting_for_external": {"type": "boolean"},
+    "external_work": {
+      "type": "array",
+      "maxItems": 1024,
+      "items": {"type": "string", "minLength": 1, "maxLength": 256}
+    },
+    "proof": {
+      "type": "object",
+      "required": ["state", "events", "integration_head"],
+      "properties": {
+        "state": {"type": "string", "minLength": 1},
+        "events": {"type": "string", "minLength": 1},
+        "integration_head": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{40,64}$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "status": {
+      "type": "object",
+      "required": [
+        "run_id", "phase", "current_wave", "next_action", "task_counts",
+        "ready_task_count", "blocking_decision_count",
+        "blocking_handoff_count", "dependency_blocker_count",
+        "work_queue_counts", "evidence_freshness"
+      ],
+      "properties": {
+        "run_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "phase": {"type": "string", "minLength": 1},
+        "current_wave": {"type": "integer", "minimum": 0},
+        "next_action": {"type": ["string", "null"], "maxLength": 4096},
+        "task_counts": {
+          "type": "object",
+          "required": ["active", "blocked", "failed", "pending", "ready_to_merge"],
+          "properties": {
+            "active": {"type": "integer", "minimum": 0},
+            "blocked": {"type": "integer", "minimum": 0},
+            "failed": {"type": "integer", "minimum": 0},
+            "pending": {"type": "integer", "minimum": 0},
+            "ready_to_merge": {"type": "integer", "minimum": 0}
+          },
+          "additionalProperties": false
+        },
+        "ready_task_count": {"type": "integer", "minimum": 0},
+        "blocking_decision_count": {"type": "integer", "minimum": 0},
+        "blocking_handoff_count": {"type": "integer", "minimum": 0},
+        "dependency_blocker_count": {"type": "integer", "minimum": 0},
+        "work_queue_counts": {
+          "type": "object",
+          "additionalProperties": {"type": "integer", "minimum": 0}
+        },
+        "evidence_freshness": {"type": "object"}
+      },
+      "additionalProperties": false
+    },
+    "generated_at": {"type": "string", "minLength": 1},
+    "wait_timed_out": {"type": "boolean"}
+  },
+  "additionalProperties": false
+}

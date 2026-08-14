@@ -50,6 +50,13 @@ is needed, use `--outcome task-created --task <same-wave-integrated-refactor>`;
 the cited task must already be mechanically checked and merged. Other lanes do
 not add prose assessments.
 
+Keep that assessment inside the user-named or recently changed hot path. Check
+duplication, ownership, dependency direction, and whether a deeper module would
+remove knowledge from callers. Apply a deletion test: if the proposed
+abstraction does not delete more incidental complexity than it adds, record a
+bounded `not-needed` rationale instead of generalizing the codebase. Do not
+turn this lane into a repository-wide architecture scan.
+
 The state manager runs only the frozen commands in a disposable detached
 checkout of the exact integration HEAD, bounds retained output, records both
 streams and the HEAD, and fails the

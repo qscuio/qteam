@@ -28,9 +28,13 @@ Route in this order:
    When it decomposes into multiple independently executable specs, create one
    QTeam epic manifest with cross-run dependencies and stable contracts. Hand
    each unblocked run to `to-spec`; do not create an epic for a single run.
-5. Unclear new behavior: use `brainstorming`; invoke `grilling` only on an
-   unresolved high-impact branch and `grill-with-docs` only when the domain
-   vocabulary is changing.
+5. Unclear new behavior: classify it before `brainstorming`:
+   - spike: a disposable learning task/experiment whose result returns for
+     approval, never an unreviewed shipping shortcut;
+   - bounded: a short design for a local, reversible change;
+   - architectural: full alternatives, domain model, spec, and ticket DAG.
+   Invoke `grilling` only on an unresolved high-impact branch and
+   `grill-with-docs` only when the domain vocabulary is changing.
 6. Sufficient approved context: use `to-spec`, then `to-tickets`, then
    `agent-team-dev` execution.
 

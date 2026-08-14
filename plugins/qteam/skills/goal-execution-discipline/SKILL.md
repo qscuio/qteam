@@ -35,6 +35,12 @@ planned slice, not only the first convenient subset. For a failure, preserve
 the exact RED symptom before the change and exact GREEN command/output after.
 Run focused and final verification proportional to risk.
 
+For an explicit autonomous goal, use `qteam-goal` as a projection of that
+durable state. Native Codex/Claude/Cursor continuation is a session lease, not
+completion evidence. Wait on one checkpoint call instead of spending model
+turns polling, and never force a new primary session merely because a run is
+long.
+
 Never claim completion from assertion alone. A failing or unavailable command
 is reported verbatim with its impact and remaining risk.
 

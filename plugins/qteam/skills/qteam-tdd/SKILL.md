@@ -10,6 +10,10 @@ Read `CONTEXT.md` and relevant ADRs when present, plus every approved
 entry freezes a seam ID, observable behavior, exact non-glob `test_paths`, focused command,
 and expected RED pattern. Treat that contract as fixed; stop if the behavior
 cannot be reached there instead of inventing a production API for the test.
+When a public interface or seam is unclear, ask the architect to describe the
+module, interface, depth, seam, adapter, leverage, and locality before the seam
+is frozen. This is design clarification, not a new role or a license to expose
+internals for tests.
 Read [scenario-coverage.md](references/scenario-coverage.md). Every dimension
 must have one strongest applicable scenario linked to a seam or an explicit
 non-applicability rationale; equivalent scenarios do not become duplicate
