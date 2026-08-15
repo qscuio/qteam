@@ -51,7 +51,7 @@ done
 [[ $SCHEMA_OK -eq 1 ]] && ok "all JSON schemas parse"
 
 for duplicate in agent-team-dev qteam-router qteam-tdd qteam-diagnose qteam-explore qteam-review \
-                 qteam-goal qteam-harden diagram-creator handoff show-me \
+                 qteam-goal qteam-harden diagram-creator handoff isometric show-me \
                  using-superpowers executing-plans subagent-driven-development \
                  requesting-code-review receiving-code-review \
                  finishing-a-development-branch using-git-worktrees \

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Isometric Codebase Map"
+  short_description: "Map repositories as evidence-backed isometric cities"
+  default_prompt: "Use $isometric to build an interactive evidence-backed architecture map for this repository."

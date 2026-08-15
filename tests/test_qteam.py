@@ -6621,6 +6621,20 @@ class InstallerTests(RepoCase):
         )
         self.assertFalse((self.repo / ".codex/qteam-project.json").exists())
 
+    def test_setup_refuses_user_owned_local_isometric_skill_before_mutation(self):
+        local = self.repo / ".agents/skills/isometric"
+        local.mkdir(parents=True)
+        marker = local / "SKILL.md"
+        marker.write_text("user-owned architecture mapper\n", encoding="utf-8")
+        blocked = self.run_tool(PROJECT_SETUP, str(self.repo))
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn("not QTeam-owned", blocked.stderr)
+        self.assertEqual(
+            marker.read_text(encoding="utf-8"),
+            "user-owned architecture mapper\n",
+        )
+        self.assertFalse((self.repo / ".codex/qteam-project.json").exists())
+
     def test_project_uninstall_retains_locally_modified_runtime_file(self):
         installed = subprocess.run(
             [sys.executable, str(PROJECT_SETUP), str(self.repo)], cwd=SOURCE,
@@ -6954,17 +6968,17 @@ class PluginTests(RepoCase):
             manifest["version"].split("+", 1)[0],
             (PLUGIN / "VERSION").read_text(encoding="utf-8").strip(),
         )
-        self.assertRegex(manifest["version"], r"^0\.14\.0\+codex\.[0-9]+$")
+        self.assertRegex(manifest["version"], r"^0\.15\.0\+codex\.[0-9]+$")
 
         claude = json.loads((PLUGIN / ".claude-plugin/plugin.json").read_text())
         cursor = json.loads((PLUGIN / ".cursor-plugin/plugin.json").read_text())
         claude_marketplace = json.loads(
             (SOURCE / ".claude-plugin/marketplace.json").read_text()
         )
-        self.assertEqual(claude["version"], "0.14.0")
-        self.assertEqual(cursor["version"], "0.14.0")
+        self.assertEqual(claude["version"], "0.15.0")
+        self.assertEqual(cursor["version"], "0.15.0")
         self.assertEqual(cursor["skills"], "./skills/")
-        self.assertEqual(claude_marketplace["plugins"][0]["version"], "0.14.0")
+        self.assertEqual(claude_marketplace["plugins"][0]["version"], "0.15.0")
         self.assertEqual(
             claude_marketplace["plugins"][0]["source"], "./plugins/qteam"
         )
@@ -7765,7 +7779,7 @@ class PluginTests(RepoCase):
         for license_path in license_paths:
             self.assertTrue((self.repo / license_path).is_file())
         current = json.loads(manifest_path.read_text(encoding="utf-8"))
-        self.assertEqual(current["version"], "0.14.0")
+        self.assertEqual(current["version"], "0.15.0")
 
     def test_uninstall_conflict_makes_no_plugin_or_marketplace_mutation(self):
         env, state, log = self.fake_codex_env()
@@ -7783,6 +7797,316 @@ class PluginTests(RepoCase):
         calls = [json.loads(line) for line in log.read_text().splitlines()]
         self.assertNotIn(["plugin", "remove", "qteam@qteam"], calls)
         self.assertNotIn(["plugin", "marketplace", "remove", "qteam"], calls)
+
+
+class IsometricSkillTests(unittest.TestCase):
+    @staticmethod
+    def render(template, data):
+        summary = (
+            f"\n    <h2>{data['title']}</h2>\n"
+            f"    <p><strong>Invariant:</strong> {data['overview']['invariant']}</p>\n"
+            "    <ul>"
+            + "".join(f"<li>{item['name']}</li>" for item in data["structures"])
+            + "</ul>\n  "
+        )
+        source, data_count = re.subn(
+            r'(<script id="isometric-data" type="application/json">\n).*?(\n  </script>)',
+            lambda match: match.group(1)
+            + json.dumps(data, indent=2, ensure_ascii=False)
+            + match.group(2),
+            template,
+            count=1,
+            flags=re.DOTALL,
+        )
+        source, summary_count = re.subn(
+            r'(<section class="static-summary" id="isometric-static-summary">).*?(</section>)',
+            lambda match: match.group(1) + summary + match.group(2),
+            source,
+            count=1,
+            flags=re.DOTALL,
+        )
+        if data_count != 1 or summary_count != 1:
+            raise AssertionError("isometric template markers changed")
+        return source
+
+    def make_repo_and_data(self, root, *, object_format=None):
+        repo = root / "repo"
+        repo.mkdir()
+        init = ["git", "init", "-b", "main"]
+        if object_format:
+            init.append(f"--object-format={object_format}")
+        subprocess.run(init, cwd=repo, check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(["git", "config", "user.email", "map@example.invalid"],
+                       cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Map Test"], cwd=repo,
+                       check=True)
+        (repo / "src").mkdir()
+        (repo / "src/entry.py").write_text("from .core import run\n", encoding="utf-8")
+        (repo / "src/core.py").write_text("def run(): return 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "src"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "map fixture"], cwd=repo,
+                       check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo,
+                                       text=True).strip()
+        sources = []
+        for relative in ("src/entry.py", "src/core.py"):
+            sources.append({
+                "path": relative,
+                "sha256": hashlib.sha256((repo / relative).read_bytes()).hexdigest(),
+            })
+        data = {
+            "schema_version": 1,
+            "sample_data": False,
+            "repository": {"source_head_sha": head, "source_dirty": False, "scope": "src"},
+            "title": "Fixture architecture",
+            "subtitle": "Measured two-module request path",
+            "stats": [{"label": "modules", "value": "2", "evidence_ids": ["E-map"]}],
+            "groups": [{"id": "runtime", "name": "Runtime", "color": "#6F9D83"}],
+            "structures": [
+                {
+                    "id": "entry", "code": "EN", "name": "Entry module",
+                    "group": "runtime", "size": {"value": 1, "unit": "files"},
+                    "position": {"gx": 1, "gy": 1}, "footprint": {"w": 2, "d": 2},
+                    "height": 2, "kind": "module", "what": "Accepts work.",
+                    "how": "Imports the core module.", "talks": ["core"],
+                    "evidence_ids": ["E-map"], "children": [],
+                },
+                {
+                    "id": "core", "code": "CO", "name": "Core module",
+                    "group": "runtime", "size": {"value": 1, "unit": "files"},
+                    "position": {"gx": 6, "gy": 5}, "footprint": {"w": 2, "d": 2},
+                    "height": 4, "kind": "module", "what": "Owns behavior.",
+                    "how": "Implements the run function.", "talks": [],
+                    "evidence_ids": ["E-map"], "children": [],
+                },
+            ],
+            "edges": [{
+                "from": "entry", "to": "core", "label": "Python import",
+                "kind": "flow", "evidence_ids": ["E-map"], "via": [],
+            }],
+            "externals": [{
+                "id": "caller", "name": "Caller", "target": "entry",
+                "label": "invokes entry", "position": {"gx": -2, "gy": 0},
+                "evidence_ids": ["E-map"],
+            }],
+            "trace": [
+                {"structure_id": "entry", "text": "The request enters.", "evidence_ids": ["E-map"]},
+                {"structure_id": "core", "text": "Core behavior executes.", "evidence_ids": ["E-map"]},
+            ],
+            "overview": {
+                "what": "A two-module fixture.", "how": "Entry imports core.",
+                "invariant": "Every visible claim is source-bound.",
+                "evidence_ids": ["E-map"],
+            },
+            "evidence": [{
+                "id": "E-map", "claim": "Entry imports the core run function.",
+                "sources": sources, "measurement": None,
+            }],
+        }
+        return repo, data
+
+    def test_isometric_contract_router_and_metadata_are_packaged(self):
+        skill = PLUGIN / "skills/isometric"
+        text = (skill / "SKILL.md").read_text(encoding="utf-8")
+        router = (PLUGIN / "skills/qteam-router/SKILL.md").read_text(encoding="utf-8")
+        contract = (PLUGIN / "scripts/qteam_project.py").read_text(encoding="utf-8")
+        doctor = (PLUGIN / "bin/agent-team-doctor.sh").read_text(encoding="utf-8")
+        launcher = QTEAM.read_text(encoding="utf-8")
+        metadata = (skill / "agents/openai.yaml").read_text(encoding="utf-8")
+        notices = (PLUGIN / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+        self.assertIn("name: isometric", text)
+        self.assertIn("evidence-backed", text.lower())
+        self.assertIn("$isometric", router)
+        self.assertIn("$diagram-creator", text)
+        self.assertIn("$show-me", text)
+        self.assertIn("$isometric", metadata)
+        self.assertIn("419388cf0e15d1741d4cfe0fdc9237cd3eef2be5", notices)
+        self.assertIn("does not redistribute", notices)
+        for packaged in (contract, doctor, launcher):
+            self.assertIn("isometric", packaged)
+        self.assertTrue((skill / "assets/template.html").is_file())
+        self.assertTrue((skill / "scripts/validate_isometric.py").is_file())
+        template = (skill / "assets/template.html").read_text(encoding="utf-8")
+        evidence = (skill / "references/evidence-contract.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("function renderInsideDetail", template)
+        self.assertIn("function renderExternal", template)
+        self.assertIn("function fitView", template)
+        self.assertIn('location.hash = `external=', template)
+        self.assertIn('document.getElementById("trace-button").hidden', template)
+        self.assertIn('padStart(2,"0")', template)
+        self.assertNotIn("item.name.slice", template)
+        self.assertNotIn('class: "block-name"', template)
+        self.assertIn("renderInsideDetail(structures.get(insideId))", template)
+        self.assertIn("@media (max-width: 700px)", template)
+        self.assertIn("one `li` per", evidence)
+
+    def test_isometric_validator_accepts_small_repo_bound_map(self):
+        skill = PLUGIN / "skills/isometric"
+        validator = skill / "scripts/validate_isometric.py"
+        template_path = skill / "assets/template.html"
+        template_check = subprocess.run(
+            [sys.executable, str(validator), "--template", str(template_path)],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(template_check.returncode, 0,
+                         template_check.stdout + template_check.stderr)
+        template = template_path.read_text(encoding="utf-8")
+        self.assertIn("function drawExternals", template)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, data = self.make_repo_and_data(root)
+            artifact = root / "map.html"
+            artifact.write_text(self.render(template, data), encoding="utf-8")
+            checked = subprocess.run(
+                [sys.executable, str(validator), str(artifact), "--repo", str(repo)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
+            self.assertIn("has 2 structures", checked.stdout)
+
+            boundary = json.loads(json.dumps(data))
+            boundary["structures"][0]["code"] = "X1"
+            boundary["structures"][0]["position"] = {"gx": 40, "gy": -20}
+            boundary["structures"][1]["position"] = {"gx": -20, "gy": 40}
+            boundary["trace"] = []
+            boundary_artifact = root / "boundary-map.html"
+            boundary_artifact.write_text(self.render(template, boundary),
+                                         encoding="utf-8")
+            boundary_check = subprocess.run(
+                [sys.executable, str(validator), str(boundary_artifact)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(boundary_check.returncode, 0,
+                             boundary_check.stdout + boundary_check.stderr)
+
+            (repo / "src/core.py").write_text("def run(): return 2\n", encoding="utf-8")
+            stale = subprocess.run(
+                [sys.executable, str(validator), str(artifact), "--repo", str(repo)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(stale.returncode, 0)
+            self.assertIn("evidence digest changed", stale.stdout)
+
+    def test_isometric_repo_snapshot_supports_committed_map_and_sha256_git(self):
+        skill = PLUGIN / "skills/isometric"
+        validator = skill / "scripts/validate_isometric.py"
+        template = (skill / "assets/template.html").read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, data = self.make_repo_and_data(root)
+            artifact = repo / "architecture-map.html"
+            artifact.write_text(self.render(template, data), encoding="utf-8")
+            before_commit = subprocess.run(
+                [sys.executable, str(validator), str(artifact), "--repo", str(repo)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(before_commit.returncode, 0,
+                             before_commit.stdout + before_commit.stderr)
+            subprocess.run(["git", "add", artifact.name], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "add architecture map"],
+                           cwd=repo, check=True, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE)
+            after_commit = subprocess.run(
+                [sys.executable, str(validator), str(artifact), "--repo", str(repo)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(after_commit.returncode, 0,
+                             after_commit.stdout + after_commit.stderr)
+            (repo / "src/core.py").write_text("def run(): return 3\n", encoding="utf-8")
+            subprocess.run(["git", "add", "src/core.py"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "change mapped source"],
+                           cwd=repo, check=True, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE)
+            stale = subprocess.run(
+                [sys.executable, str(validator), str(artifact), "--repo", str(repo)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(stale.returncode, 0)
+            self.assertIn("change files other than the map artifact", stale.stdout)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, data = self.make_repo_and_data(root, object_format="sha256")
+            self.assertEqual(len(data["repository"]["source_head_sha"]), 64)
+            artifact = root / "sha256-map.html"
+            artifact.write_text(self.render(template, data), encoding="utf-8")
+            checked = subprocess.run(
+                [sys.executable, str(validator), str(artifact), "--repo", str(repo)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
+
+    def test_isometric_validator_rejects_overlap_engine_tamper_and_bad_types(self):
+        skill = PLUGIN / "skills/isometric"
+        validator = skill / "scripts/validate_isometric.py"
+        template = (skill / "assets/template.html").read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _repo, data = self.make_repo_and_data(root)
+            cases = []
+            overlap = json.loads(json.dumps(data))
+            overlap["structures"][1]["position"] = {"gx": 2, "gy": 2}
+            cases.append(("overlap", self.render(template, overlap), "footprints overlap"))
+            bad_type = json.loads(json.dumps(data))
+            bad_type["structures"][0]["kind"] = []
+            cases.append(("bad-type", self.render(template, bad_type), "kind is invalid"))
+            unresolved = json.loads(json.dumps(data))
+            unresolved["edges"][0]["evidence_ids"] = ["missing"]
+            cases.append(("unresolved", self.render(template, unresolved), "does not resolve evidence"))
+            inconsistent = json.loads(json.dumps(data))
+            inconsistent["structures"][0]["talks"] = []
+            cases.append(("inconsistent-talks", self.render(template, inconsistent), "talks must exactly match outgoing edge targets"))
+            self_loop = json.loads(json.dumps(data))
+            self_loop["edges"][0]["to"] = "entry"
+            self_loop["structures"][0]["talks"] = ["entry"]
+            cases.append(("self-loop", self.render(template, self_loop), "self-loop edges are not supported"))
+            duplicate_code = json.loads(json.dumps(data))
+            duplicate_code["structures"][1]["code"] = "EN"
+            cases.append(("duplicate-code", self.render(template, duplicate_code), "duplicate structure code"))
+            rendered = self.render(template, data)
+            cases.append((
+                "engine-tamper",
+                rendered.replace("window.__qteamIsometricReady = true;",
+                                 "window.__qteamIsometricReady = false;", 1),
+                "markup/engine differs",
+            ))
+            cases.append((
+                "summary-handler",
+                rendered.replace("<h2>Fixture architecture</h2>",
+                                 '<h2 onclick="alert(1)">Fixture architecture</h2>', 1),
+                "static summary <h2> must not have attributes",
+            ))
+            cases.append((
+                "fabricated-summary",
+                rendered.replace(
+                    "<li>Entry module</li><li>Core module</li>",
+                    "<li>Entry module Core module</li><li>Made-up subsystem</li>",
+                    1,
+                ),
+                "static summary structure list must exactly match data order",
+            ))
+            cases.append((
+                "misnested-summary",
+                rendered.replace(
+                    "<p><strong>Invariant:</strong> Every visible claim is source-bound.</p>\n    <ul><li>Entry module</li><li>Core module</li></ul>",
+                    "<strong>Invariant:</strong><p>Invariant: Every visible claim is source-bound.</p>\n    <ul></ul><li>Entry module</li><li>Core module</li>",
+                    1,
+                ),
+                "static summary markup does not match the exact",
+            ))
+            for name, source, expected in cases:
+                artifact = root / f"{name}.html"
+                artifact.write_text(source, encoding="utf-8")
+                rejected = subprocess.run(
+                    [sys.executable, str(validator), str(artifact)],
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                self.assertNotEqual(rejected.returncode, 0, name)
+                self.assertNotIn("Traceback", rejected.stdout + rejected.stderr)
+                self.assertIn(expected, rejected.stdout)
 
 
 class VisualAndHandoffSkillTests(unittest.TestCase):
@@ -8173,7 +8497,7 @@ class VisualAndHandoffSkillTests(unittest.TestCase):
         self.assertIn("anthropic.com/engineering/multi-agent-research-system", rule)
 
     def test_visual_skill_metadata_and_attribution_are_packaged(self):
-        expected = {"diagram-creator", "handoff", "show-me"}
+        expected = {"diagram-creator", "handoff", "isometric", "show-me"}
         for name in expected:
             skill = PLUGIN / "skills" / name
             metadata = (skill / "agents/openai.yaml").read_text(encoding="utf-8")

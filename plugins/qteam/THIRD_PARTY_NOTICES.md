@@ -76,3 +76,11 @@ documentation and illustrative use; inclusion implies no endorsement.
 The complete Tabler, Simple Icons, log-z/logos, and Devicon license texts ship
 in the corresponding source `LICENSES/` files and project `.codex/licenses/`
 files.
+
+`isometric` is a clean-room QTeam-native implementation informed by the
+evidence-led architecture-city concept in
+https://github.com/sayantan94/toolbelt/tree/419388cf0e15d1741d4cfe0fdc9237cd3eef2be5/isometric.
+QTeam does not redistribute that project's template, validator, scripts, text,
+or other source material. It uses a new bounded JSON contract, offline engine,
+repository SHA-256 evidence ledger, and QTeam's existing role/verification
+model; no license is asserted for code that was not copied.

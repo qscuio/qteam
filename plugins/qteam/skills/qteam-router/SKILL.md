@@ -10,8 +10,9 @@ the only orchestration authority. Other skills are bounded decision,
 planning, test, diagnosis, or review primitives; none may start their own
 implementation loop.
 
-Artifact-only requests may use `$diagram-creator` for static technical/UML
-visuals, `$show-me` for interactive teaching UIs, or `$handoff` for an explicit
+Artifact-only requests may use `$isometric` for an evidence-backed whole-repo
+architecture map, `$diagram-creator` for a focused static technical/UML visual,
+`$show-me` for an interactive teaching UI, or `$handoff` for an explicit
 session/owner change without creating a QTeam run. If one is a deliverable of
 an active run, keep it inside that run's task/write-set/review lifecycle; the
 artifact skill does not bypass execution gates.

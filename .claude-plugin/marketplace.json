@@ -5,8 +5,8 @@
   "plugins": [
     {
       "name": "qteam",
-      "description": "Durable graph delivery and in-session goal continuation",
-      "version": "0.14.0",
+      "description": "Durable graph delivery, evidence-backed architecture maps, and in-session goal continuation",
+      "version": "0.15.0",
       "source": "./plugins/qteam",
       "author": {"name": "qscuio"}
     }

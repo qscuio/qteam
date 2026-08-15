@@ -9,6 +9,30 @@ Autoresearch while keeping exactly one orchestration authority.
 The core rule is simple: roles are created only for distinct permission,
 context, output, or lifecycle boundaries; reusable practices remain skills.
 
+## What changed in 0.15
+
+- `$isometric` turns a repository into an interactive, evidence-backed
+  architecture city. Structures, dependency edges, external systems,
+  drill-down views, and request traces are driven by a bounded JSON packet;
+  every visible claim resolves to repository-relative files and SHA-256
+  evidence that can be recomputed against an exact Git source snapshot.
+- The artifact is a self-contained offline HTML file with a fixed packaged
+  rendering engine, deterministic hash-addressed views, keyboard navigation,
+  reduced-motion behavior, and a complete static/print fallback. Its validator
+  rejects engine/markup changes, overlapping footprints, unresolved evidence,
+  sidecar or network resources, stale Git identity, and common share-safety
+  leaks.
+- This is a clean-room QTeam-native design informed by the useful concept in
+  `sayantan94/toolbelt` isometric at commit
+  `419388cf0e15d1741d4cfe0fdc9237cd3eef2be5`; no upstream engine, template, or
+  validator code is vendored. QTeam deliberately removes the arbitrary
+  15-structure minimum and fixed-subagent rule: map fidelity follows measured
+  repository facts, using existing researcher/architect roles only when an
+  active run actually needs them.
+- The skill has a sharp routing boundary: use `$isometric` for a whole-repo
+  architecture map, `$diagram-creator` for one focused technical/UML visual,
+  and `$show-me` when the primary goal is interactive teaching.
+
 ## What changed in 0.14
 
 - `$diagram-creator` vendors Diagram Design 2.4.0's editorial HTML/SVG system
@@ -326,7 +350,7 @@ codex plugin add qteam@qteam
 ```
 
 Claude setup analogously uses `claude plugin marketplace add` plus
-`claude plugin install/update`, verifies the installed 0.14 version, and its
+`claude plugin install/update`, verifies the installed 0.15 version, and its
 uninstall command removes both registrations.
 
 Start the Web UI after project setup:
@@ -435,6 +459,19 @@ the target repository's ignore rules independently so preimages cannot enter a
 normal commit.
 
 ## Visual explanation skills
+
+Use `$isometric` when the durable artifact should explain the architecture of
+an entire repository as an explorable map:
+
+```text
+Use $isometric to map this repository, including its request path and external systems.
+```
+
+It emits one offline HTML file backed by a structured fact/evidence packet.
+Run its validator with `--repo <exact-worktree>` to re-hash every cited source,
+source HEAD, and source dirty-state claim. An in-repository map may be committed
+after that snapshot only when the intervening commit changes the map alone. It is not the right tool for a single UML
+relationship or for a time-driven lesson.
 
 Use `$diagram-creator` when the durable artifact is a static technical or
 product visual:
@@ -704,7 +741,7 @@ explicitly skipped with evidence; and every typed handoff is closed.
 `qteam-router` routes the work. `agent-team-dev` alone owns execution, workers,
 merges, reviews, and finish. `brainstorming`, `grilling`, `grill-with-docs`,
 `domain-modeling`, `qteam-explore`, `to-spec`, `to-tickets`, `wayfinder`,
-`diagram-creator`, `show-me`, and `handoff` may shape decisions and artifacts
+`isometric`, `diagram-creator`, `show-me`, and `handoff` may shape decisions and artifacts
 but never begin a competing implementation loop.
 
 The coordinator uses `qteam-explore` when the solution frontier is unknown;

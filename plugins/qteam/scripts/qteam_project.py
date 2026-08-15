@@ -32,7 +32,7 @@ UI_FILES = ("index.html", "app.js", "styles.css")
 PLUGIN_SKILLS = (
     "agent-team-dev", "brainstorming", "diagram-creator", "domain-modeling",
     "goal-execution-discipline", "grill-me", "grill-with-docs", "grilling",
-    "handoff", "qteam-diagnose", "qteam-explore", "qteam-review", "qteam-router",
+    "handoff", "isometric", "qteam-diagnose", "qteam-explore", "qteam-review", "qteam-router",
     "qteam-goal", "qteam-harden", "qteam-tdd", "to-spec", "to-tickets",
     "show-me", "verification-before-completion", "wayfinder", "writing-plans",
 )
@@ -40,12 +40,12 @@ LEGACY_OWNED_PLUGIN_SKILLS = tuple(
     name for name in PLUGIN_SKILLS
     if name not in {
         "diagram-creator", "handoff", "qteam-explore", "qteam-goal",
-        "qteam-harden", "show-me",
+        "qteam-harden", "show-me", "isometric",
     }
 )
 LOCAL_SKILL_CONFLICTS = (
     "diagram-creator", "handoff", "qteam-explore", "qteam-goal",
-    "qteam-harden", "show-me",
+    "qteam-harden", "show-me", "isometric",
 )
 LEGACY_ORCHESTRATION_SKILLS = (
     "using-superpowers", "executing-plans", "subagent-driven-development",

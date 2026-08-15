@@ -1,0 +1,454 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src 'none'; connect-src 'none'; media-src 'none'; object-src 'none'; frame-src 'none'; form-action 'none'; base-uri 'none'">
+  <title>Isometric codebase map</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --paper: #f4f0e6;
+      --surface: #fffdf7;
+      --ink: #25302f;
+      --muted: #687371;
+      --line: #a7aaa0;
+      --accent: #d85b3f;
+      --accent-soft: #f8ddd4;
+      --focus: #215b8d;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; color: var(--ink); background: var(--paper); }
+    button { font: inherit; }
+    button:focus-visible { outline: 3px solid color-mix(in srgb, var(--focus) 35%, transparent); outline-offset: 2px; }
+    .shell { min-height: 100vh; display: grid; grid-template-rows: auto 1fr; }
+    header { display: flex; gap: 24px; align-items: end; justify-content: space-between; padding: 24px 28px 18px; border-bottom: 1px solid #d9d5ca; background: rgba(255,253,247,.92); }
+    .eyebrow { margin: 0 0 5px; color: var(--accent); font: 700 11px/1.2 ui-monospace, monospace; letter-spacing: .12em; text-transform: uppercase; }
+    h1 { margin: 0; max-width: 760px; font: 500 clamp(24px,3vw,38px)/1.08 Georgia, serif; }
+    .subtitle { margin: 7px 0 0; max-width: 760px; color: var(--muted); }
+    .stats { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+    .stat { min-width: 92px; padding: 8px 11px; border: 1px solid #d9d5ca; border-radius: 7px; background: var(--surface); }
+    .stat strong, .stat span { display: block; }
+    .stat strong { font: 700 14px/1.2 ui-monospace, monospace; }
+    .stat span { margin-top: 2px; color: var(--muted); font-size: 11px; }
+    .workspace { min-height: 0; display: grid; grid-template-columns: 220px minmax(460px,1fr) 300px; }
+    .rail, .detail { overflow: auto; padding: 18px; background: rgba(255,253,247,.8); }
+    .rail { border-right: 1px solid #d9d5ca; }
+    .detail { border-left: 1px solid #d9d5ca; }
+    .rail h2, .detail h2 { margin: 0 0 12px; font-size: 14px; }
+    .group-label { margin: 16px 0 6px; color: var(--muted); font: 700 10px/1.2 ui-monospace, monospace; letter-spacing: .1em; text-transform: uppercase; }
+    .structure-button { width: 100%; display: grid; grid-template-columns: 30px 1fr; gap: 7px; align-items: center; margin: 4px 0; padding: 7px; border: 0; border-radius: 6px; color: inherit; background: transparent; text-align: left; cursor: pointer; }
+    .structure-button:hover, .structure-button.active { background: var(--accent-soft); }
+    .code { display: inline-grid; place-items: center; width: 28px; height: 24px; border-radius: 4px; color: #fff; background: var(--group-color,#526a65); font: 700 10px/1 ui-monospace, monospace; }
+    .structure-button span:last-child { overflow-wrap: anywhere; white-space: normal; font-size: 12px; line-height: 1.25; }
+    .stage { min-width: 0; overflow: auto; position: relative; padding: 12px; }
+    .map-toolbar { position: sticky; left: 12px; z-index: 2; display: flex; flex-wrap: wrap; gap: 6px; width: fit-content; margin-bottom: 4px; }
+    .map-toolbar button, .trace-controls button, .inside-button { padding: 7px 10px; border: 1px solid #c7c6bd; border-radius: 6px; color: var(--ink); background: var(--surface); cursor: pointer; }
+    .map-toolbar button:hover, .trace-controls button:hover, .inside-button:hover { border-color: var(--accent); }
+    svg { display: block; width: 100%; min-width: 720px; min-height: 620px; }
+    .ground { stroke: #c8c4b7; stroke-width: .65; opacity: .42; }
+    .edge { fill: none; stroke: #6e7774; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+    .edge.advisory { stroke-dasharray: 5 4; }
+    .edge.build { stroke: #8a8069; stroke-dasharray: 2 4; }
+    .flow-dot { fill: var(--accent); }
+    .structure { cursor: pointer; }
+    .structure .top { stroke: rgba(37,48,47,.35); stroke-width: 1; }
+    .structure .side { stroke: rgba(37,48,47,.28); stroke-width: 1; }
+    .structure text { pointer-events: none; fill: #1f2827; font-family: ui-monospace, monospace; }
+    .structure .block-code { font-size: 10px; font-weight: 800; }
+    .structure.active .top { stroke: var(--accent); stroke-width: 3; }
+    .structure.trace-done .top { stroke: #b56b2e; stroke-width: 2; }
+    .structure.trace-current .top { stroke: #b52d2d; stroke-width: 3; }
+    .external-system { cursor: pointer; }
+    .external { fill: var(--surface); stroke: #777d79; stroke-dasharray: 4 3; }
+    .external-system.active .external { stroke: var(--accent); stroke-width: 3; }
+    .external-label { fill: var(--muted); font: 9px ui-monospace, monospace; }
+    .detail-section { padding: 12px 0; border-top: 1px solid #dedbd2; }
+    .detail-section h3 { margin: 0 0 5px; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+    .detail-section p, .detail-section li { color: var(--muted); font-size: 12px; line-height: 1.5; }
+    .detail-section p { margin: 0; }
+    .detail-section ul { margin: 0; padding-left: 18px; }
+    .trace-panel { position: fixed; left: 50%; bottom: 18px; z-index: 4; width: min(760px,calc(100% - 32px)); padding: 12px; border: 1px solid #c9c5ba; border-radius: 9px; background: rgba(255,253,247,.97); box-shadow: 0 12px 34px rgba(37,48,47,.16); }
+    .trace-panel[hidden] { display: none; }
+    .trace-copy { display: grid; gap: 4px; margin-bottom: 9px; }
+    .trace-copy span { color: var(--muted); font-size: 12px; }
+    .trace-controls { display: flex; gap: 6px; }
+    .trace-controls .trace-count { margin-left: auto; align-self: center; color: var(--muted); font: 11px ui-monospace, monospace; }
+    .static-summary { display: none; padding: 24px; }
+    .static-summary li, .static-summary p { line-height: 1.5; }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
+      .flow-dot { display: none; }
+    }
+    @media (max-width: 980px) {
+      header { align-items: start; flex-direction: column; }
+      .stats { justify-content: flex-start; }
+      .workspace { grid-template-columns: 180px minmax(520px,1fr); }
+      .detail { grid-column: 1 / -1; border: 1px solid #d9d5ca; }
+    }
+    @media (max-width: 700px) {
+      header { padding: 18px; }
+      .workspace { display: grid; grid-template-columns: minmax(0,1fr); }
+      .rail { overflow: visible; border-right: 0; border-bottom: 1px solid #d9d5ca; }
+      #structure-nav { display: grid; grid-template-columns: repeat(auto-fit,minmax(140px,1fr)); gap: 4px 8px; }
+      .group-label { grid-column: 1 / -1; }
+      .stage { overflow: hidden; padding: 6px; }
+      svg { min-width: 0; min-height: 420px; }
+      .detail { grid-column: auto; border-width: 1px 0 0; }
+    }
+    @media print {
+      .shell, .trace-panel { display: none !important; }
+      .static-summary { display: block !important; color: #000; background: #fff; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <div>
+        <p class="eyebrow">Evidence-backed architecture map</p>
+        <h1 id="page-title">Isometric codebase map</h1>
+        <p class="subtitle" id="page-subtitle">Measured structures and dependency flow</p>
+      </div>
+      <div class="stats" id="stats" aria-label="Repository statistics"></div>
+    </header>
+    <div class="workspace">
+      <nav class="rail" aria-label="Repository structures">
+        <h2>Structure</h2>
+        <div id="structure-nav"></div>
+      </nav>
+      <main class="stage">
+        <div class="map-toolbar" aria-label="Map controls">
+          <button type="button" id="overview-button">Overview</button>
+          <button type="button" id="trace-button">Request trace</button>
+          <button type="button" id="inside-back" hidden>Back to city</button>
+        </div>
+        <svg id="map" viewBox="0 0 1000 700" role="img" aria-labelledby="map-title map-desc">
+          <title id="map-title">Isometric repository architecture</title>
+          <desc id="map-desc">Interactive codebase structures, connections, and request trace.</desc>
+        </svg>
+      </main>
+      <aside class="detail" id="detail" aria-live="polite" aria-atomic="true"></aside>
+    </div>
+  </div>
+
+  <aside class="trace-panel" id="trace-panel" aria-live="polite" hidden>
+    <div class="trace-copy"><strong id="trace-title"></strong><span id="trace-text"></span></div>
+    <div class="trace-controls">
+      <button type="button" id="trace-prev">Previous</button>
+      <button type="button" id="trace-next">Next</button>
+      <button type="button" id="trace-close">Close</button>
+      <span class="trace-count" id="trace-count"></span>
+    </div>
+  </aside>
+
+  <section class="static-summary" id="isometric-static-summary">
+    <h2>Sample repository</h2>
+    <p><strong>Invariant:</strong> Replace this sample.</p>
+    <ul><li>Entry surface</li><li>Core module</li></ul>
+  </section>
+  <noscript><style>.shell{display:none}.static-summary{display:block}</style></noscript>
+
+  <script id="isometric-data" type="application/json">
+{
+  "schema_version": 1,
+  "sample_data": true,
+  "repository": {"source_head_sha": "0000000000000000000000000000000000000000", "source_dirty": false, "scope": "sample only"},
+  "title": "Sample repository",
+  "subtitle": "Replace this sample with measured facts",
+  "stats": [{"label": "modules", "value": "2", "evidence_ids": ["E-sample"]}],
+  "groups": [{"id": "runtime", "name": "Runtime", "color": "#6f9d83"}],
+  "structures": [
+    {"id": "entry", "code": "EN", "name": "Entry surface", "group": "runtime", "size": {"value": 10, "unit": "files"}, "position": {"gx": 2, "gy": 1}, "footprint": {"w": 2, "d": 2}, "height": 3, "kind": "module", "what": "Accepts work.", "how": "Sample only.", "talks": ["core"], "evidence_ids": ["E-sample"], "children": []},
+    {"id": "core", "code": "CO", "name": "Core module", "group": "runtime", "size": {"value": 20, "unit": "files"}, "position": {"gx": 7, "gy": 5}, "footprint": {"w": 3, "d": 2}, "height": 5, "kind": "module", "what": "Owns rules.", "how": "Sample only.", "talks": [], "evidence_ids": ["E-sample"], "children": []}
+  ],
+  "edges": [{"from": "entry", "to": "core", "label": "command", "kind": "flow", "evidence_ids": ["E-sample"], "via": []}],
+  "externals": [],
+  "trace": [{"structure_id": "entry", "text": "Work enters.", "evidence_ids": ["E-sample"]}, {"structure_id": "core", "text": "Rules run.", "evidence_ids": ["E-sample"]}],
+  "overview": {"what": "Sample only.", "how": "Sample only.", "invariant": "Replace this sample.", "evidence_ids": ["E-sample"]},
+  "evidence": [{"id": "E-sample", "claim": "Sample data only.", "sources": [{"path": "README.md", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}], "measurement": null}]
+}
+  </script>
+  <script data-isometric-engine>
+  "use strict";
+  (() => {
+    const NS = "http:" + "//www.w3.org/2000/svg";
+    const data = JSON.parse(document.getElementById("isometric-data").textContent);
+    const svg = document.getElementById("map");
+    const nav = document.getElementById("structure-nav");
+    const detail = document.getElementById("detail");
+    const tracePanel = document.getElementById("trace-panel");
+    const insideBack = document.getElementById("inside-back");
+    const structures = new Map(data.structures.map((item) => [item.id, item]));
+    const groups = new Map(data.groups.map((item) => [item.id, item]));
+    let selected = null;
+    let inside = null;
+    let traceIndex = null;
+
+    function node(name, attrs, text) {
+      const element = document.createElementNS(NS, name);
+      Object.entries(attrs || {}).forEach(([key, value]) => element.setAttribute(key, String(value)));
+      if (text !== undefined) element.textContent = String(text);
+      return element;
+    }
+    function html(name, className, text) {
+      const element = document.createElement(name);
+      if (className) element.className = className;
+      if (text !== undefined) element.textContent = String(text);
+      return element;
+    }
+    function project(gx, gy, height = 0) {
+      return [500 + (gx - gy) * 27, 105 + (gx + gy) * 14 - height * 15];
+    }
+    function points(values) { return values.map((item) => item.join(",")).join(" "); }
+    function shade(hex, amount) {
+      const value = Number.parseInt(hex.slice(1), 16);
+      const channels = [value >> 16, (value >> 8) & 255, value & 255]
+        .map((channel) => Math.max(0, Math.min(255, channel + amount)));
+      return `rgb(${channels[0]},${channels[1]},${channels[2]})`;
+    }
+    function clear(element) { while (element.firstChild) element.firstChild.remove(); }
+    function addSection(parent, heading, text) {
+      const section = html("section", "detail-section");
+      section.append(html("h3", "", heading), html("p", "", text));
+      parent.appendChild(section);
+    }
+    function renderHeader() {
+      document.getElementById("page-title").textContent = data.title;
+      document.getElementById("page-subtitle").textContent = data.subtitle;
+      document.title = data.title;
+      const stats = document.getElementById("stats");
+      clear(stats);
+      data.stats.forEach((item) => {
+        const card = html("div", "stat");
+        card.append(html("strong", "", item.value), html("span", "", item.label));
+        stats.appendChild(card);
+      });
+      document.getElementById("map-title").textContent = `${data.title} architecture map`;
+      document.getElementById("map-desc").textContent = `${data.structures.length} evidence-backed structures and ${data.edges.length} connections.`;
+      document.getElementById("trace-button").hidden = data.trace.length === 0;
+    }
+    function renderNav() {
+      clear(nav);
+      data.groups.forEach((group) => {
+        const members = data.structures.filter((item) => item.group === group.id);
+        if (!members.length) return;
+        nav.appendChild(html("p", "group-label", group.name));
+        members.forEach((item) => {
+          const button = html("button", "structure-button");
+          button.type = "button";
+          button.dataset.id = item.id;
+          button.style.setProperty("--group-color", group.color);
+          button.append(html("span", "code", item.code), html("span", "", item.name));
+          button.addEventListener("click", () => { location.hash = `structure=${encodeURIComponent(item.id)}`; });
+          nav.appendChild(button);
+        });
+      });
+      if (data.externals.length) {
+        nav.appendChild(html("p", "group-label", "External systems"));
+        data.externals.forEach((item,index) => {
+          const button = html("button", "structure-button");
+          button.type = "button"; button.dataset.id = `external:${item.id}`;
+          button.style.setProperty("--group-color", "#777d79");
+          button.append(html("span", "code", `X${String(index + 1).padStart(2,"0")}`), html("span", "", item.name));
+          button.addEventListener("click", () => { location.hash = `external=${encodeURIComponent(item.id)}`; });
+          nav.appendChild(button);
+        });
+      }
+    }
+    function center(item) {
+      return { gx: item.position.gx + item.footprint.w / 2, gy: item.position.gy + item.footprint.d / 2 };
+    }
+    function edgePath(edge) {
+      const from = structures.get(edge.from);
+      const to = structures.get(edge.to);
+      const start = center(from);
+      const end = center(to);
+      const grid = [[start.gx, start.gy], ...(edge.via || []), [end.gx, end.gy]];
+      if (grid.length === 2) grid.splice(1, 0, [end.gx, start.gy]);
+      return `M ${grid.map(([gx, gy]) => project(gx, gy, .1).join(" ")).join(" L ")}`;
+    }
+    function drawGround(layer, items = data.structures, externalItems = data.externals) {
+      const xValues = items.flatMap((item) => [item.position.gx,item.position.gx + item.footprint.w]).concat(externalItems.map((item) => item.position.gx));
+      const yValues = items.flatMap((item) => [item.position.gy,item.position.gy + item.footprint.d]).concat(externalItems.map((item) => item.position.gy));
+      const minimum = Math.floor(Math.min(...xValues,...yValues) - 4);
+      const maximum = Math.ceil(Math.max(...xValues,...yValues) + 4);
+      for (let index = minimum; index <= maximum; index += 2) {
+        const a = project(index, minimum); const b = project(index, maximum);
+        layer.appendChild(node("line", {class: "ground", x1: a[0], y1: a[1], x2: b[0], y2: b[1]}));
+        const c = project(minimum, index); const d = project(maximum, index);
+        layer.appendChild(node("line", {class: "ground", x1: c[0], y1: c[1], x2: d[0], y2: d[1]}));
+      }
+    }
+    function drawEdges(layer) {
+      data.edges.forEach((edge, index) => {
+        const pathValue = edgePath(edge);
+        const path = node("path", {class: `edge ${edge.kind}`, d: pathValue, "data-from": edge.from, "data-to": edge.to});
+        path.appendChild(node("title", {}, `${structures.get(edge.from).name} to ${structures.get(edge.to).name}: ${edge.label}`));
+        layer.appendChild(path);
+        if (edge.kind === "flow") {
+          const dot = node("circle", {class: "flow-dot", r: 3});
+          dot.appendChild(node("animateMotion", {path: pathValue, dur: `${5 + index % 4}s`, repeatCount: "indefinite"}));
+          layer.appendChild(dot);
+        }
+      });
+    }
+    function drawExternals(layer) {
+      data.externals.forEach((item,index) => {
+        const [x,y] = project(item.position.gx,item.position.gy,.2);
+        const target = center(structures.get(item.target));
+        const destination = project(target.gx,target.gy,.2);
+        const connection = node("line", {class: "edge advisory", x1: x, y1: y, x2: destination[0], y2: destination[1]});
+        connection.appendChild(node("title", {}, `${item.name} to ${structures.get(item.target).name}: ${item.label}`));
+        const choose = () => { location.hash = `external=${encodeURIComponent(item.id)}`; };
+        const external = node("g", {class: "external-system", tabindex: "0", role: "button", "aria-label": `${item.name}, external system`, "data-id": `external:${item.id}`});
+        external.append(
+          node("rect", {class: "external", x: x - 24, y: y - 17, width: 48, height: 34, rx: 5}),
+          node("text", {class: "external-label", x, y: y + 3, "text-anchor": "middle"}, `X${String(index + 1).padStart(2,"0")}`),
+          node("title", {}, `${item.name}: ${item.label}`)
+        );
+        external.addEventListener("click",choose);
+        external.addEventListener("keydown",(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); choose(); } });
+        layer.append(connection,external);
+      });
+    }
+    function geometry(item) {
+      const {gx, gy} = item.position; const {w, d} = item.footprint;
+      const height = item.kind === "store" ? Math.min(item.height, 1.25) : item.height;
+      const a = project(gx, gy, height); const b = project(gx + w, gy, height);
+      const c = project(gx + w, gy + d, height); const e = project(gx, gy + d, height);
+      const bb = project(gx + w, gy, 0); const bc = project(gx + w, gy + d, 0); const be = project(gx, gy + d, 0);
+      return {a,b,c,e,bb,bc,be,height};
+    }
+    function fitView(items, externalItems = [], edgeItems = []) {
+      const values = [];
+      items.forEach((item) => {
+        Object.values(geometry(item)).forEach((point) => { if (Array.isArray(point)) values.push(point); });
+      });
+      externalItems.forEach((item) => {
+        const point = project(item.position.gx,item.position.gy,.2);
+        values.push([point[0] - 30,point[1] - 24],[point[0] + 30,point[1] + 24]);
+      });
+      edgeItems.forEach((edge) => {
+        const start = center(structures.get(edge.from)); const end = center(structures.get(edge.to));
+        const route = [[start.gx,start.gy],...(edge.via || []),[end.gx,end.gy]];
+        if (route.length === 2) route.splice(1,0,[end.gx,start.gy]);
+        route.forEach(([gx,gy]) => values.push(project(gx,gy,.1)));
+      });
+      if (!values.length) { svg.setAttribute("viewBox","0 0 1000 700"); return; }
+      const xs = values.map((point) => point[0]); const ys = values.map((point) => point[1]);
+      const minimumX = Math.min(...xs); const maximumX = Math.max(...xs);
+      const minimumY = Math.min(...ys); const maximumY = Math.max(...ys);
+      const width = Math.max(720,maximumX - minimumX + 140);
+      const height = Math.max(560,maximumY - minimumY + 140);
+      svg.setAttribute("viewBox",`${(minimumX + maximumX - width) / 2} ${(minimumY + maximumY - height) / 2} ${width} ${height}`);
+    }
+    function drawStructure(layer, item, onSelect) {
+      const group = groups.get(item.group); const color = group.color; const shape = geometry(item);
+      const wrapper = node("g", {class: "structure", tabindex: "0", role: "button", "aria-label": `${item.name}, ${item.kind}`, "data-id": item.id});
+      wrapper.append(
+        node("polygon", {class: "side", fill: shade(color,-30), points: points([shape.b,shape.bb,shape.bc,shape.c])}),
+        node("polygon", {class: "side", fill: shade(color,-16), points: points([shape.e,shape.c,shape.bc,shape.be])}),
+        node("polygon", {class: "top", fill: color, points: points([shape.a,shape.b,shape.c,shape.e])}),
+        node("text", {class: "block-code", x: shape.a[0], y: shape.a[1] - 5, "text-anchor": "middle"}, item.code)
+      );
+      const select = onSelect || (() => { location.hash = `structure=${encodeURIComponent(item.id)}`; });
+      wrapper.addEventListener("click", select);
+      wrapper.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); select(); } });
+      layer.appendChild(wrapper);
+    }
+    function renderCity() {
+      inside = null; insideBack.hidden = true; clear(svg);
+      fitView(data.structures,data.externals,data.edges);
+      svg.append(node("title", {id: "map-title"}, `${data.title} architecture map`), node("desc", {id: "map-desc"}, `${data.structures.length} structures and ${data.edges.length} connections.`));
+      const ground = node("g"); const edges = node("g"); const externals = node("g"); const blocks = node("g");
+      svg.append(ground, edges, externals, blocks); drawGround(ground); drawEdges(edges); drawExternals(externals);
+      [...data.structures].sort((left,right) => (left.position.gx + left.position.gy) - (right.position.gx + right.position.gy) || left.position.gx - right.position.gx).forEach((item) => drawStructure(blocks,item));
+    }
+    function renderInside(parent) {
+      inside = parent.id; insideBack.hidden = false; clear(svg);
+      const children = parent.children.map((child,index) => ({...parent, ...child, id: `${parent.id}.${child.id}`, group: parent.group, kind: "module", size: {value: 1,unit: "role"}, position: {gx: 3 + (index % 4) * 4, gy: 3 + Math.floor(index / 4) * 4}, footprint: {w: 2,d: 2}, height: 2 + index % 4, talks: [],children: []}));
+      fitView(children);
+      svg.append(node("title", {id: "map-title"}, `Inside ${parent.name}`), node("desc", {id: "map-desc"}, `${parent.children.length} internal components.`));
+      const layer = node("g"); svg.appendChild(layer); drawGround(layer,children,[]);
+      children.forEach((item,index) => {
+        drawStructure(layer,item,() => renderChild(parent,parent.children[index]));
+      });
+    }
+    function setActiveClasses() {
+      document.querySelectorAll(".structure-button").forEach((item) => item.classList.toggle("active", item.dataset.id === selected));
+      svg.querySelectorAll(".structure").forEach((item) => {
+        let step = -1;
+        if (traceIndex !== null) data.trace.forEach((entry,index) => { if (index <= traceIndex && entry.structure_id === item.dataset.id) step = index; });
+        item.classList.toggle("active", traceIndex === null && item.dataset.id === selected);
+        item.classList.toggle("trace-done", step >= 0 && step < traceIndex);
+        item.classList.toggle("trace-current", traceIndex !== null && item.dataset.id === data.trace[traceIndex].structure_id);
+      });
+      svg.querySelectorAll(".external-system").forEach((item) => item.classList.toggle("active", item.dataset.id === selected));
+    }
+    function renderOverview() {
+      selected = null; traceIndex = null; tracePanel.hidden = true; clear(detail);
+      detail.append(html("p", "eyebrow", "System overview"), html("h2", "", data.title));
+      addSection(detail,"What",data.overview.what); addSection(detail,"How",data.overview.how); addSection(detail,"Invariant",data.overview.invariant); setActiveClasses();
+    }
+    function renderStructure(item) {
+      selected = item.id; traceIndex = null; tracePanel.hidden = true; clear(detail);
+      detail.append(html("p", "eyebrow", groups.get(item.group).name), html("h2", "", item.name));
+      addSection(detail,"What",item.what); addSection(detail,"How",item.how);
+      const relationships = data.edges.filter((edge) => edge.from === item.id).map((edge) => `${structures.get(edge.to).name} — ${edge.label} (${edge.kind})`);
+      addSection(detail,"Relationships",relationships.length ? relationships.join("; ") : "No outgoing connection is shown.");
+      if (item.children.length) { const button = html("button", "inside-button", `Go inside · ${item.children.length} components`); button.type = "button"; button.addEventListener("click", () => { location.hash = `inside=${encodeURIComponent(item.id)}`; }); detail.appendChild(button); }
+      setActiveClasses();
+    }
+    function renderChild(parent,child) {
+      clear(detail);
+      detail.append(html("p", "eyebrow", `Inside ${parent.name}`), html("h2", "", child.name));
+      addSection(detail,"What",child.what); addSection(detail,"How",child.how);
+    }
+    function renderExternal(item) {
+      selected = `external:${item.id}`; traceIndex = null; tracePanel.hidden = true; clear(detail);
+      detail.append(html("p", "eyebrow", "External system"), html("h2", "", item.name));
+      addSection(detail,"Relationship",item.label);
+      addSection(detail,"Connects to",structures.get(item.target).name);
+      setActiveClasses();
+    }
+    function renderInsideDetail(parent) {
+      selected = parent.id; traceIndex = null; tracePanel.hidden = true; clear(detail);
+      detail.append(html("p", "eyebrow", `Inside ${parent.name}`), html("h2", "", "Component map"));
+      addSection(detail,"What",parent.what); addSection(detail,"How",parent.how);
+      addSection(detail,"Components",parent.children.map((child) => child.name).join(", "));
+      setActiveClasses();
+    }
+    function renderTrace(index) {
+      if (!data.trace.length) { renderOverview(); return; }
+      traceIndex = Math.max(0,Math.min(data.trace.length - 1,index)); selected = data.trace[traceIndex].structure_id; tracePanel.hidden = false;
+      document.getElementById("trace-title").textContent = structures.get(selected).name;
+      document.getElementById("trace-text").textContent = data.trace[traceIndex].text;
+      document.getElementById("trace-count").textContent = `${traceIndex + 1} / ${data.trace.length}`;
+      document.getElementById("trace-prev").disabled = traceIndex === 0; document.getElementById("trace-next").disabled = traceIndex === data.trace.length - 1;
+      setActiveClasses();
+    }
+    function applyHash() {
+      const params = new URLSearchParams(location.hash.slice(1));
+      const insideId = params.get("inside"); const structureId = params.get("structure"); const externalId = params.get("external"); const rawTrace = Number(params.get("trace"));
+      if (insideId && structures.has(insideId) && structures.get(insideId).children.length) { renderInside(structures.get(insideId)); renderInsideDetail(structures.get(insideId)); return; }
+      if (inside) renderCity();
+      if (Number.isInteger(rawTrace) && rawTrace >= 1) { renderTrace(rawTrace - 1); return; }
+      if (structureId && structures.has(structureId)) { renderStructure(structures.get(structureId)); return; }
+      const external = data.externals.find((item) => item.id === externalId);
+      if (external) { renderExternal(external); return; }
+      renderOverview();
+    }
+    document.getElementById("overview-button").addEventListener("click", () => { location.hash = ""; });
+    document.getElementById("trace-button").addEventListener("click", () => { if (data.trace.length) location.hash = "trace=1"; });
+    document.getElementById("inside-back").addEventListener("click", () => { location.hash = ""; });
+    document.getElementById("trace-prev").addEventListener("click", () => { location.hash = `trace=${Math.max(1,traceIndex)}`; });
+    document.getElementById("trace-next").addEventListener("click", () => { location.hash = `trace=${Math.min(data.trace.length,traceIndex + 2)}`; });
+    document.getElementById("trace-close").addEventListener("click", () => { location.hash = ""; });
+    window.addEventListener("hashchange",applyHash);
+    renderHeader(); renderNav(); renderCity(); applyHash(); window.__qteamIsometricReady = true;
+  })();
+  </script>
+</body>
+</html>
