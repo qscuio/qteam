@@ -5,6 +5,23 @@ single lookup cannot expose and compare the plausible solution frontier. QTeam
 remains the only coordinator; existing read-only researchers execute frozen
 lanes and the architect performs final falsification.
 
+## Multi-agent fit gate
+
+Use more than one researcher only when at least two evidence lanes are genuinely
+independent: they have distinct source/tool boundaries, do not need each
+other's live conclusions, can persist their outputs as separate referenced
+artifacts, and can be synthesized after they finish. If the question requires
+one shared evolving context, tight sequential dependencies, or real-time
+cross-agent steering, use one researcher or serial lanes. Never add agents just
+to increase activity or fill capacity.
+
+This boundary follows Anthropic's public production finding that multi-agent
+research is strongest for breadth-first independent directions and much weaker
+for tightly dependent work, especially coding. Their reported fixed agent/tool
+counts are observations from one research system, not QTeam defaults; QTeam's
+coverage envelope and available safe capacity remain authoritative. See
+<https://www.anthropic.com/engineering/multi-agent-research-system>.
+
 ## State machine
 
 ```text
@@ -58,8 +75,9 @@ reason. Do not silently omit a relevant dimension.
 Every packet contains only:
 
 - `frontier_phase`: `breadth` or `depth`;
+- one precise objective and the decision it informs;
 - frozen question, decision, known facts, seeds, constraints, and non-goals;
-- source boundary and required evidence labels;
+- source/tool boundary, required output format, and evidence labels;
 - one breadth `dimension`, or one promoted `candidate` for depth;
 - required output fields, a probe limit, deadline capability
   (`runtime-enforced|coordinator-observed|unsupported`), a runtime/observation

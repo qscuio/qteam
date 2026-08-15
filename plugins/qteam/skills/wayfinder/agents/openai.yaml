@@ -1,0 +1,6 @@
+interface:
+  display_name: "Wayfinder"
+  short_description: "Map large efforts as decision frontiers"
+  default_prompt: "Use $wayfinder to map this multi-session effort as a dependency-aware decision frontier."
+policy:
+  allow_implicit_invocation: false

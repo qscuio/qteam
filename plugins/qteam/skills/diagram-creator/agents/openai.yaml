@@ -1,0 +1,4 @@
+interface:
+  display_name: "Diagram Creator"
+  short_description: "Create editorial diagrams and UML visuals"
+  default_prompt: "Use $diagram-creator to create a UML component diagram for this architecture."

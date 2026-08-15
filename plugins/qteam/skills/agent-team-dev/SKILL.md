@@ -130,6 +130,14 @@ Shared interfaces, schemas, migrations, lock/build/config/generated files,
 global fixtures, and snapshots are serial. Tests for a behavior live in its
 feature slice, not in a concurrent horizontal "tests" task.
 
+Apply a parallelism-fit gate before placing tasks in the same wave. Their
+contracts, writes, mutable resources, and verification must be independent;
+neither task may require another task's live reasoning or intermediate output;
+and the coordinator must be able to merge their durable results after both
+finish without real-time cross-worker steering. Otherwise add a dependency or
+make the work serial. Never create extra workers merely to fill capacity or
+spend more tokens.
+
 Each task must fit one fresh worker context. Group only small independent
 same-shape changes whose shared packet remains bounded. Plan wide refactors as
 expand, bounded migration batches, then contract; do not force them into one

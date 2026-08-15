@@ -1,7 +1,7 @@
 {
   "name": "qteam",
-  "version": "0.13.0+codex.20260814130549",
-  "description": "Durable graph delivery with in-session goals, checkpoint waits, adaptive quality lanes, calibrated review, isolated workers, TDD, diagnosis, and safe finish.",
+  "version": "0.14.0+codex.20260815070917",
+  "description": "Durable graph delivery plus UML diagrams, interactive teaching, portable handoffs, decision-frontier planning, adaptive quality lanes, calibrated review, TDD, diagnosis, and safe finish.",
   "author": {
     "name": "qscuio",
     "url": "https://github.com/qscuio"
@@ -20,13 +20,17 @@
     "worktrees",
     "web-ui",
     "herdr",
-    "goals"
+    "goals",
+    "diagrams",
+    "uml",
+    "teaching",
+    "handoff"
   ],
   "skills": "./skills/",
   "interface": {
     "displayName": "QTeam",
     "shortDescription": "Durable, gated multi-agent software delivery",
-    "longDescription": "Discover evidence-backed solution paths, then deliver through durable in-session goals, checkpoint waits, isolated worktrees, adaptive workflow shapes, conditional quality lanes, a local Web control plane, typed trajectory evidence, calibrated mandatory review, reversibility-aware decisions, cross-run dependencies, scenario-complete TDD, deterministic policy, and safe finish gates.",
+    "longDescription": "Discover evidence-backed solution paths, map uncertain work as a decision frontier, create editorial UML diagrams and interactive teaching UIs, hand sessions off through durable pointers, then deliver through durable goals, checkpoint waits, isolated worktrees, adaptive workflow shapes, conditional quality lanes, calibrated mandatory review, reversibility-aware decisions, scenario-complete TDD, deterministic policy, and safe finish gates.",
     "developerName": "qscuio",
     "category": "Developer Tools",
     "capabilities": [
@@ -38,7 +42,9 @@
     "defaultPrompt": [
       "Set up QTeam in this repository.",
       "Use QTeam to execute this implementation goal.",
-      "Resume the active QTeam run."
+      "Resume the active QTeam run.",
+      "Create a UML diagram for this design.",
+      "Teach me this mechanism with an interactive Show Me UI."
     ],
     "brandColor": "#2563EB",
     "screenshots": []

@@ -6,7 +6,7 @@
     {
       "name": "qteam",
       "description": "Durable graph delivery and in-session goal continuation",
-      "version": "0.13.0",
+      "version": "0.14.0",
       "source": "./plugins/qteam",
       "author": {"name": "qscuio"}
     }

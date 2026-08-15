@@ -203,7 +203,9 @@ def installed_payloads(plugin_root, version, source_commit, stamp):
     )
     for name in (
         "Matt-Pocock-MIT.txt", "Superpowers-MIT.txt", "Autoresearch-MIT.txt",
-        "LoopX-MIT.txt", "Smart-Ralph-MIT.txt",
+        "LoopX-MIT.txt", "Smart-Ralph-MIT.txt", "Diagram-Design-MIT.txt",
+        "Tabler-Icons-MIT.txt", "Simple-Icons-CC0-1.0.txt",
+        "Log-Z-Logos-MIT.txt", "Devicon-MIT.txt",
     ):
         payloads[f".codex/licenses/{name}"] = (
             source_bytes(plugin_root / f"LICENSES/{name}"), 0o644,

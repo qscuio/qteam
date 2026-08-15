@@ -10,6 +10,12 @@ the only orchestration authority. Other skills are bounded decision,
 planning, test, diagnosis, or review primitives; none may start their own
 implementation loop.
 
+Artifact-only requests may use `$diagram-creator` for static technical/UML
+visuals, `$show-me` for interactive teaching UIs, or `$handoff` for an explicit
+session/owner change without creating a QTeam run. If one is a deliverable of
+an active run, keep it inside that run's task/write-set/review lifecycle; the
+artifact skill does not bypass execution gates.
+
 Before starting or resuming execution, require the repository runtime marker
 `.codex/qteam-project.json` and executable `.codex/bin/agent-team-state`. If
 either is absent, do not create partial run state: tell the operator to run

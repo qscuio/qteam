@@ -1,10 +1,10 @@
 {
   "name": "qteam",
-  "description": "Durable graph delivery and in-session goal continuation for Claude Code",
-  "version": "0.13.0",
+  "description": "Durable delivery, diagrams, interactive teaching, and portable handoffs for Claude Code",
+  "version": "0.14.0",
   "author": {"name": "qscuio"},
   "homepage": "https://github.com/qscuio/qteam",
   "repository": "https://github.com/qscuio/qteam",
   "license": "MIT",
-  "keywords": ["skills", "delivery", "tdd", "debugging", "goals"]
+  "keywords": ["skills", "delivery", "tdd", "debugging", "goals", "diagrams", "uml", "teaching", "handoff"]
 }

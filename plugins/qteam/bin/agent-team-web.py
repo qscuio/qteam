@@ -619,7 +619,7 @@ class QTeamServer(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "QTeamWeb/0.13"
+    server_version = "QTeamWeb/0.14"
 
     def log_message(self, format_value, *args):
         sys.stderr.write("qteam-web: " + format_value % args + "\n")

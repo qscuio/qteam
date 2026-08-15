@@ -6,8 +6,8 @@ PLUGIN_ID="qteam@qteam"
 
 usage() {
   cat <<'USAGE'
-usage: ./qteam setup [project]
-       ./qteam uninstall [project]
+usage: ./qteam setup [--host codex|claude|cursor] [project]
+       ./qteam uninstall [--host codex|claude|cursor] [project]
        ./qteam runtime-setup <project>
        ./qteam runtime-uninstall <project>
        ./qteam doctor <project> [--smoke]
@@ -15,15 +15,20 @@ usage: ./qteam setup [project]
        ./qteam goal <project> --run <run-id> <status|condition|wait|cursor-stop> [options]
        ./qteam herdr doctor
        ./qteam herdr open <project> --run <run-id> [session-options]
+       ./qteam cursor <project> [cursor-agent-options]
 
-setup installs the local QTeam marketplace and plugin. When project is given,
-it also installs the small repository runtime required for isolated workers.
+setup installs the selected host integration. Codex and Claude use native
+marketplace/plugin commands; Cursor uses a version-checked local plugin source.
+When project is given, setup also installs the small repository runtime needed
+for isolated workers.
 
 uninstall removes that project runtime when project is given, then removes the
-QTeam plugin and its marketplace registration.
+selected host's persistent plugin registration when one exists.
 
-runtime-setup/runtime-uninstall manage only the host-neutral repository runtime
-for Claude Code, Cursor, or a Codex installation managed separately.
+Codex and Claude setup/uninstall manage their native plugin registrations.
+Cursor has no non-interactive persistent plugin-install command; its host mode
+manages the repository runtime and `qteam cursor` loads this plugin directory
+explicitly for each Cursor Agent session.
 
 serve starts the local QTeam Web control plane. herdr optionally opens the
 same Web/watch surface in a Herdr pane; neither command changes orchestration
@@ -61,6 +66,212 @@ else:
 plugin_source_version() {
   python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])' \
     "$ROOT/plugins/qteam/.codex-plugin/plugin.json"
+}
+
+host_plugin_source_version() {
+  case "$1" in
+    codex) plugin_source_version ;;
+    claude)
+      python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])' \
+        "$ROOT/plugins/qteam/.claude-plugin/plugin.json"
+      ;;
+    cursor)
+      python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])' \
+        "$ROOT/plugins/qteam/.cursor-plugin/plugin.json"
+      ;;
+    *) return 2 ;;
+  esac
+}
+
+validate_cursor_plugin_source() {
+  python3 -c '
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+version = (root / "VERSION").read_text(encoding="utf-8").strip()
+manifest = json.loads((root / ".cursor-plugin/plugin.json").read_text(encoding="utf-8"))
+raise SystemExit(0 if manifest.get("version") == version
+                 and manifest.get("skills") == "./skills/" else 1)
+' "$ROOT/plugins/qteam" || {
+    echo "error: Cursor plugin source manifest/version is inconsistent" >&2
+    return 4
+  }
+}
+
+claude_marketplace_status() {
+  local payload
+  payload="$(claude plugin marketplace list --json)"
+  python3 -c '
+import json, os, sys
+expected = os.path.realpath(sys.argv[1])
+payload = json.load(sys.stdin)
+matches = [item for item in payload if item.get("name") == "qteam"]
+def strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for nested in value.values():
+            yield from strings(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from strings(nested)
+if not matches:
+    print("absent")
+elif len(matches) == 1 and any(
+    os.path.realpath(value) == expected
+    for value in strings(matches[0])
+    if value.startswith(("/", "."))
+):
+    print("match")
+else:
+    print("conflict")
+' "$ROOT" <<<"$payload"
+}
+
+setup_claude_plugin() {
+  local added=0 installed=0 expected plugins status action_status
+  status="$(claude_marketplace_status)"
+  plugins="$(claude plugin list --json)"
+  case "$status" in
+    absent)
+      if python3 -c '
+import json, sys
+payload = json.load(sys.stdin)
+raise SystemExit(0 if any(item.get("id") == "qteam@qteam" for item in payload) else 1)
+' <<<"$plugins"; then
+        echo "error: Claude qteam@qteam is installed but its owning marketplace is absent; no setup changes made" >&2
+        return 3
+      fi
+      claude plugin marketplace add "$ROOT"
+      added=1
+      ;;
+    match) ;;
+    conflict)
+      echo "error: a different Claude marketplace named qteam is configured" >&2
+      return 3
+      ;;
+    *) echo "error: could not determine Claude QTeam marketplace status" >&2; return 3 ;;
+  esac
+  if claude plugin list --json | python3 -c '
+import json, sys
+payload = json.load(sys.stdin)
+raise SystemExit(0 if any(item.get("id") == "qteam@qteam" for item in payload) else 1)
+'; then
+    if claude plugin update qteam@qteam; then
+      :
+    else
+      action_status=$?
+      if [[ $added -eq 1 ]]; then
+        claude plugin marketplace remove qteam >/dev/null 2>&1 || true
+      fi
+      return "$action_status"
+    fi
+  else
+    if claude plugin install qteam@qteam; then
+      installed=1
+    else
+      action_status=$?
+      if [[ $added -eq 1 ]]; then
+        claude plugin uninstall qteam@qteam >/dev/null 2>&1 || true
+        claude plugin marketplace remove qteam >/dev/null 2>&1 || true
+      fi
+      return "$action_status"
+    fi
+  fi
+  expected="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])' \
+    "$ROOT/plugins/qteam/.claude-plugin/plugin.json")"
+  plugins="$(claude plugin list --json)"
+  if python3 -c '
+import json, sys
+expected = sys.argv[1]
+payload = json.load(sys.stdin)
+matches = [item for item in payload if item.get("id") == "qteam@qteam"]
+raise SystemExit(0 if len(matches) == 1
+                 and matches[0].get("enabled") is True
+                 and matches[0].get("version") == expected else 1)
+' "$expected" <<<"$plugins"; then
+    return 0
+  fi
+  echo "error: qteam@qteam did not reach Claude version $expected" >&2
+  if [[ $added -eq 1 ]]; then
+    if [[ $installed -eq 1 ]]; then
+      claude plugin uninstall qteam@qteam >/dev/null 2>&1 || true
+    fi
+    claude plugin marketplace remove qteam >/dev/null 2>&1 || true
+  fi
+  return 4
+}
+
+remove_claude_plugin() {
+  local plugins status
+  status="$(claude_marketplace_status)"
+  plugins="$(claude plugin list --json)"
+  if [[ "$status" == "conflict" ]]; then
+    echo "error: Claude marketplace name qteam belongs to a different source" >&2
+    return 3
+  fi
+  if [[ "$status" == "absent" ]] && python3 -c '
+import json, sys
+payload = json.load(sys.stdin)
+raise SystemExit(0 if any(item.get("id") == "qteam@qteam" for item in payload) else 1)
+' <<<"$plugins"; then
+    echo "error: Claude qteam@qteam is installed but its owning marketplace is absent; no uninstall changes made" >&2
+    return 3
+  fi
+  if python3 -c '
+import json, sys
+payload = json.load(sys.stdin)
+raise SystemExit(0 if any(item.get("id") == "qteam@qteam" for item in payload) else 1)
+' <<<"$plugins"; then
+    claude plugin uninstall qteam@qteam
+  fi
+  [[ "$status" != "match" ]] || claude plugin marketplace remove qteam
+}
+
+preflight_host_uninstall() {
+  case "$1" in
+    codex)
+      require_command codex
+      require_uninstall_ownership
+      ;;
+    claude)
+      require_command claude
+      local plugins status
+      status="$(claude_marketplace_status)"
+      plugins="$(claude plugin list --json)"
+      if [[ "$status" == "conflict" ]]; then
+        echo "error: Claude marketplace name qteam belongs to a different source; no uninstall changes made" >&2
+        return 3
+      fi
+      if [[ "$status" == "absent" ]] && python3 -c '
+import json, sys
+payload = json.load(sys.stdin)
+raise SystemExit(0 if any(item.get("id") == "qteam@qteam" for item in payload) else 1)
+' <<<"$plugins"; then
+        echo "error: Claude qteam@qteam is installed but its owning marketplace is absent; no uninstall changes made" >&2
+        return 3
+      fi
+      ;;
+    cursor) ;;
+    *) echo "error: unsupported host '$1'" >&2; return 2 ;;
+  esac
+}
+
+setup_host_plugin() {
+  case "$1" in
+    codex) require_command codex; setup_plugin ;;
+    claude) require_command claude; setup_claude_plugin ;;
+    cursor) validate_cursor_plugin_source ;;
+    *) echo "error: unsupported host '$1'" >&2; return 2 ;;
+  esac
+}
+
+remove_host_plugin() {
+  case "$1" in
+    codex) require_command codex; require_uninstall_ownership; remove_plugin ;;
+    claude) require_command claude; remove_claude_plugin ;;
+    cursor) return 0 ;;
+    *) echo "error: unsupported host '$1'" >&2; return 2 ;;
+  esac
 }
 
 setup_plugin() {
@@ -161,24 +372,42 @@ raise SystemExit(0 if any(item.get("pluginId") == "qteam@qteam" for item in payl
 }
 
 main() {
-  local project_root=""
+  local project_root="" host="codex" project_arg=""
   require_command python3
   case "${1:-}" in
     setup)
-      require_command codex
-      [[ $# -le 2 ]] || { usage >&2; exit 2; }
-      if [[ -n "${2:-}" ]]; then
+      shift
+      if [[ "${1:-}" == "--host" ]]; then
+        [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+        host="$2"
+        shift 2
+      fi
+      [[ $# -le 1 ]] || { usage >&2; exit 2; }
+      project_arg="${1:-}"
+      [[ "$host" != "cursor" || -n "$project_arg" ]] || {
+        echo "error: Cursor setup requires a project; use './qteam cursor <project>' to launch with the local plugin" >&2
+        exit 2
+      }
+      if [[ -n "$project_arg" ]]; then
         require_command git
-        project_root="$(git -C "$2" rev-parse --show-toplevel)"
+        project_root="$(git -C "$project_arg" rev-parse --show-toplevel)"
+        if [[ "$host" == "cursor" ]]; then
+          validate_cursor_plugin_source
+        fi
         if [[ -e "$project_root/.codex/qteam-refresh" || \
               -L "$project_root/.codex/qteam-refresh" ]]; then
-          QTEAM_REFRESH_PLUGIN_VERSION="$(plugin_source_version)" \
-            "$ROOT/plugins/qteam/scripts/project-refresh.py" \
-            "$project_root" "$ROOT/qteam" _setup-plugin
-          echo "QTeam setup complete. Start a new Codex task to load the plugin."
+          if [[ "$host" == "cursor" ]]; then
+            "$ROOT/plugins/qteam/scripts/project-refresh.py" "$project_root"
+          else
+            QTEAM_REFRESH_PLUGIN_VERSION="$(host_plugin_source_version "$host")" \
+              QTEAM_REFRESH_PLUGIN_HOST="$host" \
+              "$ROOT/plugins/qteam/scripts/project-refresh.py" \
+              "$project_root" "$ROOT/qteam" _setup-plugin --host "$host"
+          fi
+          echo "QTeam setup complete for $host."
           return 0
         fi
-        for local_skill in qteam-explore qteam-goal qteam-harden; do
+        for local_skill in diagram-creator handoff qteam-explore qteam-goal qteam-harden show-me; do
           if [[ -e "$project_root/.agents/skills/$local_skill" || \
                 -L "$project_root/.agents/skills/$local_skill" ]]; then
             echo "error: repository-local .agents/skills/$local_skill conflicts with the QTeam plugin and is not QTeam-owned" >&2
@@ -190,16 +419,21 @@ main() {
             -L "$project_root/.codex/qteam-project.json" ) ]]; then
         "$ROOT/plugins/qteam/scripts/project-uninstall.py" --check-only "$project_root"
       fi
-      if [[ -n "${2:-}" ]]; then
+      if [[ -n "$project_arg" ]]; then
         if [[ -e "$project_root/.codex/qteam-project.json" || \
               -L "$project_root/.codex/qteam-project.json" ]]; then
-          echo "Transactionally refreshing the QTeam plugin and project runtime."
-          QTEAM_REFRESH_PLUGIN_VERSION="$(plugin_source_version)" \
-            "$ROOT/plugins/qteam/scripts/project-refresh.py" \
-            "$project_root" "$ROOT/qteam" _setup-plugin
+          echo "Transactionally refreshing the QTeam project runtime."
+          if [[ "$host" == "cursor" ]]; then
+            "$ROOT/plugins/qteam/scripts/project-refresh.py" "$project_root"
+          else
+            QTEAM_REFRESH_PLUGIN_VERSION="$(host_plugin_source_version "$host")" \
+              QTEAM_REFRESH_PLUGIN_HOST="$host" \
+              "$ROOT/plugins/qteam/scripts/project-refresh.py" \
+              "$project_root" "$ROOT/qteam" _setup-plugin --host "$host"
+          fi
         else
           "$ROOT/plugins/qteam/scripts/project-setup.py" "$project_root"
-          if setup_plugin; then
+          if setup_host_plugin "$host"; then
             :
           else
             status=$?
@@ -208,24 +442,43 @@ main() {
           fi
         fi
       else
-        setup_plugin
+        setup_host_plugin "$host"
       fi
-      echo "QTeam setup complete. Start a new Codex task to load the plugin."
+      if [[ "$host" == "cursor" ]]; then
+        echo "QTeam setup complete for Cursor. Launch with: $ROOT/qteam cursor '$project_root'"
+      else
+        echo "QTeam setup complete for $host. Start a new $host session to load the plugin."
+      fi
       ;;
     _setup-plugin)
-      require_command codex
-      [[ $# -eq 1 ]] || { usage >&2; exit 2; }
-      setup_plugin
+      shift
+      if [[ "${1:-}" == "--host" ]]; then
+        [[ $# -eq 2 ]] || { usage >&2; exit 2; }
+        host="$2"
+      else
+        [[ $# -eq 0 ]] || { usage >&2; exit 2; }
+      fi
+      setup_host_plugin "$host"
       ;;
     uninstall)
-      require_command codex
-      [[ $# -le 2 ]] || { usage >&2; exit 2; }
-      require_uninstall_ownership
-      if [[ -n "${2:-}" ]]; then
-        "$ROOT/plugins/qteam/scripts/project-uninstall.py" "$2"
+      shift
+      if [[ "${1:-}" == "--host" ]]; then
+        [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+        host="$2"
+        shift 2
       fi
-      remove_plugin
-      echo "QTeam uninstall complete. Start a new Codex task to drop cached skills."
+      [[ $# -le 1 ]] || { usage >&2; exit 2; }
+      project_arg="${1:-}"
+      [[ "$host" != "cursor" || -n "$project_arg" ]] || {
+        echo "error: Cursor has no persistent plugin registration to uninstall; provide a project to remove its runtime" >&2
+        exit 2
+      }
+      preflight_host_uninstall "$host"
+      if [[ -n "$project_arg" ]]; then
+        "$ROOT/plugins/qteam/scripts/project-uninstall.py" "$project_arg"
+      fi
+      remove_host_plugin "$host"
+      echo "QTeam uninstall complete for $host."
       ;;
     runtime-setup)
       [[ $# -eq 2 ]] || { usage >&2; exit 2; }
@@ -245,6 +498,20 @@ main() {
       [[ $# -eq 2 ]] || { usage >&2; exit 2; }
       "$ROOT/plugins/qteam/scripts/project-uninstall.py" "$2"
       echo "QTeam repository runtime uninstall complete."
+      ;;
+    cursor)
+      [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+      require_command git
+      require_command cursor-agent
+      validate_cursor_plugin_source
+      project_root="$(git -C "$2" rev-parse --show-toplevel)"
+      [[ -x "$project_root/.codex/bin/agent-team-state" ]] || {
+        echo "error: QTeam project runtime is not installed; run ./qteam setup --host cursor '$project_root'" >&2
+        exit 3
+      }
+      shift 2
+      exec cursor-agent --plugin-dir "$ROOT/plugins/qteam" \
+        --workspace "$project_root" "$@"
       ;;
     doctor)
       require_command codex

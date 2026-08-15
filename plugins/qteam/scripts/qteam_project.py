@@ -30,17 +30,23 @@ SCHEMAS = (
 )
 UI_FILES = ("index.html", "app.js", "styles.css")
 PLUGIN_SKILLS = (
-    "agent-team-dev", "brainstorming", "domain-modeling",
+    "agent-team-dev", "brainstorming", "diagram-creator", "domain-modeling",
     "goal-execution-discipline", "grill-me", "grill-with-docs", "grilling",
-    "qteam-diagnose", "qteam-explore", "qteam-review", "qteam-router",
+    "handoff", "qteam-diagnose", "qteam-explore", "qteam-review", "qteam-router",
     "qteam-goal", "qteam-harden", "qteam-tdd", "to-spec", "to-tickets",
-    "verification-before-completion", "wayfinder", "writing-plans",
+    "show-me", "verification-before-completion", "wayfinder", "writing-plans",
 )
 LEGACY_OWNED_PLUGIN_SKILLS = tuple(
     name for name in PLUGIN_SKILLS
-    if name not in {"qteam-explore", "qteam-goal", "qteam-harden"}
+    if name not in {
+        "diagram-creator", "handoff", "qteam-explore", "qteam-goal",
+        "qteam-harden", "show-me",
+    }
 )
-LOCAL_SKILL_CONFLICTS = ("qteam-explore", "qteam-goal", "qteam-harden")
+LOCAL_SKILL_CONFLICTS = (
+    "diagram-creator", "handoff", "qteam-explore", "qteam-goal",
+    "qteam-harden", "show-me",
+)
 LEGACY_ORCHESTRATION_SKILLS = (
     "using-superpowers", "executing-plans", "subagent-driven-development",
     "requesting-code-review", "receiving-code-review",
@@ -72,6 +78,11 @@ INSTALLED_PATHS = frozenset(
         ".codex/licenses/Autoresearch-MIT.txt",
         ".codex/licenses/LoopX-MIT.txt",
         ".codex/licenses/Smart-Ralph-MIT.txt",
+        ".codex/licenses/Diagram-Design-MIT.txt",
+        ".codex/licenses/Tabler-Icons-MIT.txt",
+        ".codex/licenses/Simple-Icons-CC0-1.0.txt",
+        ".codex/licenses/Log-Z-Logos-MIT.txt",
+        ".codex/licenses/Devicon-MIT.txt",
         ".codex/agent-team-template.version",
     ]
 )
@@ -82,8 +93,17 @@ MOVED_PATHS = frozenset(
     + [f".agents/skills/{name}" for name in LEGACY_ORCHESTRATION_SKILLS]
     + [".codex/bin/__pycache__"]
 )
-V012_INSTALLED_PATHS = frozenset(
+V013_INSTALLED_PATHS = frozenset(
     INSTALLED_PATHS - {
+        ".codex/licenses/Diagram-Design-MIT.txt",
+        ".codex/licenses/Tabler-Icons-MIT.txt",
+        ".codex/licenses/Simple-Icons-CC0-1.0.txt",
+        ".codex/licenses/Log-Z-Logos-MIT.txt",
+        ".codex/licenses/Devicon-MIT.txt",
+    }
+)
+V012_INSTALLED_PATHS = frozenset(
+    V013_INSTALLED_PATHS - {
         ".codex/bin/agent-team-goal",
         ".codex/schemas/goal-status.schema.json",
     }
@@ -333,6 +353,8 @@ def validate_manifest(root, manifest):
         supported_sets = (V011_INSTALLED_PATHS,)
     elif version_tuple < (0, 13, 0):
         supported_sets = (V012_INSTALLED_PATHS,)
+    elif version_tuple < (0, 14, 0):
+        supported_sets = (V013_INSTALLED_PATHS,)
     else:
         supported_sets = (INSTALLED_PATHS,)
     if installed_set not in supported_sets:

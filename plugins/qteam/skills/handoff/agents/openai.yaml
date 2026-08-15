@@ -1,0 +1,6 @@
+interface:
+  display_name: "Handoff"
+  short_description: "Compact a session into a continuation packet"
+  default_prompt: "Use $handoff to prepare a secret-redacted continuation packet for a fresh session."
+policy:
+  allow_implicit_invocation: false

@@ -9,6 +9,27 @@ Autoresearch while keeping exactly one orchestration authority.
 The core rule is simple: roles are created only for distinct permission,
 context, output, or lifecycle boundaries; reusable practices remain skills.
 
+## What changed in 0.14
+
+- `$diagram-creator` vendors Diagram Design 2.4.0's editorial HTML/SVG system
+  and adds bounded UML class, use-case, component, deployment, and activity
+  notation. It also retains sequence/state, architecture, data, process,
+  draw.io, Mermaid, export, brand-profile, and accessible-motion workflows.
+- `$show-me` creates self-contained interactive teaching UIs. Lessons are
+  model-first, manually stepable, keyboard accessible, reduced-motion safe,
+  printable, and understandable without JavaScript; animation exposes cause
+  and state change instead of decorating a static diagram.
+- `$handoff` adapts Matt Pocock's latest compact, temporary, secret-redacted
+  continuation packet and binds it to QTeam's durable goal checkpoint and Git
+  evidence. It never replaces typed run handoffs or durable state.
+- `$wayfinder` now carries the latest map-as-index, named-ticket, native
+  dependency frontier, claim, fog-of-war, out-of-scope, and HITL/AFK rules.
+  It still hands clear decisions to `$to-spec` or a frozen QTeam epic rather
+  than becoming an implementation orchestrator.
+- All four capabilities ship through the same Codex, Claude Code, and Cursor
+  plugin. Project setup also installs Diagram Design's MIT license and rejects
+  conflicting repository-local copies of the new skill names.
+
 ## What changed in 0.13
 
 - `qteam-goal` projects the existing durable run into a bounded host completion
@@ -259,18 +280,29 @@ For plugin-only installation, omit the project path:
 ./qteam setup
 ```
 
-Claude Code can load the same skill plugin from this checkout, while the
-repository runtime is installed independently:
+Claude Code gets the same native plugin plus repository runtime with the same
+command shape:
 
 ```bash
-claude plugin marketplace add /path/to/qteam
-claude plugin install qteam@qteam
-/path/to/qteam/qteam runtime-setup /path/to/target-git-repository
+/path/to/qteam/qteam setup --host claude /path/to/target-git-repository
+/path/to/qteam/qteam uninstall --host claude /path/to/target-git-repository
 ```
 
-Cursor can install `plugins/qteam` as a local plugin from `/add-plugin`; use the
-same `runtime-setup` command. Uninstall only the shared repository runtime with
-`runtime-uninstall`. Host plugin removal remains owned by Claude/Cursor.
+Cursor Agent currently exposes `--plugin-dir` but no non-interactive persistent
+plugin-install command. QTeam therefore keeps its lifecycle honest: setup and
+uninstall manage the repository runtime, while the launcher loads the exact
+local plugin on every session without a stale host cache:
+
+```bash
+/path/to/qteam/qteam setup --host cursor /path/to/target-git-repository
+/path/to/qteam/qteam cursor /path/to/target-git-repository
+/path/to/qteam/qteam uninstall --host cursor /path/to/target-git-repository
+```
+
+For an IDE-persistent Cursor install, use `/add-plugin`; until Cursor provides
+a non-interactive install/remove CLI, QTeam does not claim that UI mutation was
+automated. The repository runtime remains host-neutral and may also be managed
+alone with `runtime-setup` / `runtime-uninstall`.
 
 For an existing run, generate the exact session adapter instead of duplicating
 the goal in prose:
@@ -286,12 +318,16 @@ with the returned condition when that tool is available. Cursor installs the
 returned command as a project `stop` hook. These are continuation adapters, not
 new state authorities.
 
-The setup command uses Codex's native plugin lifecycle:
+Codex setup uses its native plugin lifecycle:
 
 ```text
 codex plugin marketplace add <this-qteam-checkout>
 codex plugin add qteam@qteam
 ```
+
+Claude setup analogously uses `claude plugin marketplace add` plus
+`claude plugin install/update`, verifies the installed 0.14 version, and its
+uninstall command removes both registrations.
 
 Start the Web UI after project setup:
 
@@ -397,6 +433,36 @@ modified managed file fails closed instead of reporting a successful update.
 Recovery backups, the machine-specific manifest, and run state are added to
 the target repository's ignore rules independently so preimages cannot enter a
 normal commit.
+
+## Visual explanation skills
+
+Use `$diagram-creator` when the durable artifact is a static technical or
+product visual:
+
+```text
+Use $diagram-creator to make a UML component diagram of this service boundary.
+```
+
+It produces self-contained HTML with inline accessible SVG and can export SVG
+or PNG on request. UML output follows an explicitly bounded notation subset;
+it does not require PlantUML and does not claim to emit XMI or a fully
+machine-verifiable UML model.
+
+Use `$show-me` when the learner needs to control time, inputs, or state:
+
+```text
+Use $show-me to teach me how retries and backoff evolve, step by step.
+```
+
+It produces a self-contained interactive HTML lesson with Back/Next/Reset,
+optional user-initiated playback, narration, invariants, keyboard controls,
+reduced-motion behavior, and a static/print fallback. Static figures inside a
+lesson may follow `$diagram-creator`, but the two skills have separate trigger
+and quality contracts.
+
+Use `$handoff` only when actually changing session, harness, or owner. It saves
+a private temporary pointer document and, for active QTeam work, includes the
+fresh goal checkpoint rather than copying the transcript or run state.
 
 ## Start or resume
 
@@ -637,8 +703,9 @@ explicitly skipped with evidence; and every typed handoff is closed.
 
 `qteam-router` routes the work. `agent-team-dev` alone owns execution, workers,
 merges, reviews, and finish. `brainstorming`, `grilling`, `grill-with-docs`,
-`domain-modeling`, `qteam-explore`, `to-spec`, `to-tickets`, and `wayfinder` may
-shape decisions and artifacts but never begin a competing implementation loop.
+`domain-modeling`, `qteam-explore`, `to-spec`, `to-tickets`, `wayfinder`,
+`diagram-creator`, `show-me`, and `handoff` may shape decisions and artifacts
+but never begin a competing implementation loop.
 
 The coordinator uses `qteam-explore` when the solution frontier is unknown;
 researchers execute only its frozen, cold evidence-lane packets;
@@ -662,5 +729,6 @@ Only the bounded Superpowers primitives `brainstorming`, `writing-plans`, and
 (`using-superpowers`, `executing-plans`, `subagent-driven-development`, and
 independent branch finish/worktree flows) are deliberately not installed.
 
-Third-party attribution, including LoopX interaction-state ideas, is in
+Third-party attribution, including Diagram Design and its bundled icon sources,
+is in
 `plugins/qteam/THIRD_PARTY_NOTICES.md` and `plugins/qteam/LICENSES/`.

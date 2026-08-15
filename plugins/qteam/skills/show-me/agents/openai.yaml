@@ -1,0 +1,4 @@
+interface:
+  display_name: "Show Me"
+  short_description: "Teach concepts with interactive animated UIs"
+  default_prompt: "Use $show-me to teach me how this request lifecycle works with a step-by-step interactive UI."

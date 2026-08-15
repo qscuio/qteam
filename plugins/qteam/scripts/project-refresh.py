@@ -27,11 +27,13 @@ def run(command):
         raise ValueError("command failed: " + " ".join(map(str, command)))
 
 
-def verify_plugin_postcondition(expected_version):
+def verify_plugin_postcondition(plugin_host, expected_version):
     if expected_version is None:
         return
+    if plugin_host not in {"codex", "claude"}:
+        raise ValueError("unsupported frozen QTeam plugin host")
     completed = subprocess.run(
-        ["codex", "plugin", "list", "--json"], text=True,
+        [plugin_host, "plugin", "list", "--json"], text=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
     )
     if completed.returncode or len(completed.stdout.encode("utf-8")) > 1024 * 1024:
@@ -40,14 +42,24 @@ def verify_plugin_postcondition(expected_version):
         payload = json.loads(completed.stdout)
     except (UnicodeError, json.JSONDecodeError, RecursionError) as exc:
         raise ValueError(f"invalid plugin postcondition response: {exc}")
-    matches = [
-        item for item in payload.get("installed", [])
-        if isinstance(item, dict) and item.get("pluginId") == "qteam@qteam"
-    ] if isinstance(payload, dict) else []
-    if (len(matches) != 1
-            or matches[0].get("installed") is not True
-            or matches[0].get("enabled") is not True
-            or matches[0].get("version") != expected_version):
+    if plugin_host == "codex":
+        matches = [
+            item for item in payload.get("installed", [])
+            if isinstance(item, dict) and item.get("pluginId") == "qteam@qteam"
+        ] if isinstance(payload, dict) else []
+        valid = (len(matches) == 1
+                 and matches[0].get("installed") is True
+                 and matches[0].get("enabled") is True
+                 and matches[0].get("version") == expected_version)
+    else:
+        matches = [
+            item for item in payload
+            if isinstance(item, dict) and item.get("id") == "qteam@qteam"
+        ] if isinstance(payload, list) else []
+        valid = (len(matches) == 1
+                 and matches[0].get("enabled") is True
+                 and matches[0].get("version") == expected_version)
+    if not valid:
         raise ValueError(
             "QTeam plugin did not reach the frozen installed version "
             + expected_version
@@ -189,12 +201,13 @@ def snapshot_previous(root, manifest, backup_root, after_command):
     )
     previous_manifest = refresh_root / "previous-manifest.json"
     intent = {
-        "schema_version": 3,
+        "schema_version": 4,
         "repository": str(root),
         "phase": "snapshot-ready",
         "backup_root": manifest["backup_root"],
         "after_command": list(after_command),
         "plugin_version": os.environ.get("QTEAM_REFRESH_PLUGIN_VERSION"),
+        "plugin_host": os.environ.get("QTEAM_REFRESH_PLUGIN_HOST", "codex"),
         "previous_manifest": {
             "saved": "previous-manifest.json",
             "mode": previous_manifest.stat().st_mode & 0o777,
@@ -232,8 +245,10 @@ def read_intent(root):
         "previous_manifest", "backup", "files", "after_command",
         "plugin_version",
     }
+    if isinstance(intent, dict) and intent.get("schema_version") == 4:
+        required.add("plugin_host")
     if (not isinstance(intent, dict) or set(intent) != required
-            or intent.get("schema_version") != 3
+            or intent.get("schema_version") not in {3, 4}
             or intent.get("repository") != str(root)
             or intent.get("phase") not in {
                 "snapshot-ready", "project-installing", "plugin-installing",
@@ -246,7 +261,9 @@ def read_intent(root):
             or (intent.get("plugin_version") is not None
                 and (not isinstance(intent.get("plugin_version"), str)
                      or re.fullmatch(r"[0-9A-Za-z.+-]{1,128}",
-                                     intent.get("plugin_version", "")) is None))):
+                                     intent.get("plugin_version", "")) is None))
+            or (intent.get("schema_version") == 4
+                and intent.get("plugin_host") not in {"codex", "claude"})):
         raise ValueError("invalid QTeam refresh intent")
     previous = intent.get("previous_manifest")
     backup = intent.get("backup")
@@ -326,7 +343,9 @@ def recover(project, after_command=()):
         )
         verify_installed_runtime(root, current)
         run(intent["after_command"])
-        verify_plugin_postcondition(intent["plugin_version"])
+        verify_plugin_postcondition(
+            intent.get("plugin_host", "codex"), intent["plugin_version"]
+        )
         remove_tree(refresh_root)
         return True
     scripts = Path(__file__).resolve().parent
@@ -406,7 +425,9 @@ def refresh(project, after_command):
         if after_command:
             intent = set_phase(refresh_root, intent, "plugin-installing")
             run(after_command)
-            verify_plugin_postcondition(intent["plugin_version"])
+            verify_plugin_postcondition(
+                intent.get("plugin_host", "codex"), intent["plugin_version"]
+            )
     except (OSError, UnicodeError, ValueError, subprocess.SubprocessError):
         if intent["phase"] == "plugin-installing":
             raise ValueError(

@@ -6512,6 +6512,12 @@ class InstallerTests(RepoCase):
         self.assertTrue((self.repo / ".codex/licenses/Autoresearch-MIT.txt").is_file())
         self.assertTrue((self.repo / ".codex/licenses/LoopX-MIT.txt").is_file())
         self.assertTrue((self.repo / ".codex/licenses/Smart-Ralph-MIT.txt").is_file())
+        self.assertTrue((self.repo / ".codex/licenses/Diagram-Design-MIT.txt").is_file())
+        for name in (
+            "Tabler-Icons-MIT.txt", "Simple-Icons-CC0-1.0.txt",
+            "Log-Z-Logos-MIT.txt", "Devicon-MIT.txt",
+        ):
+            self.assertTrue((self.repo / ".codex/licenses" / name).is_file())
         self.assertFalse((self.repo / ".agents/skills/qteam-router").exists())
         self.assertFalse(old_qteam.exists())
         self.assertFalse(old_skill.exists())
@@ -6599,6 +6605,20 @@ class InstallerTests(RepoCase):
         self.assertIn("not QTeam-owned", blocked.stderr)
         self.assertEqual(marker.read_text(encoding="utf-8"),
                          "user-owned legacy discovery\n")
+        self.assertFalse((self.repo / ".codex/qteam-project.json").exists())
+
+    def test_setup_refuses_user_owned_local_show_me_skill_before_mutation(self):
+        local = self.repo / ".agents/skills/show-me"
+        local.mkdir(parents=True)
+        marker = local / "SKILL.md"
+        marker.write_text("user-owned interactive teaching\n", encoding="utf-8")
+        blocked = self.run_tool(PROJECT_SETUP, str(self.repo))
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn("not QTeam-owned", blocked.stderr)
+        self.assertEqual(
+            marker.read_text(encoding="utf-8"),
+            "user-owned interactive teaching\n",
+        )
         self.assertFalse((self.repo / ".codex/qteam-project.json").exists())
 
     def test_project_uninstall_retains_locally_modified_runtime_file(self):
@@ -6934,17 +6954,17 @@ class PluginTests(RepoCase):
             manifest["version"].split("+", 1)[0],
             (PLUGIN / "VERSION").read_text(encoding="utf-8").strip(),
         )
-        self.assertRegex(manifest["version"], r"^0\.13\.0\+codex\.[0-9]+$")
+        self.assertRegex(manifest["version"], r"^0\.14\.0\+codex\.[0-9]+$")
 
         claude = json.loads((PLUGIN / ".claude-plugin/plugin.json").read_text())
         cursor = json.loads((PLUGIN / ".cursor-plugin/plugin.json").read_text())
         claude_marketplace = json.loads(
             (SOURCE / ".claude-plugin/marketplace.json").read_text()
         )
-        self.assertEqual(claude["version"], "0.13.0")
-        self.assertEqual(cursor["version"], "0.13.0")
+        self.assertEqual(claude["version"], "0.14.0")
+        self.assertEqual(cursor["version"], "0.14.0")
         self.assertEqual(cursor["skills"], "./skills/")
-        self.assertEqual(claude_marketplace["plugins"][0]["version"], "0.13.0")
+        self.assertEqual(claude_marketplace["plugins"][0]["version"], "0.14.0")
         self.assertEqual(
             claude_marketplace["plugins"][0]["source"], "./plugins/qteam"
         )
@@ -7002,6 +7022,58 @@ class PluginTests(RepoCase):
         )["version"]
         return env, state, log
 
+    def fake_claude_env(self):
+        fake_bin = Path(self.tmp.name) / "claude-plugin-bin"
+        fake_bin.mkdir(exist_ok=True)
+        state = Path(self.tmp.name) / "claude-plugin-state.json"
+        state.write_text(json.dumps({"marketplace": False, "plugin": False}),
+                         encoding="utf-8")
+        log = Path(self.tmp.name) / "claude-plugin-calls.jsonl"
+        fake = fake_bin / "claude"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "state_path=Path(os.environ['QTEAM_FAKE_CLAUDE_STATE'])\n"
+            "log=Path(os.environ['QTEAM_FAKE_CLAUDE_LOG'])\n"
+            "state=json.loads(state_path.read_text())\n"
+            "args=sys.argv[1:]\n"
+            "with log.open('a') as out: out.write(json.dumps(args)+'\\n')\n"
+            "if args==['plugin','marketplace','list','--json']:\n"
+            "  items=[]\n"
+            "  if state['marketplace']: items=[{'name':'qteam','source':os.environ['QTEAM_ROOT']}]\n"
+            "  print(json.dumps(items))\n"
+            "elif args[:3]==['plugin','marketplace','add']:\n"
+            "  state['marketplace']=True\n"
+            "elif args==['plugin','install','qteam@qteam']:\n"
+            "  if os.environ.get('QTEAM_FAKE_FAIL_CLAUDE_INSTALL')=='1': state_path.write_text(json.dumps(state)); raise SystemExit(7)\n"
+            "  state['plugin']=True\n"
+            "elif args==['plugin','update','qteam@qteam']:\n"
+            "  if os.environ.get('QTEAM_FAKE_FAIL_CLAUDE_UPDATE')=='1': state_path.write_text(json.dumps(state)); raise SystemExit(9)\n"
+            "  state['plugin']=True\n"
+            "elif args==['plugin','list','--json']:\n"
+            "  items=[{'id':'qteam@qteam','version':os.environ['QTEAM_EXPECTED_CLAUDE_VERSION'],'enabled':True}] if state['plugin'] else []\n"
+            "  print(json.dumps(items))\n"
+            "elif args==['plugin','uninstall','qteam@qteam']:\n"
+            "  state['plugin']=False\n"
+            "elif args==['plugin','marketplace','remove','qteam']:\n"
+            "  state['marketplace']=False\n"
+            "else:\n"
+            "  raise SystemExit('unexpected fake claude args: '+repr(args))\n"
+            "state_path.write_text(json.dumps(state))\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+        env = os.environ.copy()
+        env["PATH"] = f"{fake_bin}:{env['PATH']}"
+        env["QTEAM_FAKE_CLAUDE_STATE"] = str(state)
+        env["QTEAM_FAKE_CLAUDE_LOG"] = str(log)
+        env["QTEAM_ROOT"] = str(SOURCE.resolve())
+        env["QTEAM_EXPECTED_CLAUDE_VERSION"] = json.loads(
+            (PLUGIN / ".claude-plugin/plugin.json").read_text(encoding="utf-8")
+        )["version"]
+        return env, state, log
+
     def test_simple_plugin_setup_and_uninstall_commands_are_symmetric(self):
         env, state, log = self.fake_codex_env()
         setup = subprocess.run(
@@ -7023,6 +7095,151 @@ class PluginTests(RepoCase):
         self.assertIn(["plugin", "add", "qteam@qteam"], calls)
         self.assertIn(["plugin", "remove", "qteam@qteam"], calls)
         self.assertIn(["plugin", "marketplace", "remove", "qteam"], calls)
+
+    def test_claude_plugin_setup_and_uninstall_are_symmetric(self):
+        env, state, log = self.fake_claude_env()
+        setup = subprocess.run(
+            [str(QTEAM), "setup", "--host", "claude"], cwd=SOURCE, env=env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(setup.returncode, 0, setup.stdout + setup.stderr)
+        self.assertEqual(json.loads(state.read_text()),
+                         {"marketplace": True, "plugin": True})
+        removed = subprocess.run(
+            [str(QTEAM), "uninstall", "--host", "claude"], cwd=SOURCE,
+            env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(removed.returncode, 0,
+                         removed.stdout + removed.stderr)
+        self.assertEqual(json.loads(state.read_text()),
+                         {"marketplace": False, "plugin": False})
+        calls = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertIn(["plugin", "marketplace", "add", str(SOURCE.resolve())],
+                      calls)
+        self.assertIn(["plugin", "install", "qteam@qteam"], calls)
+        self.assertIn(["plugin", "uninstall", "qteam@qteam"], calls)
+
+    def test_claude_project_refresh_uses_claude_version_postcondition(self):
+        env, state, _log = self.fake_claude_env()
+        for _attempt in range(2):
+            setup = subprocess.run(
+                [str(QTEAM), "setup", "--host", "claude", str(self.repo)],
+                cwd=SOURCE, env=env, text=True, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertEqual(setup.returncode, 0,
+                             setup.stdout + setup.stderr)
+            self.assertFalse((self.repo / ".codex/qteam-refresh").exists())
+        self.assertEqual(json.loads(state.read_text()),
+                         {"marketplace": True, "plugin": True})
+
+    def test_failed_claude_plugin_install_removes_new_marketplace(self):
+        env, state, _log = self.fake_claude_env()
+        env["QTEAM_FAKE_FAIL_CLAUDE_INSTALL"] = "1"
+        setup = subprocess.run(
+            [str(QTEAM), "setup", "--host", "claude"], cwd=SOURCE, env=env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(setup.returncode, 7,
+                         setup.stdout + setup.stderr)
+        self.assertEqual(json.loads(state.read_text()),
+                         {"marketplace": False, "plugin": False})
+
+    def test_claude_orphan_plugin_setup_fails_closed(self):
+        env, state, _log = self.fake_claude_env()
+        state.write_text(json.dumps({"marketplace": False, "plugin": True}),
+                         encoding="utf-8")
+        setup = subprocess.run(
+            [str(QTEAM), "setup", "--host", "claude"], cwd=SOURCE, env=env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(setup.returncode, 3,
+                         setup.stdout + setup.stderr)
+        self.assertIn("owning marketplace is absent", setup.stderr)
+        self.assertEqual(json.loads(state.read_text()),
+                         {"marketplace": False, "plugin": True})
+
+    def test_claude_orphan_plugin_uninstall_fails_closed(self):
+        env, state, _log = self.fake_claude_env()
+        state.write_text(json.dumps({"marketplace": False, "plugin": True}),
+                         encoding="utf-8")
+        removed = subprocess.run(
+            [str(QTEAM), "uninstall", "--host", "claude"], cwd=SOURCE,
+            env=env, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(removed.returncode, 3,
+                         removed.stdout + removed.stderr)
+        self.assertEqual(json.loads(state.read_text()),
+                         {"marketplace": False, "plugin": True})
+
+    def test_cursor_host_setup_and_uninstall_manage_runtime_without_codex(self):
+        setup = subprocess.run(
+            [str(QTEAM), "setup", "--host", "cursor", str(self.repo)],
+            cwd=SOURCE, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(setup.returncode, 0, setup.stdout + setup.stderr)
+        self.assertIn("qteam cursor", setup.stdout)
+        self.assertTrue((self.repo / ".codex/bin/agent-team-state").is_file())
+        removed = subprocess.run(
+            [str(QTEAM), "uninstall", "--host", "cursor", str(self.repo)],
+            cwd=SOURCE, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(removed.returncode, 0,
+                         removed.stdout + removed.stderr)
+        self.assertFalse((self.repo / ".codex/qteam-project.json").exists())
+
+    def test_cursor_refresh_revalidates_the_local_plugin_manifest(self):
+        harness = Path(self.tmp.name) / "cursor-qteam-copy"
+        (harness / "plugins").mkdir(parents=True)
+        shutil.copy2(QTEAM, harness / "qteam")
+        shutil.copytree(PLUGIN, harness / "plugins/qteam")
+        initial = [str(QTEAM), "setup", "--host", "cursor", str(self.repo)]
+        first = subprocess.run(
+            initial, cwd=SOURCE, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        manifest = self.repo / ".codex/qteam-project.json"
+        before = manifest.read_bytes()
+        cursor_manifest = harness / "plugins/qteam/.cursor-plugin/plugin.json"
+        payload = json.loads(cursor_manifest.read_text(encoding="utf-8"))
+        payload["version"] = "9.9.9"
+        cursor_manifest.write_text(json.dumps(payload), encoding="utf-8")
+        command = [str(harness / "qteam"), "setup", "--host", "cursor",
+                   str(self.repo)]
+        blocked = subprocess.run(
+            command, cwd=harness, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(blocked.returncode, 4,
+                         blocked.stdout + blocked.stderr)
+        self.assertIn("manifest/version is inconsistent", blocked.stderr)
+        self.assertEqual(manifest.read_bytes(), before)
+
+    def test_combined_uninstall_preflights_plugin_before_project_mutation(self):
+        installed = subprocess.run(
+            [str(QTEAM), "runtime-setup", str(self.repo)], cwd=SOURCE,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(installed.returncode, 0,
+                         installed.stdout + installed.stderr)
+        manifest = self.repo / ".codex/qteam-project.json"
+        before = manifest.read_bytes()
+        env, state, _log = self.fake_codex_env()
+        state.write_text(json.dumps({"marketplace": False, "plugin": True}),
+                         encoding="utf-8")
+        removed = subprocess.run(
+            [str(QTEAM), "uninstall", str(self.repo)], cwd=SOURCE, env=env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(removed.returncode, 3,
+                         removed.stdout + removed.stderr)
+        self.assertEqual(manifest.read_bytes(), before)
+        self.assertEqual(json.loads(state.read_text()),
+                         {"marketplace": False, "plugin": True})
 
     def test_simple_commands_manage_plugin_and_project_runtime_together(self):
         env, state, _log = self.fake_codex_env()
@@ -7354,6 +7571,11 @@ class PluginTests(RepoCase):
                 autoresearch_license = ".codex/licenses/Autoresearch-MIT.txt"
                 experiment_schema = ".codex/schemas/experiment.schema.json"
                 previous_paths = {
+                    ".codex/licenses/Diagram-Design-MIT.txt",
+                    ".codex/licenses/Tabler-Icons-MIT.txt",
+                    ".codex/licenses/Simple-Icons-CC0-1.0.txt",
+                    ".codex/licenses/Log-Z-Logos-MIT.txt",
+                    ".codex/licenses/Devicon-MIT.txt",
                     autoresearch_license, experiment_schema,
                     ".codex/bin/agent_team_eval.py",
                     ".codex/schemas/eval-case.schema.json",
@@ -7432,6 +7654,11 @@ class PluginTests(RepoCase):
         manifest_path = self.repo / ".codex/qteam-project.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         additions = {
+            ".codex/licenses/Diagram-Design-MIT.txt",
+            ".codex/licenses/Tabler-Icons-MIT.txt",
+            ".codex/licenses/Simple-Icons-CC0-1.0.txt",
+            ".codex/licenses/Log-Z-Logos-MIT.txt",
+            ".codex/licenses/Devicon-MIT.txt",
             ".codex/bin/agent_team_eval.py",
             ".codex/schemas/eval-case.schema.json",
             ".codex/schemas/trajectory.schema.json",
@@ -7485,6 +7712,11 @@ class PluginTests(RepoCase):
         additions = {
             ".codex/bin/agent-team-goal",
             ".codex/schemas/goal-status.schema.json",
+            ".codex/licenses/Diagram-Design-MIT.txt",
+            ".codex/licenses/Tabler-Icons-MIT.txt",
+            ".codex/licenses/Simple-Icons-CC0-1.0.txt",
+            ".codex/licenses/Log-Z-Logos-MIT.txt",
+            ".codex/licenses/Devicon-MIT.txt",
         }
         manifest["installed_files"] = [
             record for record in manifest["installed_files"]
@@ -7502,6 +7734,38 @@ class PluginTests(RepoCase):
         self.assertEqual(upgraded.returncode, 0, upgraded.stdout + upgraded.stderr)
         for relative in additions:
             self.assertTrue((self.repo / relative).is_file())
+
+    def test_setup_upgrades_v013_runtime_with_diagram_licenses(self):
+        self.run_tool(PROJECT_SETUP, str(self.repo), check=True)
+        manifest_path = self.repo / ".codex/qteam-project.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        license_paths = {
+            ".codex/licenses/Diagram-Design-MIT.txt",
+            ".codex/licenses/Tabler-Icons-MIT.txt",
+            ".codex/licenses/Simple-Icons-CC0-1.0.txt",
+            ".codex/licenses/Log-Z-Logos-MIT.txt",
+            ".codex/licenses/Devicon-MIT.txt",
+        }
+        manifest["installed_files"] = [
+            record for record in manifest["installed_files"]
+            if record["path"] not in license_paths
+        ]
+        for license_path in license_paths:
+            (self.repo / license_path).unlink()
+        manifest["version"] = "0.13.0"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        env, _state, _log = self.fake_codex_env()
+        upgraded = subprocess.run(
+            [str(QTEAM), "setup", str(self.repo)], cwd=SOURCE, env=env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(upgraded.returncode, 0,
+                         upgraded.stdout + upgraded.stderr)
+        for license_path in license_paths:
+            self.assertTrue((self.repo / license_path).is_file())
+        current = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(current["version"], "0.14.0")
 
     def test_uninstall_conflict_makes_no_plugin_or_marketplace_mutation(self):
         env, state, log = self.fake_codex_env()
@@ -7521,6 +7785,427 @@ class PluginTests(RepoCase):
         self.assertNotIn(["plugin", "marketplace", "remove", "qteam"], calls)
 
 
+class VisualAndHandoffSkillTests(unittest.TestCase):
+    def test_diagram_creator_vendors_editorial_system_and_adds_uml(self):
+        skill = PLUGIN / "skills/diagram-creator"
+        text = (skill / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("name: diagram-creator", text)
+        self.assertIn("Visual-type guide (32)", text)
+        self.assertIn("not PlantUML source", text)
+        for diagram in ("class", "use-case", "component", "deployment", "activity"):
+            reference = skill / f"references/type-uml-{diagram}.md"
+            self.assertTrue(reference.is_file(), reference)
+            self.assertIn("Load `uml-notation.md` first", reference.read_text(
+                encoding="utf-8"
+            ))
+        notation = (skill / "references/uml-notation.md").read_text(
+            encoding="utf-8"
+        )
+        for semantic in (
+            "Generalization", "Realization", "Aggregation", "Composition",
+        ):
+            self.assertIn(semantic, notation)
+        self.assertTrue((skill / "assets/example-architecture.html").is_file())
+        checked = subprocess.run(
+            [sys.executable, str(skill / "scripts/self_check.py"),
+             str(skill / "assets/example-architecture.html")],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
+        geometry = subprocess.run(
+            [sys.executable, str(skill / "scripts/verify_geometry.py"),
+             str(skill / "assets/example-architecture.html")],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(geometry.returncode, 0,
+                         geometry.stdout + geometry.stderr)
+        with tempfile.TemporaryDirectory() as tmp:
+            reordered = Path(tmp) / "reordered-geometry.html"
+            reordered.write_text(
+                "<svg><rect height='10' width='60' y='10' x='10'/>"
+                "<rect width='100' height='50' x='20' y='5'/></svg>",
+                encoding="utf-8",
+            )
+            rejected_geometry = subprocess.run(
+                [sys.executable, str(skill / "scripts/verify_geometry.py"),
+                 str(reordered)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(rejected_geometry.returncode, 0)
+            self.assertIn("clipped by node", rejected_geometry.stdout)
+
+            default_coordinates = Path(tmp) / "default-coordinates.html"
+            default_coordinates.write_text(
+                "<svg><rect x='90' y='10' width='30' height='10'/>"
+                "<rect width='100' height='50'/></svg>",
+                encoding="utf-8",
+            )
+            rejected_geometry = subprocess.run(
+                [sys.executable, str(skill / "scripts/verify_geometry.py"),
+                 str(default_coordinates)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(rejected_geometry.returncode, 0)
+            self.assertIn("clipped by node", rejected_geometry.stdout)
+
+            transformed_geometry = Path(tmp) / "transformed-geometry.html"
+            transformed_geometry.write_text(
+                "<svg><g transform='translate(1 1)'>"
+                "<rect x='10' y='10' width='80' height='50'/></g></svg>",
+                encoding="utf-8",
+            )
+            rejected_geometry = subprocess.run(
+                [sys.executable, str(skill / "scripts/verify_geometry.py"),
+                 str(transformed_geometry)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(rejected_geometry.returncode, 0)
+            self.assertIn("transformed rect geometry is unsupported",
+                          rejected_geometry.stdout)
+
+            remote_css = Path(tmp) / "remote-css.html"
+            remote_css.write_text(
+                (skill / "assets/example-architecture.html").read_text(
+                    encoding="utf-8"
+                ).replace("</style>",
+                          "@import url('https://evil.invalid/font.css');</style>",
+                          1),
+                encoding="utf-8",
+            )
+            rejected = subprocess.run(
+                [sys.executable, str(skill / "scripts/self_check.py"),
+                 str(remote_css)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("CSS @import", rejected.stdout)
+
+            inline_css = Path(tmp) / "inline-remote-css.html"
+            inline_css.write_text(
+                (skill / "assets/example-architecture.html").read_text(
+                    encoding="utf-8"
+                ).replace(
+                    "<body>",
+                    '<body style="background-image:url(https://evil.invalid/x.png)">',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            rejected = subprocess.run(
+                [sys.executable, str(skill / "scripts/self_check.py"),
+                 str(inline_css)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("remote CSS references", rejected.stdout)
+
+            local_css = Path(tmp) / "local-sidecar-css.html"
+            local_css.write_text(
+                (skill / "assets/example-architecture.html").read_text(
+                    encoding="utf-8"
+                ).replace(
+                    "<body>",
+                    '<body style="background-image:url(sidecar.png)">',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            rejected = subprocess.run(
+                [sys.executable, str(skill / "scripts/self_check.py"),
+                 str(local_css)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("CSS sidecar references", rejected.stdout)
+
+            image_set = Path(tmp) / "image-set-remote-css.html"
+            image_set.write_text(
+                (skill / "assets/example-architecture.html").read_text(
+                    encoding="utf-8"
+                ).replace(
+                    "</style>",
+                    '.bad{background-image:image-set("https://evil.invalid/x.png" 1x)}</style>',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            rejected = subprocess.run(
+                [sys.executable, str(skill / "scripts/self_check.py"),
+                 str(image_set)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("remote CSS references", rejected.stdout)
+
+            for name, insertion, expected_error in (
+                ("sidecar", '<img src="sidecar.png" alt="sidecar">',
+                 "sidecar reference"),
+                ("srcset", '<img srcset="data:image/png;base64,AA 1x, '
+                 'https://evil.invalid/x.png 2x" alt="set">',
+                 "srcset is not allowed"),
+            ):
+                artifact = Path(tmp) / f"{name}.html"
+                artifact.write_text(
+                    (skill / "assets/example-architecture.html").read_text(
+                        encoding="utf-8"
+                    ).replace("</body>", insertion + "</body>", 1),
+                    encoding="utf-8",
+                )
+                rejected = subprocess.run(
+                    [sys.executable, str(skill / "scripts/self_check.py"),
+                     str(artifact)],
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertIn(expected_error, rejected.stdout)
+
+    def test_show_me_template_is_interactive_accessible_and_self_contained(self):
+        skill = PLUGIN / "skills/show-me"
+        text = (skill / "SKILL.md").read_text(encoding="utf-8")
+        template = skill / "assets/template-interactive.html"
+        self.assertIn("name: show-me", text)
+        self.assertIn("interactive animated UI", text)
+        self.assertIn("model before motion", text.lower())
+        checked = subprocess.run(
+            [sys.executable, str(skill / "scripts/self_check.py"), str(template)],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
+        source = template.read_text(encoding="utf-8")
+        self.assertIn('aria-live="polite"', source)
+        self.assertIn("prefers-reduced-motion", source)
+        self.assertIn("@media print", source)
+        self.assertIn("Content-Security-Policy", source)
+        self.assertIn('class="print-invariant"', source)
+        self.assertIn('node.querySelector("code").textContent = step.nodes[index]', source)
+        self.assertNotRegex(source, r"<(?:script|link)[^>]+(?:src|href)=")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            unsafe = Path(tmp) / "unsafe-show-me.html"
+            unsafe.write_text(
+                source.replace("</head>", '<script src="https://evil.invalid/x.js"></script></head>'),
+                encoding="utf-8",
+            )
+            rejected = subprocess.run(
+                [sys.executable, str(skill / "scripts/self_check.py"), str(unsafe)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("external runtime resources", rejected.stderr)
+
+            networked = Path(tmp) / "networked-show-me.html"
+            networked.write_text(
+                source.replace(
+                    "const ui = { step: 0, playing: false, timer: null };",
+                    "fetch('https://evil.invalid/lesson');\n"
+                    "    const ui = { step: 0, playing: false, timer: null };",
+                ),
+                encoding="utf-8",
+            )
+            rejected = subprocess.run(
+                [sys.executable, str(skill / "scripts/self_check.py"),
+                 str(networked)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("fetch API", rejected.stderr)
+
+            beacon = Path(tmp) / "beacon-show-me.html"
+            beacon.write_text(
+                source.replace(
+                    '"use strict";',
+                    '"use strict"; const beacon = new Image(); '
+                    'beacon.src = "https://evil.invalid/pixel";',
+                ),
+                encoding="utf-8",
+            )
+            rejected = subprocess.run(
+                [sys.executable, str(skill / "scripts/self_check.py"),
+                 str(beacon)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("Image constructor", rejected.stderr)
+
+            misleading_csp = Path(tmp) / "misleading-csp-show-me.html"
+            misleading_csp.write_text(
+                source.replace(
+                    "default-src 'none';",
+                    "default-src https:; <!-- default-src 'none'; -->",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            rejected = subprocess.run(
+                [sys.executable, str(skill / "scripts/self_check.py"),
+                 str(misleading_csp)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("closed policy", rejected.stderr)
+
+            navigation = Path(tmp) / "navigation-show-me.html"
+            navigation.write_text(
+                source.replace(
+                    '"use strict";',
+                    '"use strict"; window.location.assign('
+                    '"https://evil.invalid");',
+                ),
+                encoding="utf-8",
+            )
+            rejected = subprocess.run(
+                [sys.executable, str(skill / "scripts/self_check.py"),
+                 str(navigation)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("location navigation", rejected.stderr)
+
+            hidden_invariant = Path(tmp) / "hidden-invariant-show-me.html"
+            hidden_invariant.write_text(
+                source.replace(
+                    'class="print-invariant"',
+                    'class="print-invariant" style="display:none"',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            rejected = subprocess.run(
+                [sys.executable, str(skill / "scripts/self_check.py"),
+                 str(hidden_invariant)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("visible governing invariant", rejected.stderr)
+
+            duplicate_csp = Path(tmp) / "duplicate-csp-show-me.html"
+            duplicate_csp.write_text(
+                source.replace(
+                    'content="default-src',
+                    'content="default-src *" content="default-src',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            rejected = subprocess.run(
+                [sys.executable, str(skill / "scripts/self_check.py"),
+                 str(duplicate_csp)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("duplicate attributes", rejected.stderr)
+
+            body_csp = Path(tmp) / "body-csp-show-me.html"
+            csp = re.search(
+                r'<meta http-equiv="Content-Security-Policy"[^>]+>', source
+            ).group(0)
+            body_csp.write_text(
+                source.replace(csp, "", 1).replace("</body>", csp + "</body>", 1),
+                encoding="utf-8",
+            )
+            rejected = subprocess.run(
+                [sys.executable, str(skill / "scripts/self_check.py"),
+                 str(body_csp)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("must be inside head", rejected.stderr)
+
+            css_hidden_invariant = Path(tmp) / "css-hidden-invariant-show-me.html"
+            css_hidden_invariant.write_text(
+                source.replace(
+                    "</style>",
+                    ".print-invariant { display: none; }</style>",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            rejected = subprocess.run(
+                [sys.executable, str(skill / "scripts/self_check.py"),
+                 str(css_hidden_invariant)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("CSS hides the governing invariant", rejected.stderr)
+
+    def test_handoff_and_wayfinder_bind_to_qteam_authority(self):
+        handoff = (PLUGIN / "skills/handoff/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        wayfinder = (PLUGIN / "skills/wayfinder/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("agent-team-goal --run <run-id> status", handoff)
+        self.assertIn("temporary directory", handoff)
+        self.assertIn("typed handoff", handoff)
+        self.assertIn("secret", handoff.lower())
+        command = (PLUGIN / "commands/handoff.md").read_text(encoding="utf-8")
+        self.assertIn("explicit user action", command)
+        self.assertIn("$handoff", command)
+        for concept in (
+            "map is an index", "native blocking edges", "Fog of war",
+            "HITL",
+        ):
+            self.assertIn(concept, wayfinder)
+        self.assertIn(
+            "Re-query it immediately before a claim", " ".join(wayfinder.split())
+        )
+        self.assertIn("QTeam remains the only implementation orchestrator", wayfinder)
+        self.assertIn("$to-spec", wayfinder)
+        local_tracker = (PLUGIN /
+                         "skills/wayfinder/references/local-tracker.md").read_text(
+                             encoding="utf-8"
+                         )
+        self.assertIn("frontier is mechanically determined", local_tracker)
+        self.assertIn("does not make a read/edit claim atomic", local_tracker)
+        self.assertTrue((PLUGIN /
+                         "skills/wayfinder/references/local-map-template.md").is_file())
+
+    def test_multi_agent_research_is_gated_by_independence_not_agent_count(self):
+        rule = (PLUGIN /
+                "skills/qteam-explore/references/research-frontier-rule.md").read_text(
+                    encoding="utf-8"
+                )
+        self.assertIn("Multi-agent fit gate", rule)
+        self.assertIn("distinct source/tool boundaries", rule)
+        self.assertIn("one shared evolving context", rule)
+        self.assertIn("not QTeam defaults", rule)
+        self.assertIn("anthropic.com/engineering/multi-agent-research-system", rule)
+
+    def test_visual_skill_metadata_and_attribution_are_packaged(self):
+        expected = {"diagram-creator", "handoff", "show-me"}
+        for name in expected:
+            skill = PLUGIN / "skills" / name
+            metadata = (skill / "agents/openai.yaml").read_text(encoding="utf-8")
+            self.assertIn(f"${name}", metadata)
+        contract = (PLUGIN / "scripts/qteam_project.py").read_text(
+            encoding="utf-8"
+        )
+        router = (PLUGIN / "skills/qteam-router/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        for name in expected:
+            self.assertIn(f'"{name}"', contract)
+            self.assertIn(f"${name}", router)
+        notices = (PLUGIN / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+        license_text = (PLUGIN / "LICENSES/Diagram-Design-MIT.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("Diagram Design 2.4.0", notices)
+        self.assertIn("Tabler Icons", notices)
+        self.assertIn("Copyright (c) 2025 Cathryn Lavery", license_text)
+        for name, copyright_line in (
+            ("Tabler-Icons-MIT.txt", "Copyright (c) 2020-2026 Paweł Kuna"),
+            ("Log-Z-Logos-MIT.txt", "Copyright (c) 2021 log-Z"),
+            ("Devicon-MIT.txt", "Copyright (c) 2015 konpa"),
+            ("Simple-Icons-CC0-1.0.txt", "CC0 1.0 Universal"),
+        ):
+            self.assertIn(
+                copyright_line,
+                (PLUGIN / "LICENSES" / name).read_text(encoding="utf-8"),
+            )
+
+
 class InteractionContractTests(unittest.TestCase):
     def test_goal_adapter_and_refreshed_upstream_primitives_are_explicit(self):
         goal = (PLUGIN / "skills/qteam-goal/SKILL.md").read_text(encoding="utf-8")
@@ -7536,6 +8221,7 @@ class InteractionContractTests(unittest.TestCase):
         self.assertIn("frontier of independent", grilling)
         self.assertIn("expand phase", tickets)
         self.assertIn("one blocking `wait`", workflow)
+        self.assertIn("parallelism-fit gate", workflow)
         self.assertIn("Superpowers 6.3", notices)
         self.assertIn("must fix every valid finding", notices)
 

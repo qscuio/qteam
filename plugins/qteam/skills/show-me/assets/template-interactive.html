@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src 'none'; connect-src 'none'; media-src 'none'; object-src 'none'; frame-src 'none'; form-action 'none'; base-uri 'none'">
+  <title>Show Me — Request lifecycle</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --paper: #f7f8fa;
+      --surface: #ffffff;
+      --ink: #172033;
+      --muted: #637089;
+      --rule: #d7dce5;
+      --action: #2457d6;
+      --action-soft: #e8efff;
+      --focus: #b45309;
+      --focus-soft: #fff3d6;
+      --ok: #176b4d;
+      --radius: 10px;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    body { margin: 0; color: var(--ink); background: var(--paper); }
+    button, select, input { font: inherit; }
+    button:focus-visible, input:focus-visible {
+      outline: 3px solid rgba(36, 87, 214, .32);
+      outline-offset: 2px;
+    }
+
+    .page { width: min(1120px, calc(100% - 32px)); margin: 0 auto; padding: 40px 0 56px; }
+    header { max-width: 760px; margin-bottom: 28px; }
+    .eyebrow { margin: 0 0 8px; color: var(--action); font: 700 12px/1.2 ui-monospace, monospace; letter-spacing: .12em; text-transform: uppercase; }
+    h1 { margin: 0; font-size: clamp(32px, 6vw, 56px); line-height: 1; letter-spacing: -.035em; }
+    .objective { margin: 16px 0 0; color: var(--muted); font-size: 18px; line-height: 1.55; }
+
+    .lesson { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(280px, .75fr); gap: 20px; align-items: stretch; }
+    .stage, .explanation { background: var(--surface); border: 1px solid var(--rule); border-radius: var(--radius); }
+    .stage { min-height: 440px; padding: 24px; display: flex; flex-direction: column; }
+    .stage-head { display: flex; justify-content: space-between; gap: 16px; align-items: baseline; }
+    .stage-head h2, .explanation h2 { margin: 0; font-size: 20px; }
+    .step-count { color: var(--muted); font: 600 12px/1.4 ui-monospace, monospace; }
+
+    .model {
+      flex: 1;
+      display: grid;
+      grid-template-columns: repeat(4, minmax(92px, 1fr));
+      align-items: center;
+      gap: 24px;
+      padding: 48px 0 28px;
+      position: relative;
+    }
+    .model::before {
+      content: "";
+      position: absolute;
+      left: 8%; right: 8%; top: 50%;
+      height: 2px;
+      background: var(--rule);
+      z-index: 0;
+    }
+    .node {
+      position: relative;
+      z-index: 1;
+      min-height: 104px;
+      display: grid;
+      place-content: center;
+      gap: 7px;
+      padding: 16px 10px;
+      text-align: center;
+      background: var(--surface);
+      border: 1px solid var(--rule);
+      border-radius: 8px;
+      transition: transform 240ms ease, border-color 240ms ease, background-color 240ms ease;
+    }
+    .node strong { font-size: 15px; }
+    .node code { color: var(--muted); font: 600 12px/1.4 ui-monospace, monospace; }
+    .node[data-status="done"] { border-color: rgba(23, 107, 77, .45); }
+    .node[data-status="done"]::after { content: "done"; color: var(--ok); font: 700 10px/1 ui-monospace, monospace; text-transform: uppercase; }
+    .node[data-status="active"] { transform: translateY(-8px); border: 2px solid var(--focus); background: var(--focus-soft); }
+    .node[data-status="active"]::after { content: "active"; color: var(--focus); font: 700 10px/1 ui-monospace, monospace; text-transform: uppercase; }
+
+    .state-strip { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+    .state-value { border-top: 1px solid var(--rule); padding-top: 12px; }
+    .state-value span { display: block; color: var(--muted); font: 600 10px/1.3 ui-monospace, monospace; text-transform: uppercase; letter-spacing: .08em; }
+    .state-value output { display: block; margin-top: 4px; font: 700 15px/1.4 ui-monospace, monospace; }
+
+    .explanation { padding: 24px; display: flex; flex-direction: column; }
+    .trigger-label { margin: 28px 0 4px; color: var(--muted); font: 700 10px/1.3 ui-monospace, monospace; text-transform: uppercase; letter-spacing: .1em; }
+    #narration { margin: 0; min-height: 108px; font-size: 16px; line-height: 1.6; }
+    .rule { margin-top: auto; padding: 14px; border-left: 3px solid var(--action); background: var(--action-soft); }
+    .rule span { display: block; color: var(--action); font: 700 10px/1.3 ui-monospace, monospace; text-transform: uppercase; }
+    .rule p { margin: 5px 0 0; font-size: 14px; line-height: 1.45; }
+
+    .controls { margin-top: 20px; padding: 16px; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; background: var(--surface); border: 1px solid var(--rule); border-radius: var(--radius); }
+    .controls button { min-width: 88px; min-height: 44px; padding: 8px 14px; border: 1px solid var(--rule); border-radius: 7px; color: var(--ink); background: var(--surface); cursor: pointer; }
+    .controls button:hover:not(:disabled) { border-color: var(--action); }
+    .controls button.primary { color: #fff; background: var(--action); border-color: var(--action); }
+    .controls button:disabled { opacity: .42; cursor: not-allowed; }
+    .progress-wrap { flex: 1 1 180px; min-width: 180px; }
+    .progress-track { height: 8px; overflow: hidden; background: #e7eaf0; border-radius: 999px; }
+    .progress-bar { width: 25%; height: 100%; background: var(--action); transition: width 240ms ease; }
+    .progress-text { margin-top: 5px; color: var(--muted); font: 600 11px/1.2 ui-monospace, monospace; }
+
+    .static-summary { margin-top: 24px; padding: 20px 24px; border: 1px solid var(--rule); background: var(--surface); border-radius: var(--radius); }
+    .static-summary h2 { margin-top: 0; font-size: 18px; }
+    .static-summary ol { margin-bottom: 0; padding-left: 22px; color: var(--muted); line-height: 1.55; }
+
+    @media (max-width: 800px) {
+      .lesson { grid-template-columns: 1fr; }
+      .model { grid-template-columns: 1fr 1fr; padding-top: 28px; }
+      .model::before { display: none; }
+    }
+    @media (max-width: 480px) {
+      .page { width: min(100% - 20px, 1120px); padding-top: 24px; }
+      .stage, .explanation { padding: 18px; }
+      .model { grid-template-columns: 1fr; gap: 10px; }
+      .state-strip { grid-template-columns: 1fr; }
+      .controls button { flex: 1 1 42%; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        scroll-behavior: auto !important;
+        animation-duration: .001ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: .001ms !important;
+      }
+    }
+    @media print {
+      body { background: #fff; }
+      .page { width: 100%; padding: 0; }
+      .lesson, .controls { display: none; }
+      .static-summary { border: 0; padding: 0; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header>
+      <p class="eyebrow">Interactive lesson · guided walkthrough</p>
+      <h1>How one request moves through the system</h1>
+      <p class="objective">Objective: predict which component owns the request at each step and explain why the queue exists.</p>
+    </header>
+
+    <main>
+      <div class="lesson">
+        <section class="stage" aria-labelledby="stage-title">
+          <div class="stage-head">
+            <h2 id="stage-title">System state</h2>
+            <span class="step-count" id="step-count">Step 1 of 4</span>
+          </div>
+
+          <div class="model" role="img" aria-label="Request lifecycle from client through gateway and queue to worker">
+            <div class="node" id="client" data-status="active"><strong>Client</strong><code id="client-value">request=new</code></div>
+            <div class="node" id="gateway"><strong>Gateway</strong><code id="gateway-value">validated=false</code></div>
+            <div class="node" id="queue"><strong>Queue</strong><code id="queue-value">depth=0</code></div>
+            <div class="node" id="worker"><strong>Worker</strong><code id="worker-value">busy=false</code></div>
+          </div>
+
+          <div class="state-strip" aria-label="Current lesson state">
+            <div class="state-value"><span>Owner</span><output id="owner">Client</output></div>
+            <div class="state-value"><span>Queue depth</span><output id="depth">0</output></div>
+            <div class="state-value"><span>Request</span><output id="request-state">Created</output></div>
+          </div>
+        </section>
+
+        <section class="explanation" aria-labelledby="explanation-title">
+          <h2 id="explanation-title">Create the request</h2>
+          <p class="trigger-label" id="trigger">Trigger · user submits</p>
+          <p id="narration" aria-live="polite">The client owns a new request. Nothing else may process it until the gateway validates its shape and authorization.</p>
+          <div class="rule">
+            <span>Invariant</span>
+            <p id="invariant">Only a validated request may enter the queue.</p>
+          </div>
+        </section>
+      </div>
+
+      <nav class="controls" aria-label="Lesson controls">
+        <button type="button" id="back">Back</button>
+        <button type="button" class="primary" id="play" aria-pressed="false">Play</button>
+        <button type="button" id="next">Next</button>
+        <button type="button" id="reset">Reset</button>
+        <div class="progress-wrap">
+          <div class="progress-track" role="progressbar" aria-label="Lesson progress" aria-valuemin="1" aria-valuemax="4" aria-valuenow="1" id="progress">
+            <div class="progress-bar" id="progress-bar"></div>
+          </div>
+          <div class="progress-text" id="progress-text">25% complete</div>
+        </div>
+      </nav>
+
+      <section class="static-summary" aria-labelledby="summary-title">
+        <h2 id="summary-title">Complete sequence</h2>
+        <ol>
+          <li>The client creates the request.</li>
+          <li>The gateway validates shape and authorization.</li>
+          <li>The queue accepts the validated request and absorbs timing differences.</li>
+          <li>A worker claims the request and completes it exactly once.</li>
+        </ol>
+        <p class="print-invariant"><strong>Invariant:</strong> Only a validated request may enter the queue.</p>
+      </section>
+
+      <noscript>
+        <section class="static-summary">
+          <h2>JavaScript-free explanation</h2>
+          <p>A request moves from client to gateway, then enters the queue only after validation. A worker claims it from the queue and owns processing. The queue separates request arrival speed from worker capacity.</p>
+        </section>
+      </noscript>
+    </main>
+  </div>
+
+  <script>
+    "use strict";
+
+    const lesson = Object.freeze({
+      invariant: "Only a validated request may enter the queue.",
+      steps: Object.freeze([
+        Object.freeze({
+          title: "Create the request",
+          trigger: "Trigger · user submits",
+          narration: "The client owns a new request. Nothing else may process it until the gateway validates its shape and authorization.",
+          focus: "client", owner: "Client", depth: "0", request: "Created",
+          nodes: Object.freeze(["request=new", "validated=false", "depth=0", "busy=false"])
+        }),
+        Object.freeze({
+          title: "Validate at the boundary",
+          trigger: "Trigger · gateway receives",
+          narration: "The gateway checks the public contract and authorization. A rejected request stops here; a valid request may cross into the durable work path.",
+          focus: "gateway", owner: "Gateway", depth: "0", request: "Validated",
+          nodes: Object.freeze(["request=sent", "validated=true", "depth=0", "busy=false"])
+        }),
+        Object.freeze({
+          title: "Buffer durable work",
+          trigger: "Trigger · validation passes",
+          narration: "The queue accepts the request. It absorbs the timing difference between incoming traffic and available workers without changing request ownership invisibly.",
+          focus: "queue", owner: "Queue", depth: "1", request: "Waiting",
+          nodes: Object.freeze(["request=sent", "validated=true", "depth=1", "busy=false"])
+        }),
+        Object.freeze({
+          title: "Claim and process",
+          trigger: "Trigger · worker has capacity",
+          narration: "One worker claims the request, reducing queue depth. The claim makes processing ownership explicit so two workers do not complete the same unit of work.",
+          focus: "worker", owner: "Worker", depth: "0", request: "Processing",
+          nodes: Object.freeze(["request=sent", "validated=true", "depth=0", "busy=true"])
+        })
+      ])
+    });
+
+    const ui = { step: 0, playing: false, timer: null };
+    const nodes = ["client", "gateway", "queue", "worker"].map((id) => document.getElementById(id));
+    const reduced = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const elements = {
+      title: document.getElementById("explanation-title"),
+      trigger: document.getElementById("trigger"),
+      narration: document.getElementById("narration"),
+      invariant: document.getElementById("invariant"),
+      owner: document.getElementById("owner"),
+      depth: document.getElementById("depth"),
+      request: document.getElementById("request-state"),
+      count: document.getElementById("step-count"),
+      progress: document.getElementById("progress"),
+      progressBar: document.getElementById("progress-bar"),
+      progressText: document.getElementById("progress-text"),
+      back: document.getElementById("back"),
+      next: document.getElementById("next"),
+      play: document.getElementById("play"),
+      reset: document.getElementById("reset")
+    };
+
+    function pause() {
+      if (ui.timer !== null) window.clearTimeout(ui.timer);
+      ui.timer = null;
+      ui.playing = false;
+      elements.play.textContent = "Play";
+      elements.play.setAttribute("aria-pressed", "false");
+    }
+
+    function render() {
+      const step = lesson.steps[ui.step];
+      const percent = Math.round(((ui.step + 1) / lesson.steps.length) * 100);
+      elements.title.textContent = step.title;
+      elements.trigger.textContent = step.trigger;
+      elements.narration.textContent = step.narration;
+      elements.invariant.textContent = lesson.invariant;
+      elements.owner.textContent = step.owner;
+      elements.depth.textContent = step.depth;
+      elements.request.textContent = step.request;
+      elements.count.textContent = `Step ${ui.step + 1} of ${lesson.steps.length}`;
+      elements.progress.setAttribute("aria-valuenow", String(ui.step + 1));
+      elements.progressBar.style.width = `${percent}%`;
+      elements.progressText.textContent = `${percent}% complete`;
+      elements.back.disabled = ui.step === 0;
+      elements.next.disabled = ui.step === lesson.steps.length - 1;
+      nodes.forEach((node, index) => {
+        node.dataset.status = node.id === step.focus ? "active" : index < ui.step ? "done" : "idle";
+        node.querySelector("code").textContent = step.nodes[index];
+      });
+    }
+
+    function go(nextStep) {
+      ui.step = Math.max(0, Math.min(lesson.steps.length - 1, nextStep));
+      if (ui.step === lesson.steps.length - 1) pause();
+      render();
+    }
+
+    function schedule() {
+      if (!ui.playing || reduced.matches) return;
+      if (ui.step >= lesson.steps.length - 1) {
+        pause();
+        return;
+      }
+      ui.timer = window.setTimeout(() => {
+        ui.step += 1;
+        render();
+        schedule();
+      }, 1800);
+    }
+
+    function togglePlay() {
+      if (reduced.matches) return;
+      if (ui.playing) {
+        pause();
+        return;
+      }
+      if (ui.step === lesson.steps.length - 1) ui.step = 0;
+      ui.playing = true;
+      elements.play.textContent = "Pause";
+      elements.play.setAttribute("aria-pressed", "true");
+      render();
+      schedule();
+    }
+
+    elements.back.addEventListener("click", () => { pause(); go(ui.step - 1); });
+    elements.next.addEventListener("click", () => { pause(); go(ui.step + 1); });
+    elements.reset.addEventListener("click", () => { pause(); go(0); });
+    elements.play.addEventListener("click", togglePlay);
+
+    document.addEventListener("keydown", (event) => {
+      const tag = event.target instanceof Element ? event.target.tagName : "";
+      if (["INPUT", "SELECT", "TEXTAREA", "BUTTON"].includes(tag)) return;
+      if (event.key === "ArrowLeft") { pause(); go(ui.step - 1); }
+      if (event.key === "ArrowRight") { pause(); go(ui.step + 1); }
+      if (event.key === "Home") { pause(); go(0); }
+      if (event.key === "End") { pause(); go(lesson.steps.length - 1); }
+      if (event.key === " ") { event.preventDefault(); togglePlay(); }
+    });
+
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") pause();
+    });
+    reduced.addEventListener("change", () => {
+      if (reduced.matches) pause();
+      elements.play.disabled = reduced.matches;
+      elements.play.title = reduced.matches ? "Continuous playback is disabled by reduced-motion preferences" : "";
+    });
+
+    elements.play.disabled = reduced.matches;
+    render();
+  </script>
+</body>
+</html>
