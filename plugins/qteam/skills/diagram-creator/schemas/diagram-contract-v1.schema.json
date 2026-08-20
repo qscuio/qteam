@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qteam.local/schemas/diagram-contract-v1.schema.json",
+  "title": "QTeam Diagram Contract v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "diagram_type",
+    "semantic_profile",
+    "composition_profile",
+    "title",
+    "elements",
+    "relationships"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "diagram_type": {
+      "enum": [
+        "architecture", "data-flow", "er", "tree", "org-chart", "process",
+        "swimlane", "nested",
+        "layers", "high-level", "it-state", "medallion", "dp-integration",
+        "uml-class", "uml-component", "uml-deployment"
+      ]
+    },
+    "semantic_profile": {
+      "enum": [
+        "generic", "architecture", "data-flow", "er", "uml-class",
+        "uml-component", "uml-deployment"
+      ]
+    },
+    "composition_profile": {"enum": ["standard", "showcase"]},
+    "title": {"type": "string", "minLength": 1, "maxLength": 160, "pattern": "^\\S+(?: \\S+)*$"},
+    "elements": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "required": ["id", "label", "kind"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"},
+          "label": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^\\S+(?: \\S+)*$"},
+          "kind": {"type": "string", "minLength": 1, "maxLength": 48, "pattern": "^[a-z][a-z0-9-]*$"},
+          "parent": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"},
+          "stereotype": {"type": "string", "minLength": 1, "maxLength": 48, "pattern": "^[a-z][a-z0-9-]*$"}
+        },
+        "additionalProperties": false
+      }
+    },
+    "relationships": {
+      "type": "array",
+      "maxItems": 128,
+      "items": {
+        "type": "object",
+        "required": ["id", "source", "target", "label", "kind"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"},
+          "source": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"},
+          "target": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"},
+          "label": {"type": "string", "maxLength": 128, "pattern": "^(?:\\S+(?: \\S+)*)?$"},
+          "kind": {"type": "string", "minLength": 1, "maxLength": 48, "pattern": "^[a-z][a-z0-9-]*$"}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"semantic_profile": {"const": "generic"}}},
+      "then": {
+        "properties": {
+          "diagram_type": {"enum": ["tree", "org-chart", "nested", "layers"]},
+          "elements": {"items": {"properties": {"kind": {"enum": ["element", "group"]}}}},
+          "relationships": {"items": {"properties": {"kind": {"const": "relationship"}}}}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"semantic_profile": {"const": "architecture"}}},
+      "then": {
+        "properties": {
+          "diagram_type": {"enum": ["architecture", "high-level", "it-state", "medallion", "dp-integration"]},
+          "elements": {"items": {"properties": {"kind": {"enum": ["actor", "service", "component", "store", "external", "queue", "boundary"]}}}},
+          "relationships": {"items": {"properties": {"kind": {"enum": ["request", "response", "render", "read", "write", "query", "event", "dependency", "deployment", "blocked"]}}}}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"semantic_profile": {"const": "data-flow"}}},
+      "then": {
+        "properties": {
+          "diagram_type": {"enum": ["data-flow", "process", "swimlane"]},
+          "elements": {"items": {"properties": {"kind": {"enum": ["source", "process", "store", "sink", "queue", "actor"]}}}},
+          "relationships": {"items": {"properties": {"kind": {"enum": ["data", "event", "control", "feedback"]}}}}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"semantic_profile": {"const": "er"}}},
+      "then": {
+        "properties": {
+          "diagram_type": {"const": "er"},
+          "elements": {"items": {"properties": {"kind": {"enum": ["entity", "associative-entity"]}}}},
+          "relationships": {"items": {"properties": {"kind": {"enum": ["association", "identifying"]}}}}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"semantic_profile": {"const": "uml-class"}}},
+      "then": {
+        "properties": {
+          "diagram_type": {"const": "uml-class"},
+          "elements": {"items": {"properties": {"kind": {"enum": ["class", "interface", "abstract-class", "enumeration"]}}}},
+          "relationships": {"items": {"properties": {"kind": {"enum": ["association", "dependency", "generalization", "realization", "aggregation", "composition"]}}}}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"semantic_profile": {"const": "uml-component"}}},
+      "then": {
+        "properties": {
+          "diagram_type": {"const": "uml-component"},
+          "elements": {"items": {"properties": {"kind": {"enum": ["component", "interface", "provided-interface", "required-interface", "port", "artifact", "subsystem"]}}}},
+          "relationships": {"items": {"properties": {"kind": {"enum": ["dependency", "realization", "assembly", "delegation"]}}}}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"semantic_profile": {"const": "uml-deployment"}}},
+      "then": {
+        "properties": {
+          "diagram_type": {"const": "uml-deployment"},
+          "elements": {"items": {"properties": {"kind": {"enum": ["device", "execution-environment", "artifact", "component"]}}}},
+          "relationships": {"items": {"properties": {"kind": {"enum": ["communication", "deployment", "dependency"]}}}}
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

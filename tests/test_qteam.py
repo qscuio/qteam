@@ -6968,19 +6968,23 @@ class PluginTests(RepoCase):
             manifest["version"].split("+", 1)[0],
             (PLUGIN / "VERSION").read_text(encoding="utf-8").strip(),
         )
-        self.assertRegex(manifest["version"], r"^0\.15\.0\+codex\.[0-9]+$")
+        self.assertRegex(manifest["version"], r"^0\.16\.0\+codex\.[0-9]+$")
 
         claude = json.loads((PLUGIN / ".claude-plugin/plugin.json").read_text())
         cursor = json.loads((PLUGIN / ".cursor-plugin/plugin.json").read_text())
         claude_marketplace = json.loads(
             (SOURCE / ".claude-plugin/marketplace.json").read_text()
         )
-        self.assertEqual(claude["version"], "0.15.0")
-        self.assertEqual(cursor["version"], "0.15.0")
+        self.assertEqual(claude["version"], "0.16.0")
+        self.assertEqual(cursor["version"], "0.16.0")
         self.assertEqual(cursor["skills"], "./skills/")
-        self.assertEqual(claude_marketplace["plugins"][0]["version"], "0.15.0")
+        self.assertEqual(claude_marketplace["plugins"][0]["version"], "0.16.0")
         self.assertEqual(
             claude_marketplace["plugins"][0]["source"], "./plugins/qteam"
+        )
+        self.assertIn(
+            'server_version = "QTeamWeb/0.16"',
+            (PLUGIN / "bin/agent-team-web.py").read_text(encoding="utf-8"),
         )
 
     def fake_codex_env(self):
@@ -7779,7 +7783,7 @@ class PluginTests(RepoCase):
         for license_path in license_paths:
             self.assertTrue((self.repo / license_path).is_file())
         current = json.loads(manifest_path.read_text(encoding="utf-8"))
-        self.assertEqual(current["version"], "0.15.0")
+        self.assertEqual(current["version"], "0.16.0")
 
     def test_uninstall_conflict_makes_no_plugin_or_marketplace_mutation(self):
         env, state, log = self.fake_codex_env()
@@ -8110,6 +8114,631 @@ class IsometricSkillTests(unittest.TestCase):
 
 
 class VisualAndHandoffSkillTests(unittest.TestCase):
+    def contract_backed_diagram(self, contract=None, projection=None):
+        if contract is None:
+            contract = {
+                "schema_version": 1,
+                "diagram_type": "architecture",
+                "semantic_profile": "architecture",
+                "composition_profile": "showcase",
+                "title": "Request path",
+                "elements": [
+                    {"id": "client", "label": "Client", "kind": "actor"},
+                    {"id": "api", "label": "API", "kind": "service"},
+                ],
+                "relationships": [
+                    {"id": "request", "source": "client", "target": "api",
+                     "label": "HTTPS", "kind": "request"},
+                ],
+            }
+        if projection is None:
+            projection = """
+              <rect data-diagram-element="client" data-diagram-bounds="20,40,120,64"
+                    x="20" y="40" width="120" height="64"/>
+              <text data-diagram-element-label="client" x="80" y="76"
+                    font-size="12" fill="#000" text-anchor="middle">Client</text>
+              <path data-diagram-relationship="request"
+                    data-diagram-route="140,72 220,72" d="M140 72 H220"
+                    stroke="#000" stroke-width="1"/>
+              <text data-diagram-relationship-label="request" x="180" y="64"
+                    font-size="10" fill="#000" text-anchor="middle">HTTPS</text>
+              <rect data-diagram-element="api" data-diagram-bounds="220,40,120,64"
+                    x="220" y="40" width="120" height="64"/>
+              <text data-diagram-element-label="api" x="280" y="76"
+                    font-size="12" fill="#000" text-anchor="middle">API</text>
+            """
+        encoded = json.dumps(contract, sort_keys=True).replace("<", "\\u003c")
+        title = contract["title"]
+        return f"""<!doctype html><html><head><title>{title}</title></head>
+        <body><script type="application/json" data-diagram-contract>{encoded}</script>
+        <svg viewBox="0 0 360 144" role="img" aria-labelledby="request-title request-desc">
+          <title id="request-title">{title}</title>
+          <desc id="request-desc">Client sends an HTTPS request to the API.</desc>
+          {projection}
+        </svg></body></html>"""
+
+    def test_diagram_contract_binds_semantics_and_composition(self):
+        skill = PLUGIN / "skills/diagram-creator"
+        tool = skill / "scripts/diagram_contract.py"
+        self.assertTrue((skill / "BOUNDARIES.md").is_file())
+        self.assertTrue((skill / "schemas/diagram-contract-v1.schema.json").is_file())
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            valid = tmp / "valid.html"
+            valid.write_text(self.contract_backed_diagram(), encoding="utf-8")
+            checked = subprocess.run(
+                [sys.executable, str(tool), "check", str(valid)], text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(checked.returncode, 0,
+                             checked.stdout + checked.stderr)
+            report = json.loads(checked.stdout)
+            self.assertTrue(report["ok"])
+            self.assertEqual(report["contract"]["schema_version"], 1)
+            self.assertEqual(report["composition"]["profile"], "showcase")
+            self.assertEqual(report["composition"]["score"], 100)
+            self.assertEqual(report["binding"]["elements"], 2)
+
+            harmless_css = tmp / "harmless-css.html"
+            harmless_css.write_text(valid.read_text(encoding="utf-8").replace(
+                "</head>",
+                "<style>.decorative rect{fill:none}</style></head>",
+            ), encoding="utf-8")
+            harmless = subprocess.run(
+                [sys.executable, str(tool), "check", str(harmless_css)], text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(harmless.returncode, 0,
+                             harmless.stdout + harmless.stderr)
+
+            original = valid.read_text(encoding="utf-8")
+            aliased = subprocess.run(
+                [sys.executable, str(tool), "check", str(valid),
+                 "--report", str(valid)], text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(aliased.returncode, 0)
+            self.assertIn("must not replace", aliased.stderr)
+            self.assertEqual(valid.read_text(encoding="utf-8"), original)
+
+            model = tmp / "model.json"
+            contract = json.loads(re.search(
+                r"data-diagram-contract>(.*?)</script>",
+                valid.read_text(encoding="utf-8"), re.DOTALL,
+            ).group(1))
+            model.write_text(json.dumps(contract), encoding="utf-8")
+            validated = subprocess.run(
+                [sys.executable, str(tool), "validate", str(model)], text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(validated.returncode, 0,
+                             validated.stdout + validated.stderr)
+            self.assertEqual(json.loads(validated.stdout)["elements"], 2)
+
+            inspected = subprocess.run(
+                [sys.executable, str(tool), "inspect", str(valid)], text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(inspected.returncode, 0,
+                             inspected.stdout + inspected.stderr)
+            inspected_data = json.loads(inspected.stdout)
+            self.assertEqual(inspected_data["title"], "Request path")
+            self.assertEqual(inspected_data["model"]["elements"][0]["id"],
+                             "client")
+
+            stereotyped_contract = {
+                "schema_version": 1,
+                "diagram_type": "uml-component",
+                "semantic_profile": "uml-component",
+                "composition_profile": "showcase",
+                "title": "Storage component",
+                "elements": [
+                    {"id": "orders", "label": "Orders", "kind": "component",
+                     "stereotype": "database"},
+                ],
+                "relationships": [],
+            }
+            stereotyped_projection = """
+              <rect data-diagram-element="orders" data-diagram-bounds="20,40,120,64"
+                    x="20" y="40" width="120" height="64"/>
+              <text data-diagram-element-stereotype="orders" x="80" y="56"
+                    font-size="8" fill="#000" text-anchor="middle">«database»</text>
+              <text data-diagram-element-label="orders" x="80" y="80"
+                    font-size="12" fill="#000" text-anchor="middle">Orders</text>
+            """
+            stereotyped = tmp / "stereotyped.html"
+            stereotyped.write_text(self.contract_backed_diagram(
+                stereotyped_contract, stereotyped_projection), encoding="utf-8")
+            checked = subprocess.run(
+                [sys.executable, str(tool), "check", str(stereotyped)], text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(checked.returncode, 0,
+                             checked.stdout + checked.stderr)
+            inspected = subprocess.run(
+                [sys.executable, str(tool), "inspect", str(stereotyped)], text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(inspected.returncode, 0,
+                             inspected.stdout + inspected.stderr)
+            self.assertEqual(
+                json.loads(inspected.stdout)["model"]["elements"][0]["stereotype"],
+                "database",
+            )
+
+            missing_stereotype = tmp / "missing-stereotype.html"
+            missing_stereotype.write_text(self.contract_backed_diagram(
+                stereotyped_contract,
+                stereotyped_projection.replace(
+                    '<text data-diagram-element-stereotype="orders" x="80" y="56"\n'
+                    '                    font-size="8" fill="#000" text-anchor="middle">«database»</text>',
+                    "",
+                )), encoding="utf-8")
+            rejected = subprocess.run(
+                [sys.executable, str(tool), "check", str(missing_stereotype)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("element-stereotype IDs", rejected.stderr)
+
+    def test_diagram_contract_fails_closed_on_semantic_and_visual_drift(self):
+        skill = PLUGIN / "skills/diagram-creator"
+        tool = skill / "scripts/diagram_contract.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cases = {}
+            dangling = json.loads(re.search(
+                r"data-diagram-contract>(.*?)</script>",
+                self.contract_backed_diagram(), re.DOTALL,
+            ).group(1))
+            dangling["relationships"][0]["target"] = "missing"
+            cases["dangling"] = self.contract_backed_diagram(dangling)
+            cases["missing-projection"] = self.contract_backed_diagram(
+                projection="""
+                  <rect data-diagram-element="client" data-diagram-bounds="20,40,120,64"
+                        x="20" y="40" width="120" height="64"/>
+                  <text data-diagram-element-label="client">Client</text>
+                """
+            )
+            cases["overlap"] = self.contract_backed_diagram(
+                projection="""
+                  <rect data-diagram-element="client" data-diagram-bounds="20,40,120,64" x="20" y="40" width="120" height="64"/>
+                  <text data-diagram-element-label="client">Client</text>
+                  <path data-diagram-relationship="request" data-diagram-route="140,72 100,72" d="M140 72 H100" stroke="#000" stroke-width="1"/>
+                  <text data-diagram-relationship-label="request">HTTPS</text>
+                  <rect data-diagram-element="api" data-diagram-bounds="100,40,120,64" x="100" y="40" width="120" height="64"/>
+                  <text data-diagram-element-label="api">API</text>
+                """
+            )
+            cases["diagonal"] = self.contract_backed_diagram(
+                projection="""
+                  <rect data-diagram-element="client" data-diagram-bounds="20,40,120,64" x="20" y="40" width="120" height="64"/>
+                  <text data-diagram-element-label="client">Client</text>
+                  <path data-diagram-relationship="request" data-diagram-route="140,72 220,80" d="M140 72 L220 80"/>
+                  <text data-diagram-relationship-label="request">HTTPS</text>
+                  <rect data-diagram-element="api" data-diagram-bounds="220,48,120,64" x="220" y="48" width="120" height="64"/>
+                  <text data-diagram-element-label="api">API</text>
+                """
+            )
+            cases["bounds-tamper"] = self.contract_backed_diagram(
+                projection="""
+                  <rect data-diagram-element="client" data-diagram-bounds="20,40,120,64" x="24" y="40" width="120" height="64"/>
+                  <text data-diagram-element-label="client">Client</text>
+                  <path data-diagram-relationship="request" data-diagram-route="140,72 220,72" d="M140 72 H220"/>
+                  <text data-diagram-relationship-label="request">HTTPS</text>
+                  <rect data-diagram-element="api" data-diagram-bounds="220,40,120,64" x="220" y="40" width="120" height="64"/>
+                  <text data-diagram-element-label="api">API</text>
+                """
+            )
+            cases["route-tamper"] = self.contract_backed_diagram(
+                projection="""
+                  <rect data-diagram-element="client" data-diagram-bounds="20,40,120,64" x="20" y="40" width="120" height="64"/>
+                  <text data-diagram-element-label="client">Client</text>
+                  <path data-diagram-relationship="request" data-diagram-route="140,72 220,72" d="M140 72 V120 H220 V72"/>
+                  <text data-diagram-relationship-label="request">HTTPS</text>
+                  <rect data-diagram-element="api" data-diagram-bounds="220,40,120,64" x="220" y="40" width="120" height="64"/>
+                  <text data-diagram-element-label="api">API</text>
+                """
+            )
+            cases["hidden-projection"] = self.contract_backed_diagram(
+                projection="""
+                  <g style="display:none">
+                    <rect data-diagram-element="client" data-diagram-bounds="20,40,120,64" x="20" y="40" width="120" height="64"/>
+                  </g>
+                  <text data-diagram-element-label="client">Client</text>
+                  <path data-diagram-relationship="request" data-diagram-route="140,72 220,72" d="M140 72 H220"/>
+                  <text data-diagram-relationship-label="request">HTTPS</text>
+                  <rect data-diagram-element="api" data-diagram-bounds="220,40,120,64" x="220" y="40" width="120" height="64"/>
+                  <text data-diagram-element-label="api">API</text>
+                """
+            )
+            cases["transformed-projection"] = self.contract_backed_diagram(
+                projection="""
+                  <g transform="translate(20 0)">
+                    <rect data-diagram-element="client" data-diagram-bounds="20,40,120,64" x="20" y="40" width="120" height="64"/>
+                    <text data-diagram-element-label="client">Client</text>
+                  </g>
+                  <path data-diagram-relationship="request" data-diagram-route="140,72 220,72" d="M140 72 H220"/>
+                  <text data-diagram-relationship-label="request">HTTPS</text>
+                  <rect data-diagram-element="api" data-diagram-bounds="220,40,120,64" x="220" y="40" width="120" height="64"/>
+                  <text data-diagram-element-label="api">API</text>
+                """
+            )
+            outside_projection = """
+              <rect data-diagram-element="client" data-diagram-bounds="20,40,120,64" x="20" y="40" width="120" height="64"/>
+              <text data-diagram-element-label="client">Client</text>
+              <path data-diagram-relationship="request" data-diagram-route="140,72 220,72" d="M140 72 H220" stroke="#000" stroke-width="1"/>
+              <text data-diagram-relationship-label="request">HTTPS</text>
+              <rect data-diagram-element="api" data-diagram-bounds="220,40,120,64" x="220" y="40" width="120" height="64"/>
+              <text data-diagram-element-label="api">API</text>
+            """
+            cases["outside-svg"] = self.contract_backed_diagram(
+                projection=""
+            ).replace("</body>", outside_projection + "</body>")
+            cases["definition-container"] = self.contract_backed_diagram(
+                projection="<defs>" + outside_projection + "</defs>"
+            )
+            cases["marker-definition-container"] = self.contract_backed_diagram(
+                projection="<marker>" + outside_projection + "</marker>"
+            )
+            cases["filter-definition-container"] = self.contract_backed_diagram(
+                projection="<filter>" + outside_projection + "</filter>"
+            )
+            cases["transparent-projection"] = self.contract_backed_diagram(
+                projection=outside_projection.replace(
+                    'data-diagram-element="client"',
+                    'data-diagram-element="client" opacity="0"', 1,
+                )
+            )
+            cases["endpoint-interior"] = self.contract_backed_diagram(
+                projection=outside_projection.replace(
+                    'data-diagram-route="140,72 220,72" d="M140 72 H220"',
+                    'data-diagram-route="20,72 220,72" d="M20 72 H220"',
+                )
+            )
+            cases["malformed-line"] = self.contract_backed_diagram(
+                projection=outside_projection.replace(
+                    '<path data-diagram-relationship="request" data-diagram-route="140,72 220,72" d="M140 72 H220" stroke="#000" stroke-width="1"/>',
+                    '<line data-diagram-relationship="request" data-diagram-route="140,72 220,72" y1="72" x2="220" y2="72" stroke="#000" stroke-width="1"/>',
+                )
+            )
+            cases["css-hidden"] = self.contract_backed_diagram().replace(
+                "</head>",
+                "<style>[data-diagram-element]{display:none}</style></head>",
+            )
+            cases["unpainted-element"] = self.contract_backed_diagram().replace(
+                'data-diagram-element="client" data-diagram-bounds=',
+                'data-diagram-element="client" fill="none" stroke="none" data-diagram-bounds=',
+                1,
+            )
+            cases["unpainted-relationship"] = self.contract_backed_diagram().replace(
+                'stroke="#000" stroke-width="1"',
+                'stroke="none" stroke-width="1"', 1,
+            )
+            cases["inline-style-hides-relationship"] = self.contract_backed_diagram().replace(
+                'stroke="#000" stroke-width="1"',
+                'stroke="#000" stroke-width="1" style="stroke:none"', 1,
+            )
+            cases["inline-computed-display"] = self.contract_backed_diagram().replace(
+                'data-diagram-element="client"',
+                'data-diagram-element="client" style="--hidden:none;display:var(--hidden)"',
+                1,
+            )
+            cases["inline-computed-opacity"] = self.contract_backed_diagram().replace(
+                'data-diagram-element="client"',
+                'data-diagram-element="client" style="opacity:calc(0)"', 1,
+            )
+            cases["inline-comment-whitespace"] = self.contract_backed_diagram().replace(
+                'data-diagram-element="client"',
+                'data-diagram-element="client" style="display:/**/none"', 1,
+            )
+            cases["inline-computed-fill"] = self.contract_backed_diagram().replace(
+                'data-diagram-element="client"',
+                'data-diagram-element="client" style="--hidden:none;fill:var(--hidden)"',
+                1,
+            )
+            cases["inline-computed-stroke"] = self.contract_backed_diagram().replace(
+                'stroke="#000" stroke-width="1"',
+                'stroke="#000" stroke-width="1" style="--hidden:none;stroke:var(--hidden)"',
+                1,
+            )
+            cases["inline-hidden-ancestor"] = self.contract_backed_diagram().replace(
+                '<svg viewBox=',
+                '<div style="--hidden:none;display:var(--hidden)"><svg viewBox=', 1,
+            ).replace('</svg>', '</svg></div>', 1)
+            cases["inline-hidden-span-ancestor"] = self.contract_backed_diagram().replace(
+                '<svg viewBox=', '<span style="display:none"><svg viewBox=', 1,
+            ).replace('</svg>', '</svg></span>', 1)
+            cases["hidden-span-ancestor"] = self.contract_backed_diagram().replace(
+                '<svg viewBox=', '<span hidden><svg viewBox=', 1,
+            ).replace('</svg>', '</svg></span>', 1)
+            cases["closed-details-ancestor"] = self.contract_backed_diagram().replace(
+                '<svg viewBox=', '<details><svg viewBox=', 1,
+            ).replace('</svg>', '</svg></details>', 1)
+            cases["closed-dialog-ancestor"] = self.contract_backed_diagram().replace(
+                '<svg viewBox=', '<dialog><svg viewBox=', 1,
+            ).replace('</svg>', '</svg></dialog>', 1)
+            cases["popover-ancestor"] = self.contract_backed_diagram().replace(
+                '<svg viewBox=', '<div popover><svg viewBox=', 1,
+            ).replace('</svg>', '</svg></div>', 1)
+            cases["stylesheet-transforms-element"] = self.contract_backed_diagram().replace(
+                "</head>",
+                "<style>[data-diagram-element]{transform:translateX(40px)}</style></head>",
+            )
+            cases["stylesheet-targets-element-value"] = self.contract_backed_diagram().replace(
+                "</head>",
+                '<style>[data-diagram-element="client"]{transform:translateX(40px)}</style></head>',
+            )
+            classed_projection = self.contract_backed_diagram().replace(
+                'data-diagram-element="client"',
+                'data-diagram-element="client" class="contract-node" id="client-shape"',
+                1,
+            )
+            cases["stylesheet-class-prefix"] = classed_projection.replace(
+                "</head>",
+                '<style>[class^="contract"]{transform:translateX(40px)}</style></head>',
+            )
+            cases["stylesheet-class-substring"] = classed_projection.replace(
+                "</head>",
+                '<style>[class*="node"]{display:none}</style></head>',
+            )
+            cases["stylesheet-id-value"] = classed_projection.replace(
+                "</head>",
+                '<style>[id="client-shape"]{transform:translateX(40px)}</style></head>',
+            )
+            cases["stylesheet-computed-display"] = self.contract_backed_diagram().replace(
+                "</head>",
+                '<style>[data-diagram-element="client"]{--hidden:none;display:var(--hidden)}</style></head>',
+            )
+            cases["stylesheet-computed-opacity"] = self.contract_backed_diagram().replace(
+                "</head>",
+                '<style>[data-diagram-element="client"]{opacity:calc(0)}</style></head>',
+            )
+            cases["stylesheet-comment-whitespace"] = self.contract_backed_diagram().replace(
+                "</head>",
+                '<style>[data-diagram-element="client"]{display:/**/none}</style></head>',
+            )
+            cases["stylesheet-geometry-x"] = self.contract_backed_diagram().replace(
+                "</head>",
+                '<style>[data-diagram-element="client"]{x:500px}</style></head>',
+            )
+            cases["stylesheet-zero-stroke"] = self.contract_backed_diagram().replace(
+                "</head>",
+                '<style>[data-diagram-relationship="request"]{stroke-width:0}</style></head>',
+            )
+            cases["stylesheet-zero-font"] = self.contract_backed_diagram().replace(
+                "</head>",
+                '<style>[data-diagram-element-label="client"]{font-size:0}</style></head>',
+            )
+            cases["stylesheet-mask"] = self.contract_backed_diagram().replace(
+                "</head>",
+                '<style>[data-diagram-element="client"]{mask:url(#empty)}</style></head>',
+            )
+            cases["stylesheet-animation"] = self.contract_backed_diagram().replace(
+                "</head>",
+                '<style>[data-diagram-element="client"]{animation-name:hide;animation-duration:1ms}</style></head>',
+            )
+            cases["stylesheet-hidden-span-ancestor"] = self.contract_backed_diagram().replace(
+                "</head>", '<style>span{display:none}</style></head>',
+            ).replace(
+                '<svg viewBox=', '<span><svg viewBox=', 1,
+            ).replace('</svg>', '</svg></span>', 1)
+            cases["stylesheet-collapsed-svg"] = self.contract_backed_diagram().replace(
+                "</head>", '<style>svg{width:calc(0px)}</style></head>',
+            )
+            cases["non-text-element-label"] = self.contract_backed_diagram().replace(
+                '<text data-diagram-element-label="client" x="80" y="76"\n                    font-size="12" fill="#000" text-anchor="middle">Client</text>',
+                '<g data-diagram-element-label="client">Client</g>', 1,
+            )
+            cases["smil-animates-geometry"] = self.contract_backed_diagram().replace(
+                'x="20" y="40" width="120" height="64"/>',
+                'x="20" y="40" width="120" height="64"><animate attributeName="x" from="20" to="500" dur="1ms" fill="freeze"/></rect>',
+                1,
+            )
+            cases["smil-hides-projection"] = self.contract_backed_diagram().replace(
+                'x="20" y="40" width="120" height="64"/>',
+                'x="20" y="40" width="120" height="64"><set attributeName="display" to="none" begin="0s"/></rect>',
+                1,
+            )
+            cases["clipped-viewbox"] = self.contract_backed_diagram().replace(
+                'viewBox="0 0 360 144"', 'viewBox="0 0 1 1"', 1,
+            )
+            cases["zero-svg-width"] = self.contract_backed_diagram().replace(
+                '<svg viewBox=', '<svg width="0" viewBox=', 1,
+            )
+            cases["zero-svg-height"] = self.contract_backed_diagram().replace(
+                '<svg viewBox=', '<svg height="0" viewBox=', 1,
+            )
+            cases["offscreen-element-label"] = self.contract_backed_diagram().replace(
+                'data-diagram-element-label="client" x="80" y="76"',
+                'data-diagram-element-label="client" x="999999" y="999999"', 1,
+            )
+            cases["switch-skips-projection"] = self.contract_backed_diagram(
+                projection="<switch>" + outside_projection + "</switch>"
+            )
+            cases["zero-label-font"] = self.contract_backed_diagram().replace(
+                'data-diagram-element-label="client" x="80" y="76"\n                    font-size="12"',
+                'data-diagram-element-label="client" x="80" y="76"\n                    font-size="0"', 1,
+            )
+            cases["zero-label-text-length"] = self.contract_backed_diagram().replace(
+                'data-diagram-element-label="client" x="80" y="76"',
+                'data-diagram-element-label="client" textLength="0" lengthAdjust="spacingAndGlyphs" x="80" y="76"', 1,
+            )
+            cases["start-anchor-clipped"] = self.contract_backed_diagram().replace(
+                'data-diagram-element-label="client" x="80" y="76"',
+                'data-diagram-element-label="client" x="360" y="72"', 1,
+            ).replace('text-anchor="middle">Client', 'text-anchor="start">Client', 1)
+            cases["end-anchor-clipped"] = self.contract_backed_diagram().replace(
+                'data-diagram-element-label="client" x="80" y="76"',
+                'data-diagram-element-label="client" x="0" y="72"', 1,
+            ).replace('text-anchor="middle">Client', 'text-anchor="end">Client', 1)
+            cases["nested-semantic-svg"] = self.contract_backed_diagram().replace(
+                '<svg viewBox=',
+                '<svg viewBox="0 0 360 144"><svg x="999999" y="999999" viewBox=', 1,
+            ).replace('</svg>', '</svg></svg>', 1)
+            cases["inherited-root-fill"] = self.contract_backed_diagram().replace(
+                '<svg viewBox=', '<svg fill="none" viewBox=', 1,
+            )
+            cases["inherited-root-fill-opacity"] = self.contract_backed_diagram().replace(
+                '<svg viewBox=', '<svg fill-opacity="0" viewBox=', 1,
+            )
+            cases["inherited-root-font-size"] = self.contract_backed_diagram().replace(
+                '<svg viewBox=', '<svg font-size="0" viewBox=', 1,
+            )
+            cases["title-drift"] = self.contract_backed_diagram().replace(
+                "<title>Request path</title>", "<title>Wrong title</title>", 1,
+            ).replace(
+                '<title id="request-title">Request path</title>',
+                '<title id="request-title">Wrong title</title>', 1,
+            )
+            cases["backtracking-visible-route"] = self.contract_backed_diagram().replace(
+                'd="M140 72 H220"', 'd="M140 72 H1000 H220"', 1,
+            )
+            cases["overflow-visible-route"] = self.contract_backed_diagram().replace(
+                'd="M140 72 H220"', 'd="M140 72 H1e308 H220"', 1,
+            )
+            for name, source in cases.items():
+                with self.subTest(name=name):
+                    artifact = tmp / f"{name}.html"
+                    artifact.write_text(source, encoding="utf-8")
+                    rejected = subprocess.run(
+                        [sys.executable, str(tool), "check", str(artifact)],
+                        text=True, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                    self.assertNotEqual(rejected.returncode, 0,
+                                        rejected.stdout + rejected.stderr)
+                    error = json.loads(rejected.stderr)
+                    self.assertFalse(error["ok"])
+
+            duplicate_field = tmp / "duplicate-field.html"
+            duplicate_field.write_text(
+                self.contract_backed_diagram().replace(
+                    '"schema_version": 1,',
+                    '"schema_version": 1, "schema_version": 1,', 1,
+                ), encoding="utf-8",
+            )
+            rejected = subprocess.run(
+                [sys.executable, str(tool), "check", str(duplicate_field)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("duplicate JSON field", rejected.stderr)
+
+            generic_architecture = tmp / "generic-architecture.json"
+            generic_architecture.write_text(json.dumps({
+                "schema_version": 1,
+                "diagram_type": "architecture",
+                "semantic_profile": "generic",
+                "composition_profile": "standard",
+                "title": "Escaped architecture",
+                "elements": [{"id": "box", "label": "Box", "kind": "element"}],
+                "relationships": [],
+            }), encoding="utf-8")
+            rejected = subprocess.run(
+                [sys.executable, str(tool), "validate", str(generic_architecture)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("does not apply", rejected.stderr)
+
+            overlap = tmp / "gap-with-report.html"
+            overlap.write_text(self.contract_backed_diagram().replace(
+                'data-diagram-route="140,72 220,72" d="M140 72 H220"',
+                'data-diagram-route="140,72 150,72" d="M140 72 H150"',
+            ).replace(
+                'data-diagram-bounds="220,40,120,64"',
+                'data-diagram-bounds="150,40,120,64"',
+            ).replace(
+                'x="220" y="40" width="120" height="64"',
+                'x="150" y="40" width="120" height="64"',
+            ), encoding="utf-8")
+            report_path = tmp / "failed-composition.json"
+            rejected = subprocess.run(
+                [sys.executable, str(tool), "check", str(overlap),
+                 "--report", str(report_path)], text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            failed_report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertFalse(failed_report["ok"])
+            self.assertIn(
+                "ELEMENT_GAP",
+                {item["code"] for item in failed_report["composition"]["violations"]},
+            )
+            self.assertIn("violations", json.loads(rejected.stderr)["composition"])
+
+    def test_diagram_contract_rejects_crossing_relationships(self):
+        skill = PLUGIN / "skills/diagram-creator"
+        tool = skill / "scripts/diagram_contract.py"
+        contract = {
+            "schema_version": 1,
+            "diagram_type": "architecture",
+            "semantic_profile": "architecture",
+            "composition_profile": "standard",
+            "title": "Crossing routes",
+            "elements": [
+                {"id": "left", "label": "Left", "kind": "service"},
+                {"id": "right", "label": "Right", "kind": "service"},
+                {"id": "top", "label": "Top", "kind": "service"},
+                {"id": "bottom", "label": "Bottom", "kind": "service"},
+            ],
+            "relationships": [
+                {"id": "horizontal", "source": "left", "target": "right",
+                 "label": "", "kind": "request"},
+                {"id": "vertical", "source": "top", "target": "bottom",
+                 "label": "", "kind": "request"},
+            ],
+        }
+        projection = """
+          <rect data-diagram-element="left" data-diagram-bounds="20,80,80,40" x="20" y="80" width="80" height="40"/><text data-diagram-element-label="left" x="60" y="104" font-size="10" fill="#000" text-anchor="middle">Left</text>
+          <rect data-diagram-element="right" data-diagram-bounds="260,80,80,40" x="260" y="80" width="80" height="40"/><text data-diagram-element-label="right" x="300" y="104" font-size="10" fill="#000" text-anchor="middle">Right</text>
+          <rect data-diagram-element="top" data-diagram-bounds="160,0,40,60" x="160" y="0" width="40" height="60"/><text data-diagram-element-label="top" x="180" y="32" font-size="10" fill="#000" text-anchor="middle">Top</text>
+          <rect data-diagram-element="bottom" data-diagram-bounds="160,140,40,60" x="160" y="140" width="40" height="60"/><text data-diagram-element-label="bottom" x="180" y="172" font-size="10" fill="#000" text-anchor="middle">Bottom</text>
+          <line data-diagram-relationship="horizontal" data-diagram-route="100,100 260,100" x1="100" y1="100" x2="260" y2="100" stroke="#000" stroke-width="1"/>
+          <line data-diagram-relationship="vertical" data-diagram-route="180,60 180,140" x1="180" y1="60" x2="180" y2="140" stroke="#000" stroke-width="1"/>
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "crossing.html"
+            artifact.write_text(self.contract_backed_diagram(
+                contract, projection,
+            ).replace('viewBox="0 0 360 144"', 'viewBox="0 0 360 220"'),
+                encoding="utf-8")
+            rejected = subprocess.run(
+                [sys.executable, str(tool), "check", str(artifact)], text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("RELATIONSHIP_CROSSINGS", rejected.stderr)
+
+            touching_contract = dict(contract)
+            touching_contract["title"] = "Touching routes"
+            touching_contract["relationships"] = [
+                {"id": "horizontal", "source": "left", "target": "top",
+                 "label": "", "kind": "request"},
+                {"id": "vertical", "source": "right", "target": "bottom",
+                 "label": "", "kind": "request"},
+            ]
+            touching_projection = """
+              <rect data-diagram-element="left" data-diagram-bounds="20,80,80,40" x="20" y="80" width="80" height="40"/><text data-diagram-element-label="left" x="60" y="104" font-size="10" fill="#000" text-anchor="middle">Left</text>
+              <rect data-diagram-element="right" data-diagram-bounds="260,80,80,40" x="260" y="80" width="80" height="40"/><text data-diagram-element-label="right" x="300" y="104" font-size="10" fill="#000" text-anchor="middle">Right</text>
+              <rect data-diagram-element="top" data-diagram-bounds="160,0,40,60" x="160" y="0" width="40" height="60"/><text data-diagram-element-label="top" x="180" y="32" font-size="10" fill="#000" text-anchor="middle">Top</text>
+              <rect data-diagram-element="bottom" data-diagram-bounds="160,140,40,60" x="160" y="140" width="40" height="60"/><text data-diagram-element-label="bottom" x="180" y="172" font-size="10" fill="#000" text-anchor="middle">Bottom</text>
+              <path data-diagram-relationship="horizontal" data-diagram-route="100,100 180,100 180,60" d="M100 100 H180 V60" stroke="#000" stroke-width="1"/>
+              <path data-diagram-relationship="vertical" data-diagram-route="260,100 180,100 180,140" d="M260 100 H180 V140" stroke="#000" stroke-width="1"/>
+            """
+            touching = Path(tmp) / "touching.html"
+            touching.write_text(self.contract_backed_diagram(
+                touching_contract, touching_projection,
+            ).replace('viewBox="0 0 360 144"', 'viewBox="0 0 360 220"'),
+                encoding="utf-8")
+            rejected = subprocess.run(
+                [sys.executable, str(tool), "check", str(touching)], text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("RELATIONSHIP_TOUCH", rejected.stderr)
+
     def test_diagram_creator_vendors_editorial_system_and_adds_uml(self):
         skill = PLUGIN / "skills/diagram-creator"
         text = (skill / "SKILL.md").read_text(encoding="utf-8")
@@ -8143,6 +8772,15 @@ class VisualAndHandoffSkillTests(unittest.TestCase):
         )
         self.assertEqual(geometry.returncode, 0,
                          geometry.stdout + geometry.stderr)
+        contract = subprocess.run(
+            [sys.executable, str(skill / "scripts/diagram_contract.py"),
+             "check", str(skill / "assets/example-architecture.html")],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(contract.returncode, 0,
+                         contract.stdout + contract.stderr)
+        self.assertEqual(json.loads(contract.stdout)["composition"]["score"],
+                         100)
         with tempfile.TemporaryDirectory() as tmp:
             reordered = Path(tmp) / "reordered-geometry.html"
             reordered.write_text(

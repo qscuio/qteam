@@ -1,4 +1,4 @@
 interface:
   display_name: "Diagram Creator"
-  short_description: "Create editorial diagrams and UML visuals"
-  default_prompt: "Use $diagram-creator to create a UML component diagram for this architecture."
+  short_description: "Create contract-backed editorial and UML diagrams"
+  default_prompt: "Use $diagram-creator to create a contract-backed UML component diagram for this architecture."

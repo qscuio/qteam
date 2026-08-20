@@ -8,9 +8,10 @@ description: Create editorial technical, product, data, process, chart, architec
 Create visual diagrams as self-contained HTML files with inline SVG and CSS, following an opinionated editorial design system.
 
 Thirty-two visual types. The Diagram Design 2.4 editorial system supplies the
-base visual language; QTeam adds bounded UML semantics for software design.
-Semantic patterns describe behavior independently; type references describe
-layout. Details load from `references/` only when selected.
+base visual language; QTeam adds bounded UML semantics and a versioned,
+contract-backed path for structural diagrams. Semantic patterns describe
+behavior independently; type references describe layout. Details load from
+`references/` only when selected.
 
 ---
 
@@ -146,6 +147,22 @@ Rules of thumb:
 **Always load the chosen `references/type-*.md` before drawing.** For UML,
 also load `uml-notation.md`; when routed above, also load
 `semantic-patterns.md`; when animation is chosen, load `animation.md`.
+
+### Diagram Contract gate for structural figures
+
+For a **static** architecture/high-level/IT/medallion/integration, data-flow,
+process/swimlane, ER, tree/org/nested/layer, UML class, UML component, or UML
+deployment figure, load
+[`references/diagram-contract.md`](references/diagram-contract.md). Author the
+strict semantic contract before layout, validate it, then bind every contract
+ID to exactly one SVG projection. This is the semantic source; the SVG renders
+exact validator-checked label/stereotype copies plus IDs and derived geometry.
+Contract v1 requires zero crossings and does not support motion.
+
+Do not force sequence, state-machine, flowchart, UML use-case/activity, loop,
+animated, quantitative, matrix, or plot figures into this version. They keep
+their selected type/semantic reference and native authority. This is a
+semantic boundary, not a fallback.
 
 ### Confirm before drawing
 
@@ -293,7 +310,7 @@ These six rules are **non-negotiable**. Run the pre-output checklist (§9) to ve
 
 2. **Label-to-connector margin: 6–10px gap, always.** A label must never sit *on* its arrow — the connector must remain visible. Place the label centered above (or beside, for vertical segments) the line with a **minimum 6px gap** between the bottom of the label's mask rect and the connector stroke. The opaque mask rect prevents the arrow from bleeding through, but the *visible* gap between mask edge and line preserves the reader's ability to trace the connection. If the label is large enough that 6px feels cramped, push it to 8–10px. Never let the mask rect touch or overlap the stroke.
 
-3. **No overlapping connectors.** Two connectors must never share the same stroke path, run parallel on top of each other, or be drawn on top of each other for any segment. When two orthogonal arrows must cross at a single point, apply the **bridge / hop** primitive (see `references/type-architecture.md` § Crossing arrows). When two arrows naturally want to overlap, offset their routing by ≥12px so each line is independently traceable. If you find yourself stacking connectors, redesign the layout — it means two nodes are too close, or the diagram is over budget (split into overview + detail).
+3. **No overlapping connectors.** Two connectors must never share the same stroke path, run parallel on top of each other, or be drawn on top of each other for any segment. Contract-backed figures also permit no crossings or geometric touches: reroute or split the figure. For a non-contract legacy figure only, a single bridge/hop may preserve readability. When two arrows naturally want to overlap, offset their routing by ≥12px so each line is independently traceable. If you find yourself stacking connectors, redesign the layout — it means two nodes are too close, or the diagram is over budget (split into overview + detail).
 
 4. **Shared edge → fan the attach points.** When two or more connectors enter or exit the *same edge* of a box, each must have its own distinct attach point along that edge — **no two connectors may share a single point on a box**. Spread the attach points evenly along the edge with **≥12px** between adjacent points (8px minimum for very small boxes). Routing rules:
    - For N connectors on an edge of length L, attach point `k` (1..N) sits at offset `L * k / (N + 1)` from the edge's leading corner.
@@ -462,6 +479,7 @@ Run before producing any diagram.
 **Type fit:**
 
 - [ ] If behavior matters, did I choose one semantic pattern before the visual type and load `semantic-patterns.md`?
+- [ ] If the static figure is in the exact Diagram Contract v1 scope (§3), did I validate before layout and run final `check` against the HTML?
 - [ ] Right visual type for the layout? (§3 visual-type guide)
 - [ ] Stated type, pattern, size preset, and planned cuts before drawing — confirmed, or assumptions noted? (§3)
 - [ ] Would a table / paragraph do the same job? (If yes — don't draw.)
@@ -491,7 +509,7 @@ Run before producing any diagram.
 - [ ] Arrows drawn before boxes?
 - [ ] **Every connector between off-axis nodes uses a rounded right-angle elbow (`r=8`)? No diagonal `<line>` slants?**
 - [ ] **Every arrow label has a visible 6–10px gap above its connector? (Mask rect not touching the stroke.)**
-- [ ] **No two connectors overlap, share a stroke path, or run on top of each other? Crossings use the bridge/hop primitive?**
+- [ ] **No two connectors overlap, share a stroke path, or run on top of each other? Contract-backed routes have zero crossings/touches; any non-contract legacy crossing uses a bridge/hop?**
 - [ ] **When several connectors enter or exit the same edge of a box, each has its own attach point (≥12px apart)? No connector hides another?**
 - [ ] **No connector passes behind a non-endpoint box, except the unavoidable-intervening-box case (§6 rule 5) — and in that case, the stroke is dashed and the label sits at the visible end?**
 - [ ] **No label mask overlaps a node drawn after it? (Node fill would clip the text — §6 rule 6.)**
@@ -536,9 +554,10 @@ Every diagram ships in three variants (see `assets/`):
 
 1. Copy the variant closest to what you want (`template.html` for minimal, `template-full.html` for cards, `template-motion.html` only when motion is requested).
 2. If behavior is load-bearing, choose a semantic pattern; then load the matching `references/type-<name>.md`. For UML, load `uml-notation.md` first.
-3. Replace the eyebrow, h1, and SVG body. Replace `[diagram-slug]` with the file slug and fill `<title>` / `<desc>`.
-4. If motion is requested, load `animation.md`; otherwise keep mode `none` and no script.
-5. Run the §9 taste gate.
+3. For a static figure in the exact Diagram Contract v1 scope (§3), author the contract and run `diagram_contract.py validate` before choosing coordinates. Other types keep their native authority.
+4. Replace the eyebrow, h1, and SVG body. Replace `[diagram-slug]` with the file slug and fill `<title>` / `<desc>`. Embed the validated contract and bind its IDs per `diagram-contract.md`.
+5. If motion is requested, load `animation.md` and do not claim Diagram Contract v1 validation; otherwise keep mode `none` and no executable script.
+6. Run the §9 taste gate. For a contract-backed figure, finish with `diagram_contract.py check`; it composes the contract, self-contained/accessibility, geometry, and composition gates.
 
 ---
 
@@ -580,6 +599,10 @@ Always produce a single self-contained `.html` file:
 - Embedded CSS with no external runtime resources
 - Inline SVG (no external images)
 - Static by default; minimal inline JavaScript only for explicit animation controls/state
+
+Static figures in the exact Diagram Contract v1 scope (§3) also carry one
+non-executable contract JSON script inside that same HTML file. It is semantic
+data, not a sidecar or runtime dependency.
 
 Renders correctly in any modern browser. Motion-enabled output must render its complete meaning without JavaScript; under `prefers-reduced-motion: reduce` it shows the complete static frame and hides/disables playback controls.
 

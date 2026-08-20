@@ -22,6 +22,11 @@ Load `uml-notation.md` first.
 Component, interface, port, provided/required interface, assembly connector,
 realization, dependency/usage, package/subsystem boundary.
 
+When a component has a load-bearing domain role such as a database or queue,
+keep `kind: component` and record the role in Diagram Contract v1 as a rendered
+stereotype (`stereotype: database` / `stereotype: queue`). Do not silently
+collapse that role into an untyped box.
+
 ## Budget
 
 9 components, 8 interfaces, 12 connectors, 2 subsystem boundaries. If an

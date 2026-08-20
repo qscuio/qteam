@@ -9,6 +9,32 @@ Autoresearch while keeping exactly one orchestration authority.
 The core rule is simple: roles are created only for distinct permission,
 context, output, or lifecycle boundaries; reusable practices remain skills.
 
+## What changed in 0.16
+
+- `$diagram-creator` now separates structural semantics from visual treatment
+  with Diagram Contract v1. The strict model is embedded in the same offline
+  HTML artifact and owns element identities, labels, kinds, relationship
+  endpoints, and relationship kinds; SVG projections repeat only IDs and
+  rendered bounds/routes.
+- A dependency-free `diagram_contract.py` CLI validates the model before
+  layout, binds every modeled fact to exactly one SVG projection, and emits a
+  deterministic composition report. Fixed `standard` and `showcase` profiles
+  measure overlap, spacing, orthogonality, bend count, route stretch,
+  micro-segments, containment, and crossings without allowing an artifact to
+  weaken its own limits.
+- The first contract-backed path applies to static architecture, data-flow,
+  process/swimlane, ER, tree/org/nested/layer, and UML class/component/deployment
+  figures. Sequence, state, flowchart, use-case, activity, loop, animated, and
+  quantitative figures keep their native semantic or data authority until a
+  specialized contract can represent their lifelines, curves, diamonds,
+  actors, bars, loops, or time states faithfully.
+- The implementation is a clean-room QTeam design informed by the versioned
+  Diagram IR, semantic-contract, composition, and unified-validation ideas in
+  `yizhiyanhua-ai/fireworks-tech-graph` at commit
+  `d56d45a286f16439a0fba2e66ff85f598c42ef41`. QTeam retains its existing
+  editorial HTML source, visual system, type references, and self-contained
+  output instead of importing a second renderer.
+
 ## What changed in 0.15
 
 - `$isometric` turns a repository into an interactive, evidence-backed
@@ -350,7 +376,7 @@ codex plugin add qteam@qteam
 ```
 
 Claude setup analogously uses `claude plugin marketplace add` plus
-`claude plugin install/update`, verifies the installed 0.15 version, and its
+`claude plugin install/update`, verifies the installed 0.16 version, and its
 uninstall command removes both registrations.
 
 Start the Web UI after project setup:
@@ -481,9 +507,11 @@ Use $diagram-creator to make a UML component diagram of this service boundary.
 ```
 
 It produces self-contained HTML with inline accessible SVG and can export SVG
-or PNG on request. UML output follows an explicitly bounded notation subset;
-it does not require PlantUML and does not claim to emit XMI or a fully
-machine-verifiable UML model.
+or PNG on request. Static figures in Diagram Contract v1's documented scope
+embed the strict model and must pass semantic/SVG binding plus deterministic
+composition checks; specialized or animated types retain their native
+authority. UML output follows an explicitly bounded notation subset; it does
+not require PlantUML and does not claim to emit XMI or a fully machine-verifiable UML model.
 
 Use `$show-me` when the learner needs to control time, inputs, or state:
 

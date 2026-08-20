@@ -84,3 +84,13 @@ QTeam does not redistribute that project's template, validator, scripts, text,
 or other source material. It uses a new bounded JSON contract, offline engine,
 repository SHA-256 evidence ledger, and QTeam's existing role/verification
 model; no license is asserted for code that was not copied.
+
+Diagram Contract v1 and its composition validator are a clean-room QTeam
+implementation informed by the versioned Diagram IR, semantic-contract,
+composition-quality, and unified-validation concepts in
+https://github.com/yizhiyanhua-ai/fireworks-tech-graph/tree/d56d45a286f16439a0fba2e66ff85f598c42ef41
+(MIT License, copyright 2025 fireworks-tech-graph contributors). QTeam does
+not redistribute that project's renderer, schemas, scripts, templates, or
+source text. The contract is embedded in QTeam's existing editorial HTML and
+uses new strict fields, fixed quality limits, SVG identity binding, and
+dependency-free validation code.

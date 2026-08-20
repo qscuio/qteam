@@ -15,6 +15,7 @@ markup is present — the structural motion contract. Pair it with the packaged
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from collections import Counter
@@ -28,6 +29,7 @@ ACTIONS = {"play", "pause", "replay", "prev", "next"}
 ASCII_DECIMAL_RE = re.compile(r"^[0-9]+$")
 REFERENCE_ATTRS = {"src", "href", "xlink:href", "poster", "srcset", "action", "formaction"}
 CSS_REMOTE_RE = re.compile(r"(?:https?:)?//[A-Za-z0-9]", re.IGNORECASE)
+MAX_CONTRACT_BYTES = 256 * 1024
 
 
 class DiagramParser(HTMLParser):
@@ -199,6 +201,12 @@ def canonical_controller() -> str:
     return normalized_controller("".join(body))
 
 
+def is_contract_script(script: dict[str, object]) -> bool:
+    attrs = script["attrs"]
+    assert isinstance(attrs, dict)
+    return "data-diagram-contract" in attrs
+
+
 def check_svgs(parser: DiagramParser, errors: list[str]) -> None:
     checkable = [
         svg
@@ -235,9 +243,41 @@ def check_svgs(parser: DiagramParser, errors: list[str]) -> None:
 def check_scripts(parser: DiagramParser, errors: list[str]) -> None:
     if not parser.scripts:
         return
-    if len(parser.scripts) > 1:
-        errors.append(f"at most one script is allowed; found {len(parser.scripts)}")
-    for number, script in enumerate(parser.scripts, 1):
+    contracts = [script for script in parser.scripts if is_contract_script(script)]
+    controllers = [script for script in parser.scripts if not is_contract_script(script)]
+    if len(contracts) > 1:
+        errors.append(f"at most one Diagram Contract is allowed; found {len(contracts)}")
+    if len(controllers) > 1:
+        errors.append(f"at most one executable controller is allowed; found {len(controllers)}")
+    for number, script in enumerate(contracts, 1):
+        attrs = script["attrs"]
+        attr_names = script["attr_names"]
+        body = script["body"]
+        assert isinstance(attrs, dict) and isinstance(attr_names, list) and isinstance(body, list)
+        if not script["closed"]:
+            errors.append(f"Diagram Contract {number} must have a closing script tag")
+        if (len(attr_names) != 2
+                or set(attr_names) != {"type", "data-diagram-contract"}
+                or attrs.get("type") != "application/json"
+                or attrs.get("data-diagram-contract") != ""):
+            errors.append(
+                "Diagram Contract script must carry only type=application/json "
+                "and data-diagram-contract"
+            )
+            continue
+        source = "".join(body)
+        if len(source.encode("utf-8")) > MAX_CONTRACT_BYTES:
+            errors.append(f"Diagram Contract exceeds {MAX_CONTRACT_BYTES} bytes")
+        if "<" in source:
+            errors.append("Diagram Contract JSON must escape every < as \\u003c")
+        try:
+            value = json.loads(source)
+        except (json.JSONDecodeError, RecursionError) as exc:
+            errors.append(f"Diagram Contract is not valid JSON: {exc}")
+        else:
+            if not isinstance(value, dict):
+                errors.append("Diagram Contract must be a JSON object")
+    for number, script in enumerate(controllers, 1):
         attrs = script["attrs"]
         attr_names = script["attr_names"]
         body = script["body"]
@@ -255,7 +295,8 @@ def check_scripts(parser: DiagramParser, errors: list[str]) -> None:
 
 
 def check_motion(parser: DiagramParser, source: str, errors: list[str]) -> None:
-    has_motion_markup = bool(parser.roots or parser.items or parser.scripts)
+    controllers = [script for script in parser.scripts if not is_contract_script(script)]
+    has_motion_markup = bool(parser.roots or parser.items or controllers)
     if not has_motion_markup:
         return
     if len(parser.roots) != 1:
@@ -302,11 +343,11 @@ def check_motion(parser: DiagramParser, source: str, errors: list[str]) -> None:
     if crowded:
         errors.append(f"no more than two semantic items may share a step; found {crowded}")
 
-    if mode in {"none", "loop"} and parser.scripts:
+    if mode in {"none", "loop"} and controllers:
         errors.append(f"{mode} mode must be script-free")
     if mode in {"none", "loop"} and (parser.controls or parser.actions or parser.statuses):
         errors.append(f"{mode} mode must not expose playback controls or live status")
-    controlled = mode == "step" or (mode == "reveal" and bool(parser.scripts))
+    controlled = mode == "step" or (mode == "reveal" and bool(controllers))
     if controlled:
         if parser.controls != 1:
             errors.append(f"controlled mode needs one in-root control group; found {parser.controls}")
@@ -325,11 +366,11 @@ def check_motion(parser: DiagramParser, source: str, errors: list[str]) -> None:
                 errors.append("motion status needs role=status, aria-live=polite, aria-atomic=true")
             if parser.statuses_in_controls:
                 errors.append("motion status must sit outside data-motion-controls")
-        if not parser.scripts:
+        if not controllers:
             errors.append("controlled mode needs the scoped control script")
 
     style_source = "".join(parser.styles)
-    if parser.scripts:
+    if controllers:
         if re.search(r"prefers-reduced-motion\s*:\s*reduce", style_source, re.IGNORECASE) is None:
             errors.append("missing reduced-motion CSS fallback (prefers-reduced-motion)")
         if re.search(r"@media\s+print\b", style_source, re.IGNORECASE) is None:

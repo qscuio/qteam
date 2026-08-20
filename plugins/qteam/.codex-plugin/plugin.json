@@ -1,7 +1,7 @@
 {
   "name": "qteam",
-  "version": "0.15.0+codex.20260815095108",
-  "description": "Durable graph delivery plus evidence-backed architecture maps, UML diagrams, interactive teaching, portable handoffs, adaptive quality lanes, calibrated review, TDD, diagnosis, and safe finish.",
+  "version": "0.16.0+codex.20260820045626",
+  "description": "Durable graph delivery plus evidence-backed architecture maps, contract-backed UML diagrams, interactive teaching, portable handoffs, adaptive quality lanes, calibrated review, TDD, diagnosis, and safe finish.",
   "author": {
     "name": "qscuio",
     "url": "https://github.com/qscuio"
@@ -32,7 +32,7 @@
   "interface": {
     "displayName": "QTeam",
     "shortDescription": "Durable, gated multi-agent software delivery",
-    "longDescription": "Discover evidence-backed solution paths, map repositories as measured isometric architecture cities, create editorial UML diagrams and interactive teaching UIs, hand sessions off through durable pointers, then deliver through durable goals, checkpoint waits, isolated worktrees, adaptive workflow shapes, conditional quality lanes, calibrated mandatory review, reversibility-aware decisions, scenario-complete TDD, deterministic policy, and safe finish gates.",
+    "longDescription": "Discover evidence-backed solution paths, map repositories as measured isometric architecture cities, create contract-backed editorial UML diagrams and interactive teaching UIs, hand sessions off through durable pointers, then deliver through durable goals, checkpoint waits, isolated worktrees, adaptive workflow shapes, conditional quality lanes, calibrated mandatory review, reversibility-aware decisions, scenario-complete TDD, deterministic policy, and safe finish gates.",
     "developerName": "qscuio",
     "category": "Developer Tools",
     "capabilities": [

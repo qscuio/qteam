@@ -31,13 +31,16 @@ Flip the vertical signs for right+up. Use a plain `<line>` only when endpoints s
 
 Reserve left/right ports for connections that travel primarily horizontally. Entering a node from the side on a mainly-vertical path looks like the arrow punctures the node face rather than arriving from above or below.
 
-**Dashed paths — same routing rules.** Optional, return, async, and passive flows use `stroke-dasharray="4,3"` and a lighter stroke weight (`stroke-width="1"`). Apply the **same orthogonal routing, port-selection, and bridge/hop rules** as solid paths — the dash pattern only communicates semantic weight, not a different routing grammar. When a dashed path and a solid path must cross, bridge the dashed one (it is by definition the less important connection).
+**Dashed paths — same routing rules.** Optional, return, async, and passive flows use `stroke-dasharray="4,3"` and a lighter stroke weight (`stroke-width="1"`). Apply the same orthogonal routing and port-selection rules as solid paths — the dash pattern only communicates semantic weight, not a different routing grammar. Contract-backed figures must reroute or split instead of crossing.
 
 **Zone label margin.** Leave ≥16px between the bottom of the zone eyebrow label and the top of the first enclosed node. Size the zone rect tall enough to contain this header gap (zone `y` = node_top − 32; label mask `y` = zone_y + 4).
 
-## Crossing arrows — bridge / hop
+## Crossing arrows — non-contract legacy only
 
-When two orthogonal arrows must cross, add a small arc (hop/bridge) on the **less important** arrow at the crossing point. The more important arrow is drawn uninterrupted.
+Diagram Contract v1 rejects all crossings and touches. Reroute or split new
+contract-backed architecture diagrams. The bridge below exists only for a
+legacy/non-contract redraw that cannot yet use the contract; do not claim it
+passed `diagram_contract.py check`.
 
 ```svg
 <!-- Horizontal hop over a vertical crossing at x=cx, on a line at y -->
@@ -73,6 +76,8 @@ Rules:
 - Legend floating inside the diagram area.
 
 ## Examples
-- `assets/example-architecture.html` — minimal light
+- `assets/example-architecture.html` — minimal light and the canonical
+  Diagram Contract v1 binding example; run `scripts/diagram_contract.py check`
+  against it after changing its semantic or rendered structure
 - `assets/example-architecture-dark.html` — minimal dark
 - `assets/example-architecture-full.html` — full editorial
