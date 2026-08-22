@@ -197,8 +197,13 @@ For each wave:
    turns or pass conversation history. Put task briefs, reports, and review
    packages in durable files and exchange pointers plus digests, not pasted
    transcript history.
-4. Workers stay inside their worktree/write set, run focused verification,
-   commit locally, and never push or merge. Feature/bugfix work makes a
+4. Workers stay inside their worktree/write set and never push or merge.
+   After GREEN, applicable implementation roles read the immutable cleanup
+   snapshot named by their packet and apply `deslop` only to noise introduced
+   by the task. They preserve behavior and scope, then rerun focused
+   verification. TDD work preserves its test-only RED and minimal GREEN commits
+   and records cleanup as a focused follow-up; non-TDD work cleans before its
+   final task commit. Feature/bugfix work makes a
    test-only RED commit and minimal GREEN commit per approved seam; the
    coordinator runs `verify-tdd-cycle` with the seam ID and RED/GREEN commits
    to replay the frozen command at both commits. Bugfix/

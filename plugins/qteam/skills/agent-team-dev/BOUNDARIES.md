@@ -10,6 +10,7 @@
 | cleanup obligation | worker packet derivation | `agent-team-worker.py` packet build | applicable worker |
 | structural quality rubric | thermo skill reference | QTeam plugin release | public skill, project setup |
 | installed practice/rubric copies | project runtime manifest | setup/refresh only | worker, packet builder, doctor |
+| cleanup practice snapshot | worker packet builder | validated content-addressed run snapshot | assigned worker |
 | structural defect finding | standards finding ledger | `agent-team-review run` receipt transaction | coordinator, fixer, re-reviewer |
 | finding closure | independent re-review receipt | `agent-team-review complete` | review gate, finish gate |
 
@@ -21,6 +22,7 @@ files are byte-identical installed copies, not second authorities.
 
 deslop reference -> project setup -> `.codex/practices/deslop.md`
 thermo reference -> project setup -> `.codex/standards/structural-quality.md`
+worker/review packet builders -> `agent_team_artifact.managed_runtime_bytes` -> complete project manifest + captured bytes
 `agent-team-worker.py` -> task role/work-kind -> one cleanup obligation
 assigned worker -> owned diff -> existing focused verification
 `agent-team-review.py` -> installed rubric snapshot -> immutable standards packet

@@ -29,6 +29,7 @@ def repository_root(value):
 
 def cleanup_empty_directories(root):
     for relative in (
+        ".codex/practices", ".codex/standards",
         ".codex/licenses", ".codex/schemas", ".codex/worker-prompts",
         ".codex/agents", ".codex/bin", ".codex/qteam-ui",
         ".codex/qteam-backups/install",

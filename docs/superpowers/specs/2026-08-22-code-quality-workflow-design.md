@@ -2,7 +2,8 @@
 
 ## Status
 
-Approved direction; implementation has not started.
+Implemented on the current feature branch; verification evidence is recorded in
+the corresponding commit history and test output.
 
 ## Context
 
@@ -82,8 +83,10 @@ workers receive a repository-local, versioned practice without depending on
 plugin discovery inside a child process.
 
 Inside QTeam runs, `agent-team-worker.py` owns a single cleanup obligation
-appended to applicable worker packets. The obligation points to the installed
-practice file. Do not duplicate the full checklist across every role prompt.
+appended to applicable worker packets. It validates and captures the installed
+practice bytes once, freezes them under the run by content hash, and points the
+worker to that immutable snapshot. Do not duplicate the full checklist across
+every role prompt.
 
 The obligation applies when both conditions hold:
 
@@ -211,8 +214,9 @@ The three layers are complementary:
 Path: `plugins/qteam/skills/deslop/SKILL.md`.
 
 The skill is behavior-preserving, diff-scoped, and subordinate to QTeam when a
-run exists. It cannot commit, merge, change task scope, alter tests to make
-them pass, or claim completion.
+run exists. An assigned worker may record bounded cleanup in a focused task
+commit, but the skill cannot merge, change task scope, alter tests to make them
+pass, or claim completion.
 
 ### New skill: `thermo-nuclear-code-quality-review`
 
@@ -227,8 +231,9 @@ finding ledger. It never spawns its own reviewer or writes findings outside
 ### Worker packet assembly
 
 Update `plugins/qteam/bin/agent-team-worker.py` with one derived cleanup
-obligation based on role and work kind. It validates and points to the installed
-`.codex/practices/deslop.md`. The task record remains unchanged.
+obligation based on role and work kind. It validates installed
+`.codex/practices/deslop.md`, freezes the captured bytes in the run, and points
+to that content-addressed snapshot. The task record remains unchanged.
 
 ### Review policy and runner
 

@@ -26,7 +26,10 @@ from agent_team_policy import (
     DEFAULT_PROJECT_POLICY, core_policy_digest, effective_execution,
     project_policy_digest, safe_identifier,
 )
-from agent_team_artifact import ArtifactError, locked_regular, safe_regular
+from agent_team_artifact import (
+    ArtifactError, locked_regular, managed_runtime_bytes, regular_bytes,
+    safe_regular,
+)
 from agent_team_eval import (
     codex_version, parse_codex_trace, regular_output, validate_eval_case,
     validate_learning_manifest, wait_capped_process,
@@ -38,6 +41,14 @@ ROLES = {
     "test-writer", "integration-tester", "fixer", "knowledge-distiller",
 }
 TASK_ENV_KEYS = {"TMPDIR", "PORT_BASE", "TEST_DB_NAME", "COMPOSE_PROJECT_NAME", "BUILD_DIR"}
+DESLOP_ROLES = {
+    "developer", "debugger", "frontend-debugger", "system-debugger",
+    "test-writer", "integration-tester", "fixer",
+}
+DESLOP_WORK_KINDS = {
+    "feature", "bugfix", "debug", "refactor", "test", "integration",
+    "experiment",
+}
 
 
 def safe_task_id(value):
@@ -217,6 +228,24 @@ def role_prompt(repo, role):
     raise SystemExit(f"error: missing worker prompt for role {role}")
 
 
+def freeze_practice(run_dir, data, digest):
+    snapshot_dir = run_dir / "practices"
+    if snapshot_dir.is_symlink() or (
+            snapshot_dir.exists() and not snapshot_dir.is_dir()):
+        raise SystemExit("error: practice snapshot root must be a real directory")
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    snapshot = snapshot_dir / f"{digest}.md"
+    try:
+        if snapshot.exists():
+            if regular_bytes(snapshot, "cleanup practice snapshot") != data:
+                raise SystemExit("error: cleanup practice snapshot hash collision")
+        else:
+            atomic_text(snapshot, data.decode("utf-8"))
+    except (ArtifactError, UnicodeError) as exc:
+        raise SystemExit(f"error: cannot freeze cleanup practice: {exc}")
+    return snapshot.resolve()
+
+
 def build_packet(repo, run_dir, task, role, extra_prompt):
     allowed = {
         key: task.get(key) for key in (
@@ -230,6 +259,38 @@ def build_packet(repo, run_dir, task, role, extra_prompt):
         ) if key in task
     }
     prompt = role_prompt(repo, role)
+    cleanup = ""
+    if role in DESLOP_ROLES and task.get("work_kind") in DESLOP_WORK_KINDS:
+        try:
+            _source, practice_data, practice_digest = managed_runtime_bytes(
+                repo, ".codex/practices/deslop.md"
+            )
+        except ArtifactError as exc:
+            raise SystemExit(
+                f"error: cannot load cleanup practice: {exc}; "
+                "run qteam setup/refresh"
+            )
+        practice = freeze_practice(run_dir, practice_data, practice_digest)
+        cleanup = f"""
+After the implementation is GREEN and before final verification, read
+the immutable cleanup snapshot `{practice}` (SHA-256 `{practice_digest}`),
+installed from `.codex/practices/deslop.md`. Clean only slop introduced by this task.
+Preserve behavior and scope. Do not amend test-only RED or minimal GREEN commits.
+"""
+        if task.get("policy", {}).get("tdd_required"):
+            cleanup += (
+                "Record cleanup as a focused follow-up commit, then rerun "
+                "focused verification.\n"
+            )
+        else:
+            cleanup += (
+                "Complete cleanup before the final task commit, then rerun "
+                "focused verification.\n"
+            )
+        cleanup += (
+            "If behavior or focused verification changes, revert the cleanup "
+            "and report the conflict; do not weaken tests.\n"
+        )
     handoff = ("Before exit, leave the outbox uncommitted for controlled harvest and print a bounded digest."
                if role == "knowledge-distiller" else
                ("Before exit, commit only the final kept experiment state locally, leave .qteam-experiment.json uncommitted, and print a bounded attempt digest."
@@ -248,6 +309,7 @@ Task packet:
 Additional coordinator instruction:
 {extra_prompt or '(none)'}
 
+{cleanup}
 {handoff}
 Every digest must include non-empty single-line `Validation scope:` and
 `Claim boundary:` fields. State what the evidence directly covers and what it

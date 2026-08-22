@@ -9,6 +9,21 @@ Autoresearch while keeping exactly one orchestration authority.
 The core rule is simple: roles are created only for distinct permission,
 context, output, or lifecycle boundaries; reusable practices remain skills.
 
+## What changed in 0.17
+
+- `$deslop` adds a bounded, behavior-preserving cleanup pass after GREEN. QTeam
+  workers receive the obligation centrally for implementation work, preserve
+  RED/GREEN history, stay inside the task write set, and rerun focused
+  verification after any cleanup.
+- `$thermo-nuclear-code-quality-review` adds a strict structural-quality rubric
+  for incidental complexity, spaghetti growth, unearned abstractions, unclear
+  boundaries, canonical ownership, and cohesive file growth. Every standards
+  review packet freezes the installed rubric and binds it into the existing
+  immutable packet digest; no new reviewer or review axis is introduced.
+- Project setup installs and manifest-binds both runtime references plus the
+  Cursor Team Kit MIT license. This release intentionally adds no CI, PR, or
+  GitHub automation.
+
 ## What changed in 0.16
 
 - `$diagram-creator` now separates structural semantics from visual treatment
@@ -376,7 +391,7 @@ codex plugin add qteam@qteam
 ```
 
 Claude setup analogously uses `claude plugin marketplace add` plus
-`claude plugin install/update`, verifies the installed 0.16 version, and its
+`claude plugin install/update`, verifies the installed 0.17 version, and its
 uninstall command removes both registrations.
 
 Start the Web UI after project setup:

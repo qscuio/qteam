@@ -4,6 +4,7 @@
 import argparse
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -168,6 +169,68 @@ def safe_regular(path, label, *, required=False):
     if required and not path.is_file():
         raise ArtifactError(f"missing {label}: {path}")
     return path
+
+
+def regular_bytes_and_mode(path, label):
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ArtifactError(f"cannot open {label}: {path}: {exc}")
+    try:
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode):
+            raise ArtifactError(f"unsafe non-regular file for {label}: {path}")
+        with os.fdopen(descriptor, "rb", closefd=False) as source:
+            return source.read(), stat.S_IMODE(status.st_mode)
+    finally:
+        os.close(descriptor)
+
+
+def regular_bytes(path, label):
+    return regular_bytes_and_mode(path, label)[0]
+
+
+def qteam_project_module():
+    module_path = Path(__file__).with_name("qteam_project.py")
+    if not module_path.is_file():
+        module_path = Path(__file__).resolve().parent.parent / "scripts/qteam_project.py"
+    spec = importlib.util.spec_from_file_location(
+        "qteam_managed_runtime_contract", module_path
+    )
+    if spec is None or spec.loader is None:
+        raise ArtifactError("cannot load QTeam project manifest contract")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def managed_runtime_bytes(repo, relative):
+    """Capture bytes authorized by a complete installed project manifest."""
+    runtime = repo_path(repo, relative)
+    marker = repo_path(repo, ".codex/qteam-project.json")
+    try:
+        manifest = json.loads(regular_bytes(marker, "project manifest"))
+    except (json.JSONDecodeError, UnicodeError) as exc:
+        raise ArtifactError(f"invalid project manifest: {exc}")
+    if not isinstance(manifest, dict):
+        raise ArtifactError("project manifest must be an object")
+    try:
+        records = qteam_project_module().installed_records(repo, manifest)
+    except (ValueError, OSError) as exc:
+        raise ArtifactError(f"invalid project manifest: {exc}")
+    record = records.get(relative)
+    if record is None:
+        raise ArtifactError(f"project manifest does not own runtime: {relative}")
+    data, mode = regular_bytes_and_mode(runtime, f"managed runtime {relative}")
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != record["sha256"]:
+        raise ArtifactError(f"managed runtime digest mismatch: {relative}")
+    if manifest["schema_version"] == 3 and mode != record["mode"]:
+        raise ArtifactError(f"managed runtime mode mismatch: {relative}")
+    return runtime, data, digest
 
 
 @contextmanager

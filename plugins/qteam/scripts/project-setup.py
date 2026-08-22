@@ -172,6 +172,17 @@ def installed_payloads(plugin_root, version, source_commit, stamp):
         payloads[f".codex/qteam-ui/{name}"] = (
             source_bytes(plugin_root / f"ui/{name}"), 0o644,
         )
+    payloads[".codex/practices/deslop.md"] = (
+        source_bytes(plugin_root / "skills/deslop/references/diff-cleanup.md"),
+        0o644,
+    )
+    payloads[".codex/standards/structural-quality.md"] = (
+        source_bytes(
+            plugin_root
+            / "skills/thermo-nuclear-code-quality-review/references/structural-quality.md"
+        ),
+        0o644,
+    )
     binary_sources = {
         "wake-agent-team": "bin/wake-agent-team.sh",
         "agent-team-artifact": "bin/agent_team_artifact.py",
@@ -204,6 +215,7 @@ def installed_payloads(plugin_root, version, source_commit, stamp):
     for name in (
         "Matt-Pocock-MIT.txt", "Superpowers-MIT.txt", "Autoresearch-MIT.txt",
         "LoopX-MIT.txt", "Smart-Ralph-MIT.txt", "Diagram-Design-MIT.txt",
+        "Cursor-Team-Kit-MIT.txt",
         "Tabler-Icons-MIT.txt", "Simple-Icons-CC0-1.0.txt",
         "Log-Z-Logos-MIT.txt", "Devicon-MIT.txt",
     ):

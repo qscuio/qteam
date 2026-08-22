@@ -15,12 +15,19 @@ cases, and the deterministic artifact-lint report. A typed
 spec with lint errors is rejected before a reviewer launches. Legacy sources
 remain reviewable with an explicit untyped-source warning.
 
+Every new `standards` packet also freezes the setup-managed
+`.codex/standards/structural-quality.md` rubric. It is part of the existing
+standards axis and packet digest, not another reviewer or gate. Spec and risk
+packets do not auto-include it.
+
 Run exactly one independent axis per reviewer. Both `spec` and `standards` are
 mandatory on every gate:
 
 - `spec`: required behavior, scope, acceptance, tests, and forbidden fallback.
-- `standards` (code-quality): correctness, repository standards, architecture, error handling,
-  maintainability, and regression risk.
+- `standards` (code-quality): correctness, repository standards, architecture,
+  error handling, maintainability, regression risk, and the frozen structural
+  checks for incidental complexity, spaghetti growth, earned abstractions,
+  explicit boundaries, canonical ownership, and cohesive file growth.
 - `risk`: only when concurrency, security, migration, compatibility, data loss,
   auth, or a public API triggers it. This additional axis never replaces either
   mandatory axis.
@@ -35,6 +42,11 @@ create a non-empty packet with `--iteration <N>` (where `N >= 2`) and
 fresh read-only reviewer receipt close exactly those IDs. Manual `resolve` is
 rejected. The gate passes only when required ledgers are complete at current
 HEAD and no finding remains open.
+
+The standards ledger is defect-only. Do not record taste, optional polish, or
+unrelated pre-existing debt. Crossing 1000 lines is a strong prompt to assess
+cohesion and decomposition, never a mechanical finding. When a valid fix would
+cross the frozen write set or ownership contract, require QTeam replanning.
 
 The coordinator must launch each independent reviewer through
 `agent-team-review run --ledger ... --reviewer ... --session-id ...`. The

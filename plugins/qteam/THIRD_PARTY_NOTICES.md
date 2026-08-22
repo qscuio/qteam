@@ -77,6 +77,15 @@ The complete Tabler, Simple Icons, log-z/logos, and Devicon license texts ship
 in the corresponding source `LICENSES/` files and project `.codex/licenses/`
 files.
 
+`deslop` and `thermo-nuclear-code-quality-review` adapt diff-cleanup and strict
+maintainability-review ideas from Cursor Team Kit (MIT License, copyright 2026
+Cursor). QTeam narrows them to behavior-preserving, write-set-bounded cleanup
+and defect-only structural findings, and integrates them into its existing
+worker and standards-review authorities rather than adding CI, a reviewer, or
+another orchestration loop. The upstream license is reproduced in
+`LICENSES/Cursor-Team-Kit-MIT.txt` and installed as
+`.codex/licenses/Cursor-Team-Kit-MIT.txt`.
+
 `isometric` is a clean-room QTeam-native implementation informed by the
 evidence-led architecture-city concept in
 https://github.com/sayantan94/toolbelt/tree/419388cf0e15d1741d4cfe0fdc9237cd3eef2be5/isometric.

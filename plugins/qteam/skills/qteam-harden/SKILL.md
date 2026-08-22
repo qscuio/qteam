@@ -57,6 +57,12 @@ abstraction does not delete more incidental complexity than it adds, record a
 bounded `not-needed` rationale instead of generalizing the codebase. Do not
 turn this lane into a repository-wide architecture scan.
 
+Use the structural rubric's vocabulary where it fits:
+`delete-incidental-complexity`, `no-spaghetti-growth`, `earned-abstractions`,
+`explicit-boundaries`, `canonical-ownership`, and `cohesive-file-growth`.
+This lane still records deterministic command evidence only; it never launches
+or substitutes for the independent standards reviewer.
+
 The state manager runs only the frozen commands in a disposable detached
 checkout of the exact integration HEAD, bounds retained output, records both
 streams and the HEAD, and fails the

@@ -30,22 +30,25 @@ SCHEMAS = (
 )
 UI_FILES = ("index.html", "app.js", "styles.css")
 PLUGIN_SKILLS = (
-    "agent-team-dev", "brainstorming", "diagram-creator", "domain-modeling",
+    "agent-team-dev", "brainstorming", "deslop", "diagram-creator", "domain-modeling",
     "goal-execution-discipline", "grill-me", "grill-with-docs", "grilling",
     "handoff", "isometric", "qteam-diagnose", "qteam-explore", "qteam-review", "qteam-router",
     "qteam-goal", "qteam-harden", "qteam-tdd", "to-spec", "to-tickets",
-    "show-me", "verification-before-completion", "wayfinder", "writing-plans",
+    "show-me", "thermo-nuclear-code-quality-review",
+    "verification-before-completion", "wayfinder", "writing-plans",
 )
 LEGACY_OWNED_PLUGIN_SKILLS = tuple(
     name for name in PLUGIN_SKILLS
     if name not in {
         "diagram-creator", "handoff", "qteam-explore", "qteam-goal",
-        "qteam-harden", "show-me", "isometric",
+        "qteam-harden", "show-me", "isometric", "deslop",
+        "thermo-nuclear-code-quality-review",
     }
 )
 LOCAL_SKILL_CONFLICTS = (
     "diagram-creator", "handoff", "qteam-explore", "qteam-goal",
-    "qteam-harden", "show-me", "isometric",
+    "qteam-harden", "show-me", "isometric", "deslop",
+    "thermo-nuclear-code-quality-review",
 )
 LEGACY_ORCHESTRATION_SKILLS = (
     "using-superpowers", "executing-plans", "subagent-driven-development",
@@ -72,6 +75,8 @@ INSTALLED_PATHS = frozenset(
     + [f".codex/bin/{name}" for name in BINARIES]
     + [f".codex/qteam-ui/{name}" for name in UI_FILES]
     + [
+        ".codex/practices/deslop.md",
+        ".codex/standards/structural-quality.md",
         ".codex/QTEAM-THIRD-PARTY-NOTICES.md",
         ".codex/licenses/Matt-Pocock-MIT.txt",
         ".codex/licenses/Superpowers-MIT.txt",
@@ -79,6 +84,7 @@ INSTALLED_PATHS = frozenset(
         ".codex/licenses/LoopX-MIT.txt",
         ".codex/licenses/Smart-Ralph-MIT.txt",
         ".codex/licenses/Diagram-Design-MIT.txt",
+        ".codex/licenses/Cursor-Team-Kit-MIT.txt",
         ".codex/licenses/Tabler-Icons-MIT.txt",
         ".codex/licenses/Simple-Icons-CC0-1.0.txt",
         ".codex/licenses/Log-Z-Logos-MIT.txt",
@@ -93,8 +99,15 @@ MOVED_PATHS = frozenset(
     + [f".agents/skills/{name}" for name in LEGACY_ORCHESTRATION_SKILLS]
     + [".codex/bin/__pycache__"]
 )
-V013_INSTALLED_PATHS = frozenset(
+V016_INSTALLED_PATHS = frozenset(
     INSTALLED_PATHS - {
+        ".codex/practices/deslop.md",
+        ".codex/standards/structural-quality.md",
+        ".codex/licenses/Cursor-Team-Kit-MIT.txt",
+    }
+)
+V013_INSTALLED_PATHS = frozenset(
+    V016_INSTALLED_PATHS - {
         ".codex/licenses/Diagram-Design-MIT.txt",
         ".codex/licenses/Tabler-Icons-MIT.txt",
         ".codex/licenses/Simple-Icons-CC0-1.0.txt",
@@ -355,6 +368,8 @@ def validate_manifest(root, manifest):
         supported_sets = (V012_INSTALLED_PATHS,)
     elif version_tuple < (0, 14, 0):
         supported_sets = (V013_INSTALLED_PATHS,)
+    elif version_tuple < (0, 17, 0):
+        supported_sets = (V016_INSTALLED_PATHS,)
     else:
         supported_sets = (INSTALLED_PATHS,)
     if installed_set not in supported_sets:
@@ -418,6 +433,34 @@ def validate_manifest(root, manifest):
         require_sha(record.get("backup_sha256"), expected_backup)
         safe_path(root, expected_backup)
     return backup_root
+
+
+def installed_records(root, manifest):
+    """Validate an installed manifest and return its records by managed path."""
+    validate_manifest(root, manifest)
+    if manifest.get("phase") != "installed":
+        raise ValueError("QTeam project runtime is not fully installed")
+    return {record["path"]: record for record in manifest["installed_files"]}
+
+
+def verify_installed_files(root, manifest):
+    """Verify every installed file against the manifest content and mode."""
+    records = installed_records(root, manifest)
+    schema_version = manifest["schema_version"]
+    for relative, record in records.items():
+        destination = safe_path(root, relative)
+        if not destination.is_file():
+            raise ValueError(f"missing QTeam installed file: {relative}")
+        if file_digest(destination) != record["sha256"]:
+            raise ValueError(f"QTeam installed file digest mismatch: {relative}")
+        expected_mode = (
+            record["mode"] if schema_version == 3
+            else _legacy_installed_mode(relative)
+        )
+        actual_mode = stat.S_IMODE(destination.stat().st_mode)
+        if actual_mode != expected_mode:
+            raise ValueError(f"QTeam installed file mode mismatch: {relative}")
+    return records
 
 
 def _legacy_installed_mode(path):

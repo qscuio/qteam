@@ -32,6 +32,32 @@ done
 [[ -f ".codex/bin/agent_team_artifact.py" ]] || fail "missing artifact module: agent_team_artifact.py"
 [[ -f ".codex/bin/agent_team_eval.py" ]] || fail "missing evaluation module: agent_team_eval.py"
 [[ -f ".codex/bin/qteam_project.py" ]] || fail "missing project manifest module: qteam_project.py"
+[[ -f ".codex/practices/deslop.md" ]] || fail "missing cleanup practice: deslop.md"
+[[ -f ".codex/standards/structural-quality.md" ]] || fail "missing standards rubric: structural-quality.md"
+[[ -f ".codex/licenses/Cursor-Team-Kit-MIT.txt" ]] || fail "missing Cursor Team Kit license"
+if python3 - "$ROOT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(root / ".codex/bin"))
+from qteam_project import verify_installed_files
+
+try:
+    manifest = json.loads(
+        (root / ".codex/qteam-project.json").read_text(encoding="utf-8")
+    )
+    verify_installed_files(root, manifest)
+except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+    print(f"runtime integrity error: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+then
+  ok "project manifest and installed runtime content match"
+else
+  fail "project manifest or installed runtime integrity check failed"
+fi
 
 for role in developer debugger frontend-debugger system-debugger test-writer \
             integration-tester fixer knowledge-distiller; do
@@ -51,7 +77,8 @@ done
 [[ $SCHEMA_OK -eq 1 ]] && ok "all JSON schemas parse"
 
 for duplicate in agent-team-dev qteam-router qteam-tdd qteam-diagnose qteam-explore qteam-review \
-                 qteam-goal qteam-harden diagram-creator handoff isometric show-me \
+                 qteam-goal qteam-harden deslop thermo-nuclear-code-quality-review \
+                 diagram-creator handoff isometric show-me \
                  using-superpowers executing-plans subagent-driven-development \
                  requesting-code-review receiving-code-review \
                  finishing-a-development-branch using-git-worktrees \

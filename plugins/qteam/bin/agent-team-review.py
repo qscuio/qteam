@@ -26,7 +26,8 @@ from agent_team_policy import (
     safe_identifier,
 )
 from agent_team_artifact import (
-    ArtifactError, lint_documents, locked_regular, safe_regular,
+    ArtifactError, lint_documents, locked_regular, managed_runtime_bytes,
+    safe_regular,
 )
 from agent_team_eval import (
     calibration_suite, codex_version, parse_codex_trace,
@@ -127,16 +128,20 @@ def write(path, value):
             os.unlink(tmp)
 
 
-def snapshot_sources(repo, run, sources):
+def snapshot_sources(repo, run, sources, captured=None):
     """Freeze review inputs so a later edit cannot change what was reviewed."""
     records = []
+    captured = captured or {}
     snapshot_dir = run / "reviews" / "sources"
     safe_directory(snapshot_dir, "review source directory", create=True)
     for source in sources:
         source_path = ((repo / source).resolve() if not Path(source).is_absolute()
                        else Path(source).resolve())
-        data = source_path.read_bytes()
-        digest = hashlib.sha256(data).hexdigest()
+        if source_path in captured:
+            data, digest = captured[source_path]
+        else:
+            data = source_path.read_bytes()
+            digest = hashlib.sha256(data).hexdigest()
         snapshot = snapshot_dir / f"{digest}.source"
         if snapshot.exists():
             if snapshot.read_bytes() != data:
@@ -838,7 +843,36 @@ def cmd_create(args, repo, run):
         raise SystemExit("error: spec review requires at least one --spec-source")
     if args.axis in {"standards", "risk"} and not args.standards_source:
         raise SystemExit(f"error: {args.axis} review requires at least one --standards-source")
-    for source in [*args.spec_source, *args.standards_source]:
+    standards_source = list(args.standards_source)
+    captured_standards = {}
+    if args.axis == "standards":
+        structural = ".codex/standards/structural-quality.md"
+        try:
+            structural_path, structural_data, structural_digest = (
+                managed_runtime_bytes(repo, structural)
+            )
+        except ArtifactError as exc:
+            raise SystemExit(
+                f"error: cannot load structural quality rubric: {exc}; "
+                "run qteam setup/refresh"
+            )
+        supplied_paths = []
+        deduplicated_sources = []
+        for source in standards_source:
+            source_path = (
+                (repo / source).resolve() if not Path(source).is_absolute()
+                else Path(source).resolve()
+            )
+            if source_path not in supplied_paths:
+                supplied_paths.append(source_path)
+                deduplicated_sources.append(source)
+        standards_source = deduplicated_sources
+        if structural_path not in supplied_paths:
+            standards_source.append(structural)
+        captured_standards[structural_path] = (
+            structural_data, structural_digest
+        )
+    for source in [*args.spec_source, *standards_source]:
         source_path = (repo / source).resolve() if not Path(source).is_absolute() else Path(source).resolve()
         if repo not in source_path.parents or not source_path.is_file():
             raise SystemExit(f"error: review source must be a repository file: {source}")
@@ -939,7 +973,9 @@ def cmd_create(args, repo, run):
         closure_findings.sort(key=lambda item: (item["ledger"], item["id"] or ""))
     with review_lock(run / "reviews"):
         spec_sources = snapshot_sources(repo, run, args.spec_source)
-        standards_sources = snapshot_sources(repo, run, args.standards_source)
+        standards_sources = snapshot_sources(
+            repo, run, standards_source, captured_standards
+        )
         digest_sources = snapshot_sources(repo, run, args.digest_source)
     try:
         trajectory = wave_trajectory(run, state, args.wave, base, head)

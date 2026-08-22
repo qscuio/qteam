@@ -67,7 +67,26 @@ class RepoCase(unittest.TestCase):
         result = self.run_tool(STATE, "--run", run, "init", "--goal", "test goal",
                                *init_args)
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.install_quality_runtime()
         return self.repo / ".agents/runs" / run
+
+    def install_quality_runtime(self):
+        marker = self.repo / ".codex/qteam-project.json"
+        if not marker.exists():
+            installed = self.run_tool(PROJECT_SETUP, str(self.repo))
+            self.assertEqual(
+                installed.returncode, 0, installed.stdout + installed.stderr
+            )
+        exclude = self.repo / ".git/info/exclude"
+        existing = exclude.read_text(encoding="utf-8")
+        ignored = [".codex/", ".gitignore"]
+        missing = [path for path in ignored if path not in existing.splitlines()]
+        if missing:
+            exclude.write_text(
+                existing + ("" if existing.endswith("\n") else "\n")
+                + "\n".join(missing) + "\n",
+                encoding="utf-8",
+            )
 
     def make_task_record(self, run, task, wave, write_set, depends_on):
         branch = f"agent/{run.name}/{task}"
@@ -2877,6 +2896,112 @@ class OperatorSurfaceTests(RepoCase):
 
 
 class WorkerTests(RepoCase):
+    def test_managed_runtime_rejects_incomplete_or_inactive_manifest(self):
+        self.init_run("managed-runtime-manifest")
+        spec = importlib.util.spec_from_file_location(
+            "qteam_managed_runtime_test", ARTIFACT
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        marker = self.repo / ".codex/qteam-project.json"
+        original = json.loads(marker.read_text(encoding="utf-8"))
+        invalid = (
+            {"installed_files": [{
+                "path": ".codex/practices/deslop.md",
+                "sha256": hashlib.sha256(b"forged\n").hexdigest(),
+            }]},
+            {**original, "phase": "installing"},
+            {**original, "version": "0.16.0"},
+        )
+        try:
+            for manifest in invalid:
+                with self.subTest(manifest=manifest.get("phase", "partial")):
+                    marker.write_text(json.dumps(manifest), encoding="utf-8")
+                    with self.assertRaises(module.ArtifactError):
+                        module.managed_runtime_bytes(
+                            self.repo, ".codex/practices/deslop.md"
+                        )
+        finally:
+            marker.write_text(json.dumps(original), encoding="utf-8")
+
+    def test_worker_packet_enforces_deslop_for_applicable_work_only(self):
+        run = self.init_run("worker-deslop")
+        self.make_task(run, work_kind="test")
+        local_prompt = self.repo / ".codex/worker-prompts/developer.md"
+        local_prompt.parent.mkdir(parents=True, exist_ok=True)
+        local_prompt.write_text("Project-local developer prompt.\n", encoding="utf-8")
+
+        spec = importlib.util.spec_from_file_location(
+            "qteam_worker_deslop_test", WORKER
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.path.insert(0, str(PLUGIN / "bin"))
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            sys.path.pop(0)
+        task = json.loads((run / "tasks/T01.json").read_text(encoding="utf-8"))
+        packet = module.build_packet(self.repo, run, task, "developer", "")
+        self.assertEqual(packet.count(".codex/practices/deslop.md"), 1)
+        self.assertIn(str(run / "practices"), packet)
+        self.assertIn("Do not amend test-only RED or minimal GREEN commits", packet)
+        self.assertIn("rerun focused verification", packet)
+        self.assertIn("revert the cleanup", packet)
+        self.assertIn("do not weaken tests", packet)
+        self.assertIn("before the final task commit", packet)
+        snapshot = next((run / "practices").glob("*.md"))
+        self.assertEqual(
+            snapshot.read_bytes(),
+            (PLUGIN / "skills/deslop/references/diff-cleanup.md").read_bytes(),
+        )
+
+        task["policy"]["tdd_required"] = True
+        tdd_packet = module.build_packet(self.repo, run, task, "developer", "")
+        self.assertIn("focused follow-up commit", tdd_packet)
+        self.assertNotIn("before the final task commit", tdd_packet)
+        task["policy"]["tdd_required"] = False
+
+        for role in (
+            "developer", "debugger", "frontend-debugger", "system-debugger",
+            "test-writer", "integration-tester", "fixer",
+        ):
+            with self.subTest(role=role):
+                role_packet = module.build_packet(self.repo, run, task, role, "")
+                self.assertEqual(
+                    role_packet.count(".codex/practices/deslop.md"), 1
+                )
+        for work_kind in (
+            "feature", "bugfix", "debug", "refactor", "test", "integration",
+            "experiment",
+        ):
+            with self.subTest(work_kind=work_kind):
+                task["work_kind"] = work_kind
+                kind_packet = module.build_packet(
+                    self.repo, run, task, "developer", ""
+                )
+                self.assertEqual(
+                    kind_packet.count(".codex/practices/deslop.md"), 1
+                )
+        for work_kind in ("docs", "generated", "learning", "config"):
+            with self.subTest(excluded_work_kind=work_kind):
+                task["work_kind"] = work_kind
+                excluded = module.build_packet(
+                    self.repo, run, task, "developer", ""
+                )
+                self.assertNotIn(".codex/practices/deslop.md", excluded)
+        task["work_kind"] = "test"
+        learning_packet = module.build_packet(
+            self.repo, run, task, "knowledge-distiller", ""
+        )
+        self.assertNotIn(".codex/practices/deslop.md", learning_packet)
+        (self.repo / ".codex/practices/deslop.md").write_text(
+            "tampered after packet assembly\n", encoding="utf-8"
+        )
+        self.assertEqual(
+            snapshot.read_bytes(),
+            (PLUGIN / "skills/deslop/references/diff-cleanup.md").read_bytes(),
+        )
+
     def test_worker_process_identity_requires_a_recorded_start(self):
         spec = importlib.util.spec_from_file_location(
             "qteam_worker_identity_test", WORKER
@@ -3903,6 +4028,81 @@ class GateTests(RepoCase):
 
 
 class ReviewTests(RepoCase):
+    def test_structural_rubric_is_frozen_only_into_standards_packets(self):
+        run = self.init_run("structural-rubric")
+        common = (
+            "--wave", "1", "--base", "HEAD", "--head", "HEAD",
+        )
+        self.run_tool(
+            REVIEW, "--run", str(run), "create", *common,
+            "--axis", "standards", "--standards-source", "README.md",
+            "--standards-source", ".codex/standards/structural-quality.md",
+            "--standards-source",
+            str(self.repo / ".codex/standards/structural-quality.md"),
+            "--standards-source",
+            str(self.repo / ".codex/standards/structural-quality.md"),
+            check=True,
+        )
+        standards = json.loads((
+            run / "reviews/wave-1-standards.json"
+        ).read_text(encoding="utf-8"))["packet"]
+        self.assertEqual(
+            {item["source"] for item in standards["standards_sources"]},
+            {"README.md", ".codex/standards/structural-quality.md"},
+        )
+        self.assertEqual(len(standards["standards_sources"]), 2)
+        structural_source = next(
+            item for item in standards["standards_sources"]
+            if item["source"] == ".codex/standards/structural-quality.md"
+        )
+        frozen_rubric = (run / structural_source["snapshot"]).read_text(
+            encoding="utf-8"
+        )
+        for check in (
+            "delete-incidental-complexity", "no-spaghetti-growth",
+            "earned-abstractions", "explicit-boundaries",
+            "canonical-ownership", "cohesive-file-growth",
+        ):
+            self.assertIn(f"`{check}`", frozen_rubric)
+        self.assertIn("automatic defect", frozen_rubric)
+        self.assertIn("unrelated historical debt", frozen_rubric)
+
+        self.run_tool(
+            REVIEW, "--run", str(run), "create", *common,
+            "--axis", "spec", "--spec-source", "README.md", check=True,
+        )
+        spec_packet = json.loads((
+            run / "reviews/wave-1-spec.json"
+        ).read_text(encoding="utf-8"))["packet"]
+        self.assertEqual(
+            [item["source"] for item in spec_packet["spec_sources"]],
+            ["README.md"],
+        )
+        self.assertEqual(spec_packet["standards_sources"], [])
+
+        self.run_tool(
+            REVIEW, "--run", str(run), "create", *common,
+            "--axis", "risk", "--standards-source", "README.md", check=True,
+        )
+        risk_packet = json.loads((
+            run / "reviews/wave-1-risk.json"
+        ).read_text(encoding="utf-8"))["packet"]
+        self.assertEqual(
+            [item["source"] for item in risk_packet["standards_sources"]],
+            ["README.md"],
+        )
+
+        rubric = self.repo / ".codex/standards/structural-quality.md"
+        rubric.write_text("tampered\n", encoding="utf-8")
+        rejected = self.run_tool(
+            REVIEW, "--run", str(run), "create", "--wave", "1",
+            "--axis", "standards", "--iteration", "2", "--scope", "dispute",
+            "--base", "HEAD", "--head", "HEAD",
+            "--standards-source", "README.md",
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("managed runtime digest", rejected.stderr)
+
     def test_review_packets_pin_judge_profile_trajectory_and_calibration(self):
         run = self.init_run(
             "judge-run", "--review-model-standard", "gpt-5.6-sol"
@@ -6513,6 +6713,22 @@ class InstallerTests(RepoCase):
         self.assertTrue((self.repo / ".codex/licenses/LoopX-MIT.txt").is_file())
         self.assertTrue((self.repo / ".codex/licenses/Smart-Ralph-MIT.txt").is_file())
         self.assertTrue((self.repo / ".codex/licenses/Diagram-Design-MIT.txt").is_file())
+        self.assertTrue((self.repo / ".codex/licenses/Cursor-Team-Kit-MIT.txt").is_file())
+        self.assertTrue((self.repo / ".codex/practices/deslop.md").is_file())
+        self.assertTrue((
+            self.repo / ".codex/standards/structural-quality.md"
+        ).is_file())
+        self.assertEqual(
+            (self.repo / ".codex/practices/deslop.md").read_bytes(),
+            (PLUGIN / "skills/deslop/references/diff-cleanup.md").read_bytes(),
+        )
+        self.assertEqual(
+            (self.repo / ".codex/standards/structural-quality.md").read_bytes(),
+            (
+                PLUGIN
+                / "skills/thermo-nuclear-code-quality-review/references/structural-quality.md"
+            ).read_bytes(),
+        )
         for name in (
             "Tabler-Icons-MIT.txt", "Simple-Icons-CC0-1.0.txt",
             "Log-Z-Logos-MIT.txt", "Devicon-MIT.txt",
@@ -6526,6 +6742,33 @@ class InstallerTests(RepoCase):
                                 cwd=self.repo, text=True, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, env=self.fake_plugin_env())
         self.assertEqual(doctor.returncode, 0, doctor.stdout + doctor.stderr)
+        for relative in (
+            ".codex/practices/deslop.md",
+            ".codex/standards/structural-quality.md",
+            ".codex/licenses/Cursor-Team-Kit-MIT.txt",
+        ):
+            with self.subTest(tampered_runtime=relative):
+                managed = self.repo / relative
+                expected = managed.read_bytes()
+                managed.write_bytes(b"tampered\n")
+                doctor = subprocess.run(
+                    [str(self.repo / ".codex/bin/agent-team-doctor")],
+                    cwd=self.repo, text=True, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, env=self.fake_plugin_env(),
+                )
+                self.assertNotEqual(doctor.returncode, 0)
+                self.assertIn("integrity check failed", doctor.stdout)
+                managed.write_bytes(expected)
+        rubric_mode = self.repo / ".codex/standards/structural-quality.md"
+        rubric_mode.chmod(0o600)
+        doctor = subprocess.run(
+            [str(self.repo / ".codex/bin/agent-team-doctor")],
+            cwd=self.repo, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env=self.fake_plugin_env(),
+        )
+        self.assertNotEqual(doctor.returncode, 0)
+        self.assertIn("integrity check failed", doctor.stdout)
+        rubric_mode.chmod(0o644)
         # Doctor validates every schema, not only run-state.
         finding_schema = self.repo / ".codex/schemas/finding.schema.json"
         expected_schema = finding_schema.read_text(encoding="utf-8")
@@ -6968,22 +7211,22 @@ class PluginTests(RepoCase):
             manifest["version"].split("+", 1)[0],
             (PLUGIN / "VERSION").read_text(encoding="utf-8").strip(),
         )
-        self.assertRegex(manifest["version"], r"^0\.16\.0\+codex\.[0-9]+$")
+        self.assertRegex(manifest["version"], r"^0\.17\.0\+codex\.[0-9]+$")
 
         claude = json.loads((PLUGIN / ".claude-plugin/plugin.json").read_text())
         cursor = json.loads((PLUGIN / ".cursor-plugin/plugin.json").read_text())
         claude_marketplace = json.loads(
             (SOURCE / ".claude-plugin/marketplace.json").read_text()
         )
-        self.assertEqual(claude["version"], "0.16.0")
-        self.assertEqual(cursor["version"], "0.16.0")
+        self.assertEqual(claude["version"], "0.17.0")
+        self.assertEqual(cursor["version"], "0.17.0")
         self.assertEqual(cursor["skills"], "./skills/")
-        self.assertEqual(claude_marketplace["plugins"][0]["version"], "0.16.0")
+        self.assertEqual(claude_marketplace["plugins"][0]["version"], "0.17.0")
         self.assertEqual(
             claude_marketplace["plugins"][0]["source"], "./plugins/qteam"
         )
         self.assertIn(
-            'server_version = "QTeamWeb/0.16"',
+            'server_version = "QTeamWeb/0.17"',
             (PLUGIN / "bin/agent-team-web.py").read_text(encoding="utf-8"),
         )
 
@@ -7589,6 +7832,9 @@ class PluginTests(RepoCase):
                 autoresearch_license = ".codex/licenses/Autoresearch-MIT.txt"
                 experiment_schema = ".codex/schemas/experiment.schema.json"
                 previous_paths = {
+                    ".codex/practices/deslop.md",
+                    ".codex/standards/structural-quality.md",
+                    ".codex/licenses/Cursor-Team-Kit-MIT.txt",
                     ".codex/licenses/Diagram-Design-MIT.txt",
                     ".codex/licenses/Tabler-Icons-MIT.txt",
                     ".codex/licenses/Simple-Icons-CC0-1.0.txt",
@@ -7672,6 +7918,9 @@ class PluginTests(RepoCase):
         manifest_path = self.repo / ".codex/qteam-project.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         additions = {
+            ".codex/practices/deslop.md",
+            ".codex/standards/structural-quality.md",
+            ".codex/licenses/Cursor-Team-Kit-MIT.txt",
             ".codex/licenses/Diagram-Design-MIT.txt",
             ".codex/licenses/Tabler-Icons-MIT.txt",
             ".codex/licenses/Simple-Icons-CC0-1.0.txt",
@@ -7728,6 +7977,9 @@ class PluginTests(RepoCase):
         manifest_path = self.repo / ".codex/qteam-project.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         additions = {
+            ".codex/practices/deslop.md",
+            ".codex/standards/structural-quality.md",
+            ".codex/licenses/Cursor-Team-Kit-MIT.txt",
             ".codex/bin/agent-team-goal",
             ".codex/schemas/goal-status.schema.json",
             ".codex/licenses/Diagram-Design-MIT.txt",
@@ -7758,6 +8010,9 @@ class PluginTests(RepoCase):
         manifest_path = self.repo / ".codex/qteam-project.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         license_paths = {
+            ".codex/practices/deslop.md",
+            ".codex/standards/structural-quality.md",
+            ".codex/licenses/Cursor-Team-Kit-MIT.txt",
             ".codex/licenses/Diagram-Design-MIT.txt",
             ".codex/licenses/Tabler-Icons-MIT.txt",
             ".codex/licenses/Simple-Icons-CC0-1.0.txt",
@@ -7783,7 +8038,37 @@ class PluginTests(RepoCase):
         for license_path in license_paths:
             self.assertTrue((self.repo / license_path).is_file())
         current = json.loads(manifest_path.read_text(encoding="utf-8"))
-        self.assertEqual(current["version"], "0.16.0")
+        self.assertEqual(current["version"], "0.17.0")
+
+    def test_setup_upgrades_v016_runtime_with_quality_references(self):
+        self.run_tool(PROJECT_SETUP, str(self.repo), check=True)
+        manifest_path = self.repo / ".codex/qteam-project.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        additions = {
+            ".codex/practices/deslop.md",
+            ".codex/standards/structural-quality.md",
+            ".codex/licenses/Cursor-Team-Kit-MIT.txt",
+        }
+        manifest["installed_files"] = [
+            record for record in manifest["installed_files"]
+            if record["path"] not in additions
+        ]
+        for relative in additions:
+            (self.repo / relative).unlink()
+        manifest["version"] = "0.16.0"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        env, _state, _log = self.fake_codex_env()
+        upgraded = subprocess.run(
+            [str(QTEAM), "setup", str(self.repo)], cwd=SOURCE, env=env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(upgraded.returncode, 0,
+                         upgraded.stdout + upgraded.stderr)
+        for relative in additions:
+            self.assertTrue((self.repo / relative).is_file())
+        current = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(current["version"], "0.17.0")
 
     def test_uninstall_conflict_makes_no_plugin_or_marketplace_mutation(self):
         env, state, log = self.fake_codex_env()
