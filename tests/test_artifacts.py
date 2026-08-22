@@ -14,6 +14,7 @@ PLUGIN = SOURCE / "plugins/qteam"
 ARTIFACT = PLUGIN / "bin/agent_team_artifact.py"
 STATE = PLUGIN / "bin/agent-team-state.py"
 REVIEW = PLUGIN / "bin/agent-team-review.py"
+PROJECT_SETUP = PLUGIN / "scripts/project-setup.py"
 
 
 GOOD_SPEC = """<!-- qteam-artifact: spec-v1 -->
@@ -572,6 +573,835 @@ class EpicTests(ArtifactCase):
             (PLUGIN / "schemas/epic.schema.json").read_text(encoding="utf-8")
         )
         self.assertIn("allOf", schema["$defs"]["run"])
+
+
+class ProductCloseoutTests(ArtifactCase):
+    def complete_epic(self, epic_id="product", run_ids=("run-a", "run-b")):
+        if not (self.repo / ".codex/qteam-project.json").is_file():
+            self.tool(PROJECT_SETUP, str(self.repo), check=True)
+        base = self.git("rev-parse", "HEAD").stdout.strip()
+        self.artifact(
+            "epic-init", "--epic", epic_id, "--goal", "deliver product",
+            check=True,
+        )
+        plan = self.repo / f"{epic_id}-plan.json"
+        plan.write_text(json.dumps({
+            "contracts": [],
+            "runs": [
+                {
+                    "id": run_id, "title": f"ship product {run_id}",
+                    "spec": f"{run_id}.md", "depends_on": [], "contracts": [],
+                }
+                for run_id in run_ids
+            ],
+        }), encoding="utf-8")
+        self.artifact(
+            "epic-plan", "--epic", epic_id, "--file", str(plan), check=True,
+        )
+        release = None
+        for index, run_id in enumerate(run_ids):
+            started = self.tool(
+                STATE, "--run", run_id, "init", "--goal", f"ship {run_id}",
+                "--epic", epic_id, check=True,
+            )
+            state = json.loads(started.stdout)
+            if index == 0:
+                (self.repo / "product.txt").write_text(
+                    f"{epic_id} released\n", encoding="utf-8"
+                )
+                self.git("add", "product.txt")
+                self.git("commit", "-m", "release product")
+                release = self.git("rev-parse", "HEAD").stdout.strip()
+            state.update({"phase": "DONE", "finished": True,
+                          "finished_head": release})
+            state_path = self.repo / f".agents/runs/{run_id}/state.json"
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            self.artifact(
+                "epic-complete-run", "--epic", epic_id, "--run", run_id,
+                check=True,
+            )
+        return base, release
+
+    def write_draft(self, *, evidence_path="state.json", outcome_id="O1",
+                    run_id="run-a"):
+        draft = self.repo / "product-closeout-draft.json"
+        draft.write_text(json.dumps({
+            "summary": "The product shipped, but review found a reusable gap.",
+            "retrospectives": [
+                {
+                    "lens": "product-outcome",
+                    "reviewer": "product-review-session",
+                    "summary": "The release met its product acceptance boundary.",
+                    "evidence": [{"run": run_id, "path": "state.json"}],
+                    "validation_scope": "the delivered product outcome",
+                    "claim_boundary": "does not assess QTeam process behavior",
+                },
+                {
+                    "lens": "qteam-behavior",
+                    "reviewer": "qteam-review-session",
+                    "summary": "A reusable process gap caused late detection.",
+                    "evidence": [{"run": run_id, "path": "events.jsonl"}],
+                    "validation_scope": "the recorded QTeam delivery process",
+                    "claim_boundary": "does not assert product-domain correctness",
+                },
+            ],
+            "outcomes": [{
+                "id": outcome_id,
+                "title": "Late workflow defect",
+                "observation": "The defect was detected after implementation.",
+                "evidence": [{"run": run_id, "path": evidence_path}],
+                "validation_scope": "the completed run-a product delivery",
+                "claim_boundary": "does not establish behavior in unrelated domains",
+            }],
+            "improvements": [{
+                "id": "I1", "title": "Detect the defect before implementation",
+                "target": "skill", "outcomes": [outcome_id],
+                "proposal": "Teach the relevant QTeam skill to check the invariant.",
+                "success_criterion": "A held-out replay rejects the defective design.",
+                "status": "proposed",
+            }],
+            "prior_improvements": [],
+        }), encoding="utf-8")
+        return draft
+
+    def test_product_closeout_seals_evidence_and_exports_only_approved_changes(self):
+        _, release = self.complete_epic()
+        draft = self.write_draft()
+        sealed = self.artifact(
+            "product-closeout-seal", "--epic", "product",
+            "--release", release, "--file", str(draft),
+        )
+        self.assertEqual(sealed.returncode, 0, sealed.stderr)
+        closeout_path = Path(sealed.stdout.strip())
+        closeout = json.loads(closeout_path.read_text(encoding="utf-8"))
+        self.assertEqual(closeout["release_commit"], release)
+        self.assertEqual(closeout["qteam_runtime"]["version"], "0.18.0")
+        self.assertNotIn("source_path", closeout["qteam_runtime"])
+        self.assertEqual(
+            closeout["qteam_runtime"]["project_manifest"],
+            ".codex/qteam-project.json",
+        )
+        self.assertGreater(closeout["qteam_runtime"]["managed_files"], 0)
+        evidence = closeout["outcomes"][0]["evidence"][0]
+        self.assertRegex(evidence["sha256"], r"^[0-9a-f]{64}$")
+
+        pending = self.artifact("product-closeout-status", "--epic", "product")
+        self.assertEqual(pending.returncode, 0, pending.stderr)
+        self.assertEqual(json.loads(pending.stdout)["status"], "pending-decisions")
+        blocked = self.artifact("product-closeout-brief", "--epic", "product")
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn("pending", blocked.stderr)
+
+        approved = self.artifact(
+            "product-closeout-decision", "--epic", "product", "--item", "I1",
+            "--outcome", "approved", "--evidence",
+            "Coordinator confirmed the defect and replay criterion.",
+        )
+        self.assertEqual(approved.returncode, 0, approved.stderr)
+        status = self.artifact("product-closeout-status", "--epic", "product")
+        self.assertEqual(json.loads(status.stdout)["status"], "complete")
+        brief = self.artifact("product-closeout-brief", "--epic", "product")
+        self.assertEqual(brief.returncode, 0, brief.stderr)
+        payload = json.loads(brief.stdout)
+        self.assertEqual([item["id"] for item in payload["improvements"]], ["I1"])
+        self.assertEqual(payload["source"]["epic_id"], "product")
+        self.assertEqual(payload["source"]["release_commit"], release)
+
+    def test_product_closeout_requires_all_runs_and_release_ancestry(self):
+        base, _ = self.complete_epic("ancestry")
+        rejected = self.artifact(
+            "product-closeout-seal", "--epic", "ancestry", "--release", base,
+            "--file", str(self.write_draft()),
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("release commit", rejected.stderr)
+        self.assertFalse(
+            (self.repo / ".agents/epics/ancestry/product-closeout.json").exists()
+        )
+
+        self.artifact("epic-init", "--epic", "unfinished", "--goal", "unfinished")
+        plan = self.repo / "unfinished-plan.json"
+        plan.write_text(json.dumps({
+            "contracts": [],
+            "runs": [
+                {"id": "run-a", "title": "a", "spec": "a.md",
+                 "depends_on": [], "contracts": []},
+                {"id": "run-b", "title": "b", "spec": "b.md",
+                 "depends_on": [], "contracts": []},
+            ],
+        }), encoding="utf-8")
+        self.artifact(
+            "epic-plan", "--epic", "unfinished", "--file", str(plan), check=True,
+        )
+        unfinished = self.artifact(
+            "product-closeout-seal", "--epic", "unfinished", "--release", "HEAD",
+            "--file", str(self.write_draft()),
+        )
+        self.assertNotEqual(unfinished.returncode, 0)
+        self.assertIn("not durably done", unfinished.stderr.lower())
+
+    def test_product_closeout_rejects_single_run_epic(self):
+        _, release = self.complete_epic(
+            "single-run", run_ids=("run-a",)
+        )
+        rejected = self.artifact(
+            "product-closeout-seal", "--epic", "single-run",
+            "--release", release, "--file", str(self.write_draft()),
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("multiple runs", rejected.stderr)
+
+    def test_product_closeout_requires_independent_retrospective_passes(self):
+        _, release = self.complete_epic("independent-passes")
+        draft = self.write_draft()
+        payload = json.loads(draft.read_text(encoding="utf-8"))
+        payload["retrospectives"][1]["reviewer"] = (
+            payload["retrospectives"][0]["reviewer"]
+        )
+        draft.write_text(json.dumps(payload), encoding="utf-8")
+
+        rejected = self.artifact(
+            "product-closeout-seal", "--epic", "independent-passes",
+            "--release", release, "--file", str(draft),
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("independent retrospective", rejected.stderr)
+
+    def test_product_closeout_rejects_tampered_installed_runtime(self):
+        _, release = self.complete_epic("runtime-binding")
+        runtime = self.repo / ".codex/bin/agent_team_artifact.py"
+        runtime.write_text(
+            runtime.read_text(encoding="utf-8") + "\n", encoding="utf-8"
+        )
+
+        rejected = self.artifact(
+            "product-closeout-seal", "--epic", "runtime-binding",
+            "--release", release, "--file", str(self.write_draft()),
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertNotIn("Traceback", rejected.stderr)
+        self.assertIn("runtime", rejected.stderr.lower())
+
+    def test_product_closeout_check_detects_changed_run_evidence(self):
+        _, release = self.complete_epic("stale")
+        self.artifact(
+            "product-closeout-seal", "--epic", "stale", "--release", release,
+            "--file", str(self.write_draft()), check=True,
+        )
+        state_path = self.repo / ".agents/runs/run-a/state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["tampered"] = True
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        refused = self.artifact(
+            "product-closeout-decision", "--epic", "stale", "--item", "I1",
+            "--outcome", "approved", "--evidence",
+            "Stale evidence cannot support a coordinator decision.",
+        )
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("stale", refused.stderr)
+        closeout = json.loads(
+            (self.repo / ".agents/epics/stale/product-closeout.json")
+            .read_text(encoding="utf-8")
+        )
+        self.assertEqual(closeout["improvements"][0]["status"], "proposed")
+        stale = self.artifact("product-closeout-check", "--epic", "stale")
+        self.assertNotEqual(stale.returncode, 0)
+        report = json.loads(stale.stdout)
+        self.assertEqual(report["status"], "stale")
+        self.assertIn("state.json", report["stale"][0]["path"])
+
+    def test_product_closeout_check_detects_missing_decision_event(self):
+        _, release = self.complete_epic("decision-event")
+        self.artifact(
+            "product-closeout-seal", "--epic", "decision-event",
+            "--release", release, "--file", str(self.write_draft()),
+            check=True,
+        )
+        self.artifact(
+            "product-closeout-decision", "--epic", "decision-event",
+            "--item", "I1", "--outcome", "approved", "--evidence",
+            "Coordinator approved the held-out replay criterion.",
+            check=True,
+        )
+        events_path = (
+            self.repo / ".agents/epics/decision-event/"
+            "product-closeout-events.jsonl"
+        )
+        events = events_path.read_text(encoding="utf-8").splitlines()
+        events_path.write_text(events[0] + "\n", encoding="utf-8")
+
+        stale = self.artifact(
+            "product-closeout-check", "--epic", "decision-event"
+        )
+        self.assertNotEqual(stale.returncode, 0)
+        report = json.loads(stale.stdout)
+        self.assertEqual(report["status"], "stale")
+        self.assertIn("bound decision event", report["stale"][0]["reason"])
+
+    def test_product_closeout_rejects_duplicate_and_tampered_event_audit_fields(self):
+        _, release = self.complete_epic("event-audit")
+        self.artifact(
+            "product-closeout-seal", "--epic", "event-audit",
+            "--release", release, "--file", str(self.write_draft()),
+            check=True,
+        )
+        events_path = (
+            self.repo / ".agents/epics/event-audit/"
+            "product-closeout-events.jsonl"
+        )
+        original = events_path.read_text(encoding="utf-8")
+        events_path.write_text(original + original, encoding="utf-8")
+
+        duplicate = self.artifact(
+            "product-closeout-check", "--epic", "event-audit"
+        )
+        self.assertNotEqual(duplicate.returncode, 0)
+        self.assertNotIn("Traceback", duplicate.stderr)
+        self.assertIn("duplicate", duplicate.stderr)
+
+        event = json.loads(original)
+        event["txid"] = "c" * 32
+        event["recorded_at"] = "2026-08-22T01:02:03+00:00"
+        event["unexpected"] = "must not be accepted"
+        events_path.write_text(json.dumps(event) + "\n", encoding="utf-8")
+
+        tampered = self.artifact(
+            "product-closeout-check", "--epic", "event-audit"
+        )
+        self.assertNotEqual(tampered.returncode, 0)
+        self.assertNotIn("Traceback", tampered.stderr)
+        self.assertIn("transaction event", tampered.stderr)
+
+    def test_product_closeout_rejects_structurally_valid_unbound_event(self):
+        _, release = self.complete_epic("unbound-event")
+        self.artifact(
+            "product-closeout-seal", "--epic", "unbound-event",
+            "--release", release, "--file", str(self.write_draft()),
+            check=True,
+        )
+        self.artifact(
+            "product-closeout-decision", "--epic", "unbound-event",
+            "--item", "I1", "--outcome", "approved", "--evidence",
+            "Coordinator approved the held-out replay criterion.",
+            check=True,
+        )
+        events_path = (
+            self.repo / ".agents/epics/unbound-event/"
+            "product-closeout-events.jsonl"
+        )
+        ghost = {
+            "event": "product_improvement_decided",
+            "item": "ghost",
+            "outcome": "approved",
+            "evidence": "Structurally valid but not owned by the closeout.",
+            "item_sha256": "d" * 64,
+            "txid": "e" * 32,
+            "recorded_at": "2026-08-22T01:02:03+00:00",
+        }
+        with events_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(ghost) + "\n")
+
+        rejected = self.artifact(
+            "product-closeout-check", "--epic", "unbound-event"
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertNotIn("Traceback", rejected.stderr)
+        self.assertIn("unbound product closeout event", rejected.stderr)
+
+    def test_product_closeout_check_detects_changed_sealed_proposal(self):
+        _, release = self.complete_epic("sealed-proposal")
+        self.artifact(
+            "product-closeout-seal", "--epic", "sealed-proposal",
+            "--release", release, "--file", str(self.write_draft()),
+            check=True,
+        )
+        closeout_path = (
+            self.repo / ".agents/epics/sealed-proposal/product-closeout.json"
+        )
+        closeout = json.loads(closeout_path.read_text(encoding="utf-8"))
+        closeout["improvements"][0]["proposal"] = "A coherently edited proposal."
+        closeout_path.write_text(json.dumps(closeout), encoding="utf-8")
+
+        stale = self.artifact(
+            "product-closeout-check", "--epic", "sealed-proposal"
+        )
+        self.assertNotEqual(stale.returncode, 0)
+        report = json.loads(stale.stdout)
+        self.assertEqual(report["status"], "stale")
+        self.assertIn("sealed closeout event", report["stale"][0]["reason"])
+
+        refused = self.artifact(
+            "product-closeout-decision", "--epic", "sealed-proposal",
+            "--item", "I1", "--outcome", "approved", "--evidence",
+            "Coordinator evidence must not approve edited content.",
+        )
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("sealed closeout event", refused.stderr)
+
+    def test_product_closeout_rejects_symlinked_event_log_without_outside_write(self):
+        _, release = self.complete_epic("event-symlink")
+        epic_dir = self.repo / ".agents/epics/event-symlink"
+        outside = self.repo.parent / "outside-closeout-events"
+        outside.write_text("unchanged\n", encoding="utf-8")
+        (epic_dir / "product-closeout-events.jsonl").symlink_to(outside)
+
+        rejected = self.artifact(
+            "product-closeout-seal", "--epic", "event-symlink",
+            "--release", release, "--file", str(self.write_draft()),
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertNotIn("Traceback", rejected.stderr)
+        self.assertIn("symlink", rejected.stderr)
+        self.assertEqual(outside.read_text(encoding="utf-8"), "unchanged\n")
+        self.assertFalse((epic_dir / "product-closeout.json").exists())
+
+    def test_product_closeout_recovery_rejects_unbound_wal_before_overwrite(self):
+        _, release = self.complete_epic("unbound-wal")
+        self.artifact(
+            "product-closeout-seal", "--epic", "unbound-wal",
+            "--release", release, "--file", str(self.write_draft()),
+            check=True,
+        )
+        epic_dir = self.repo / ".agents/epics/unbound-wal"
+        closeout_path = epic_dir / "product-closeout.json"
+        original = closeout_path.read_text(encoding="utf-8")
+        replacement = json.loads(original)
+        replacement["summary"] = "A valid shape that was not a valid transition."
+        replacement["improvements"][0]["status"] = "approved"
+        replacement["improvements"][0]["decision"] = {
+            "authority": "coordinator",
+            "outcome": "approved",
+            "evidence": "A forged but structurally valid WAL decision.",
+            "decided_at": "2026-08-22T00:00:00+00:00",
+            "txid": "a" * 32,
+        }
+        item_sha256 = hashlib.sha256(json.dumps(
+            replacement["improvements"][0], sort_keys=True,
+            separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")).hexdigest()
+        intent = epic_dir / ".product-closeout.transaction.json"
+        intent.write_text(json.dumps({
+            "schema_version": 1,
+            "closeout": replacement,
+            "event": {
+                "event": "product_improvement_decided",
+                "item": "I1",
+                "outcome": "approved",
+                "evidence": "A forged but structurally valid WAL decision.",
+                "item_sha256": item_sha256,
+                "txid": "a" * 32,
+                "recorded_at": "2026-08-22T00:00:00+00:00",
+            },
+        }), encoding="utf-8")
+
+        rejected = self.artifact(
+            "product-closeout-status", "--epic", "unbound-wal"
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertNotIn("Traceback", rejected.stderr)
+        self.assertIn("transaction transition", rejected.stderr)
+        self.assertEqual(closeout_path.read_text(encoding="utf-8"), original)
+        self.assertTrue(intent.exists())
+
+    def test_product_closeout_recovery_preserves_wal_for_tampered_same_txid_event(self):
+        _, release = self.complete_epic("tampered-wal-event")
+        self.artifact(
+            "product-closeout-seal", "--epic", "tampered-wal-event",
+            "--release", release, "--file", str(self.write_draft()),
+            check=True,
+        )
+        epic_dir = self.repo / ".agents/epics/tampered-wal-event"
+        closeout_path = epic_dir / "product-closeout.json"
+        events_path = epic_dir / "product-closeout-events.jsonl"
+        closeout = json.loads(closeout_path.read_text(encoding="utf-8"))
+        event = json.loads(events_path.read_text(encoding="utf-8"))
+        intent = epic_dir / ".product-closeout.transaction.json"
+        intent.write_text(json.dumps({
+            "schema_version": 1, "closeout": closeout, "event": event,
+        }), encoding="utf-8")
+        event["unexpected"] = "must block recovery before any write"
+        events_path.write_text(json.dumps(event) + "\n", encoding="utf-8")
+        closeout_path.unlink()
+
+        rejected = self.artifact(
+            "product-closeout-status", "--epic", "tampered-wal-event"
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertNotIn("Traceback", rejected.stderr)
+        self.assertIn("transaction event", rejected.stderr)
+        self.assertFalse(closeout_path.exists())
+        self.assertTrue(intent.exists())
+
+    def test_product_closeout_recovery_rejects_epic_run_subset_wal(self):
+        _, release = self.complete_epic(
+            "subset-wal", run_ids=("run-a", "run-b", "run-c")
+        )
+        self.artifact(
+            "product-closeout-seal", "--epic", "subset-wal",
+            "--release", release, "--file", str(self.write_draft()),
+            check=True,
+        )
+        epic_dir = self.repo / ".agents/epics/subset-wal"
+        closeout_path = epic_dir / "product-closeout.json"
+        events_path = epic_dir / "product-closeout-events.jsonl"
+        closeout = json.loads(closeout_path.read_text(encoding="utf-8"))
+        closeout["runs"].pop("run-c")
+        sealed_view = {
+            key: value for key, value in closeout.items()
+            if key != "updated_at"
+        }
+        sealed_view["improvements"] = [
+            {
+                key: value for key, value in item.items()
+                if key not in {"status", "decision"}
+            }
+            for item in closeout["improvements"]
+        ]
+        sealed_sha256 = hashlib.sha256(json.dumps(
+            sealed_view, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")).hexdigest()
+        event = {
+            "event": "product_closeout_sealed",
+            "epic": "subset-wal",
+            "release_commit": release,
+            "sealed_sha256": sealed_sha256,
+            "txid": closeout["seal"]["txid"],
+            "recorded_at": closeout["seal"]["recorded_at"],
+        }
+        closeout_path.unlink()
+        events_path.unlink()
+        intent = epic_dir / ".product-closeout.transaction.json"
+        intent.write_text(json.dumps({
+            "schema_version": 1, "closeout": closeout, "event": event,
+        }), encoding="utf-8")
+
+        rejected = self.artifact(
+            "product-closeout-status", "--epic", "subset-wal"
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertNotIn("Traceback", rejected.stderr)
+        self.assertIn("epic binding", rejected.stderr)
+        self.assertFalse(closeout_path.exists())
+        self.assertTrue(intent.exists())
+
+    def test_product_closeout_recovery_fsyncs_after_removing_valid_wal(self):
+        _, release = self.complete_epic("valid-wal")
+        self.artifact(
+            "product-closeout-seal", "--epic", "valid-wal",
+            "--release", release, "--file", str(self.write_draft()),
+            check=True,
+        )
+        epic_dir = self.repo / ".agents/epics/valid-wal"
+        closeout = json.loads(
+            (epic_dir / "product-closeout.json").read_text(encoding="utf-8")
+        )
+        event = json.loads(
+            (epic_dir / "product-closeout-events.jsonl")
+            .read_text(encoding="utf-8").splitlines()[0]
+        )
+        intent = epic_dir / ".product-closeout.transaction.json"
+        intent.write_text(json.dumps({
+            "schema_version": 1, "closeout": closeout, "event": event,
+        }), encoding="utf-8")
+
+        spec = importlib.util.spec_from_file_location(
+            "product_closeout_recovery_test", ARTIFACT,
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        fsync_states = []
+        real_fsync = module.os.fsync
+
+        def recorded_fsync(descriptor):
+            fsync_states.append(intent.exists())
+            return real_fsync(descriptor)
+
+        module.os.fsync = recorded_fsync
+        try:
+            with module.locked_product_closeout(
+                    self.repo, "valid-wal") as (_directory, _path):
+                pass
+        finally:
+            module.os.fsync = real_fsync
+        self.assertFalse(intent.exists())
+        self.assertIn(False, fsync_states)
+
+    def test_product_closeout_recovers_valid_seal_wal_at_each_crash_point(self):
+        for crash_point in ("before-closeout", "before-event", "before-intent"):
+            with self.subTest(crash_point=crash_point):
+                epic_id = crash_point
+                run_ids = (f"{epic_id}-a", f"{epic_id}-b")
+                _, release = self.complete_epic(epic_id, run_ids=run_ids)
+                self.artifact(
+                    "product-closeout-seal", "--epic", epic_id,
+                    "--release", release, "--file",
+                    str(self.write_draft(run_id=run_ids[0])),
+                    check=True,
+                )
+                epic_dir = self.repo / f".agents/epics/{epic_id}"
+                closeout_path = epic_dir / "product-closeout.json"
+                events_path = epic_dir / "product-closeout-events.jsonl"
+                closeout = json.loads(
+                    closeout_path.read_text(encoding="utf-8")
+                )
+                event = json.loads(
+                    events_path.read_text(encoding="utf-8").splitlines()[0]
+                )
+                intent = epic_dir / ".product-closeout.transaction.json"
+                intent.write_text(json.dumps({
+                    "schema_version": 1,
+                    "closeout": closeout,
+                    "event": event,
+                }), encoding="utf-8")
+                if crash_point == "before-closeout":
+                    closeout_path.unlink()
+                    events_path.unlink()
+                elif crash_point == "before-event":
+                    events_path.unlink()
+
+                recovered = self.artifact(
+                    "product-closeout-status", "--epic", epic_id
+                )
+                self.assertEqual(recovered.returncode, 0, recovered.stderr)
+                self.assertEqual(
+                    json.loads(recovered.stdout)["status"],
+                    "pending-decisions",
+                )
+                self.assertTrue(closeout_path.is_file())
+                self.assertEqual(
+                    len(events_path.read_text(encoding="utf-8").splitlines()),
+                    1,
+                )
+                self.assertFalse(intent.exists())
+
+    def test_product_closeout_uses_one_validated_run_state_snapshot(self):
+        _, release = self.complete_epic("single-snapshot")
+        epic_path = self.repo / ".agents/epics/single-snapshot/epic.json"
+        manifest = json.loads(epic_path.read_text(encoding="utf-8"))
+        expected = manifest["runs"]["run-a"]["run_state_sha256"]
+        state_path = self.repo / ".agents/runs/run-a/state.json"
+
+        spec = importlib.util.spec_from_file_location(
+            "product_closeout_snapshot_test", ARTIFACT,
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        real_digest = module.file_sha256
+        real_regular_bytes = module.regular_bytes
+        replaced = False
+        digest_calls = 0
+        snapshot_reads = 0
+
+        def replace_after_validated_digest(path):
+            nonlocal digest_calls, replaced
+            if Path(path) == state_path:
+                digest_calls += 1
+            digest = real_digest(path)
+            if Path(path) == state_path and not replaced:
+                replaced = True
+                state_path.write_text(
+                    state_path.read_text(encoding="utf-8") + "\n",
+                    encoding="utf-8",
+                )
+            return digest
+
+        def count_snapshot_reads(path, label):
+            nonlocal snapshot_reads
+            if Path(path) == state_path:
+                snapshot_reads += 1
+            return real_regular_bytes(path, label)
+
+        module.file_sha256 = replace_after_validated_digest
+        module.regular_bytes = count_snapshot_reads
+        try:
+            snapshots = module._snapshot_product_runs(
+                self.repo, manifest, release
+            )
+        finally:
+            module.file_sha256 = real_digest
+            module.regular_bytes = real_regular_bytes
+        self.assertEqual(snapshot_reads, 1)
+        self.assertEqual(digest_calls, 0)
+        self.assertFalse(replaced)
+        self.assertEqual(snapshots["run-a"]["state_sha256"], expected)
+
+    def test_product_closeout_uses_one_validated_learning_snapshot(self):
+        _, release = self.complete_epic("learning-snapshot")
+        epic_path = self.repo / ".agents/epics/learning-snapshot/epic.json"
+        manifest = json.loads(epic_path.read_text(encoding="utf-8"))
+        learning_path = (
+            self.repo / ".agents/runs/run-a/learning-outbox/manifest.json"
+        )
+        learning_path.parent.mkdir(parents=True)
+        learning_bytes = json.dumps({
+            "schema_version": 1,
+            "run_id": "run-a",
+            "project": "product",
+            "items": [],
+        }).encode("utf-8")
+        learning_path.write_bytes(learning_bytes)
+        expected = hashlib.sha256(learning_bytes).hexdigest()
+
+        spec = importlib.util.spec_from_file_location(
+            "product_closeout_learning_snapshot_test", ARTIFACT,
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        real_digest = module.file_sha256
+        real_regular_bytes = module.regular_bytes
+        replaced = False
+        digest_calls = 0
+        snapshot_reads = 0
+
+        def replace_after_validated_digest(path):
+            nonlocal digest_calls, replaced
+            if Path(path) == learning_path:
+                digest_calls += 1
+            digest = real_digest(path)
+            if Path(path) == learning_path and not replaced:
+                replaced = True
+                learning_path.write_text(json.dumps({
+                    "schema_version": 1,
+                    "run_id": "run-a",
+                    "project": "product",
+                    "items": [{
+                        "id": "late-change",
+                        "title": "A later valid learning item",
+                        "category": "lesson",
+                        "status": "proposed",
+                    }],
+                }), encoding="utf-8")
+            return digest
+
+        def count_snapshot_reads(path, label):
+            nonlocal snapshot_reads
+            if Path(path) == learning_path:
+                snapshot_reads += 1
+            return real_regular_bytes(path, label)
+
+        module.file_sha256 = replace_after_validated_digest
+        module.regular_bytes = count_snapshot_reads
+        try:
+            snapshots = module._snapshot_product_runs(
+                self.repo, manifest, release
+            )
+        finally:
+            module.file_sha256 = real_digest
+            module.regular_bytes = real_regular_bytes
+        learning = snapshots["run-a"]["learning"]
+        self.assertEqual(snapshot_reads, 1)
+        self.assertEqual(digest_calls, 0)
+        self.assertFalse(replaced)
+        self.assertEqual(learning["sha256"], expected)
+        self.assertEqual(learning["items"], 0)
+
+    def test_product_closeout_rejects_invalid_learning_manifest(self):
+        _, release = self.complete_epic("invalid-learning")
+        learning_path = (
+            self.repo / ".agents/runs/run-a/learning-outbox/manifest.json"
+        )
+        learning_path.parent.mkdir(parents=True)
+        learning_path.write_text(json.dumps({"items": []}), encoding="utf-8")
+
+        rejected = self.artifact(
+            "product-closeout-seal", "--epic", "invalid-learning",
+            "--release", release, "--file", str(self.write_draft()),
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertNotIn("Traceback", rejected.stderr)
+        self.assertIn("learning manifest", rejected.stderr)
+
+        learning_path.write_text(json.dumps({
+            "schema_version": 1,
+            "run_id": "another-run",
+            "project": "product",
+            "items": [],
+        }), encoding="utf-8")
+        wrong_run = self.artifact(
+            "product-closeout-seal", "--epic", "invalid-learning",
+            "--release", release, "--file", str(self.write_draft()),
+        )
+        self.assertNotEqual(wrong_run.returncode, 0)
+        self.assertIn("run_id does not match", wrong_run.stderr)
+
+    def test_product_closeout_check_reports_directory_evidence_as_stale(self):
+        _, release = self.complete_epic("directory-evidence")
+        self.artifact(
+            "product-closeout-seal", "--epic", "directory-evidence",
+            "--release", release, "--file", str(self.write_draft()),
+            check=True,
+        )
+        state_path = self.repo / ".agents/runs/run-a/state.json"
+        state_path.unlink()
+        state_path.mkdir()
+
+        stale = self.artifact(
+            "product-closeout-check", "--epic", "directory-evidence"
+        )
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertNotIn("Traceback", stale.stderr)
+        report = json.loads(stale.stdout)
+        self.assertEqual(report["status"], "stale")
+        self.assertEqual(report["stale"][0]["path"],
+                         ".agents/runs/run-a/state.json")
+
+    def test_product_closeout_rejects_unsafe_or_unbound_draft_evidence(self):
+        _, release = self.complete_epic("unsafe")
+        unsafe = self.artifact(
+            "product-closeout-seal", "--epic", "unsafe", "--release", release,
+            "--file", str(self.write_draft(evidence_path="../state.json")),
+        )
+        self.assertNotEqual(unsafe.returncode, 0)
+        self.assertNotIn("Traceback", unsafe.stderr)
+        self.assertIn("evidence", unsafe.stderr)
+
+        unknown = self.write_draft(outcome_id="missing")
+        payload = json.loads(unknown.read_text(encoding="utf-8"))
+        payload["improvements"][0]["outcomes"] = ["O-does-not-exist"]
+        unknown.write_text(json.dumps(payload), encoding="utf-8")
+        rejected = self.artifact(
+            "product-closeout-seal", "--epic", "unsafe", "--release", release,
+            "--file", str(unknown),
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertNotIn("Traceback", rejected.stderr)
+        self.assertIn("unknown outcome", rejected.stderr)
+
+    def test_product_closeout_schema_exposes_the_runtime_contract(self):
+        schema_path = PLUGIN / "schemas/product-closeout.schema.json"
+        self.assertTrue(schema_path.is_file())
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["schema_version"]["const"], 1)
+        self.assertIn("improvements", schema["required"])
+        self.assertIn("retrospectives", schema["required"])
+        self.assertEqual(schema["properties"]["runs"]["minProperties"], 2)
+        self.assertEqual(
+            schema["properties"]["runs"]["propertyNames"],
+            {"$ref": "#/$defs/id"},
+        )
+        self.assertIn(
+            "/state\\.json$",
+            schema["$defs"]["run"]["properties"]["state_path"]["pattern"],
+        )
+        self.assertIn(
+            "project_manifest_sha256",
+            schema["$defs"]["qteam_runtime"]["required"],
+        )
+        self.assertEqual(
+            set(schema["$defs"]["improvement"]["properties"]["target"]["enum"]),
+            {"skill", "worker-prompt", "tool", "policy", "eval"},
+        )
+        status_rules = {
+            rule["if"]["properties"]["status"]["const"]: rule["then"]
+            for rule in schema["$defs"]["improvement"]["allOf"]
+        }
+        for outcome in ("approved", "rejected"):
+            self.assertEqual(
+                status_rules[outcome]["properties"]["decision"]
+                ["properties"]["outcome"]["const"],
+                outcome,
+            )
 
 
 class KnowledgeArtifactTests(ArtifactCase):

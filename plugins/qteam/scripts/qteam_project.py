@@ -25,15 +25,15 @@ SCHEMAS = (
     "artifact-lint", "code-index", "decision-gate", "diagnosis", "epic",
     "eval-case", "experiment", "experiment-verification", "finding", "goal-status", "handoff", "review-receipt", "review-result",
     "run-state", "scenario-coverage", "spec-drift", "task-policy", "task",
-    "project-policy", "quality-lane", "queue-item", "tdd-cycle", "trajectory",
-    "verification", "worker-result",
+    "product-closeout", "project-policy", "quality-lane", "queue-item",
+    "tdd-cycle", "trajectory", "verification", "worker-result",
 )
 UI_FILES = ("index.html", "app.js", "styles.css")
 PLUGIN_SKILLS = (
     "agent-team-dev", "brainstorming", "deslop", "diagram-creator", "domain-modeling",
     "goal-execution-discipline", "grill-me", "grill-with-docs", "grilling",
     "handoff", "isometric", "qteam-diagnose", "qteam-explore", "qteam-review", "qteam-router",
-    "qteam-goal", "qteam-harden", "qteam-tdd", "to-spec", "to-tickets",
+    "qteam-goal", "qteam-harden", "qteam-retrospect", "qteam-tdd", "to-spec", "to-tickets",
     "show-me", "thermo-nuclear-code-quality-review",
     "verification-before-completion", "wayfinder", "writing-plans",
 )
@@ -42,13 +42,13 @@ LEGACY_OWNED_PLUGIN_SKILLS = tuple(
     if name not in {
         "diagram-creator", "handoff", "qteam-explore", "qteam-goal",
         "qteam-harden", "show-me", "isometric", "deslop",
-        "thermo-nuclear-code-quality-review",
+        "qteam-retrospect", "thermo-nuclear-code-quality-review",
     }
 )
 LOCAL_SKILL_CONFLICTS = (
     "diagram-creator", "handoff", "qteam-explore", "qteam-goal",
     "qteam-harden", "show-me", "isometric", "deslop",
-    "thermo-nuclear-code-quality-review",
+    "qteam-retrospect", "thermo-nuclear-code-quality-review",
 )
 LEGACY_ORCHESTRATION_SKILLS = (
     "using-superpowers", "executing-plans", "subagent-driven-development",
@@ -99,8 +99,13 @@ MOVED_PATHS = frozenset(
     + [f".agents/skills/{name}" for name in LEGACY_ORCHESTRATION_SKILLS]
     + [".codex/bin/__pycache__"]
 )
-V016_INSTALLED_PATHS = frozenset(
+V017_INSTALLED_PATHS = frozenset(
     INSTALLED_PATHS - {
+        ".codex/schemas/product-closeout.schema.json",
+    }
+)
+V016_INSTALLED_PATHS = frozenset(
+    V017_INSTALLED_PATHS - {
         ".codex/practices/deslop.md",
         ".codex/standards/structural-quality.md",
         ".codex/licenses/Cursor-Team-Kit-MIT.txt",
@@ -370,6 +375,8 @@ def validate_manifest(root, manifest):
         supported_sets = (V013_INSTALLED_PATHS,)
     elif version_tuple < (0, 17, 0):
         supported_sets = (V016_INSTALLED_PATHS,)
+    elif version_tuple < (0, 18, 0):
+        supported_sets = (V017_INSTALLED_PATHS,)
     else:
         supported_sets = (INSTALLED_PATHS,)
     if installed_set not in supported_sets:

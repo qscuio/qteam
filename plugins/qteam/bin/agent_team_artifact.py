@@ -15,7 +15,7 @@ import tempfile
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 sys.dont_write_bytecode = True
@@ -202,6 +202,18 @@ def qteam_project_module():
     )
     if spec is None or spec.loader is None:
         raise ArtifactError("cannot load QTeam project manifest contract")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def qteam_eval_module():
+    module_path = Path(__file__).with_name("agent_team_eval.py")
+    spec = importlib.util.spec_from_file_location(
+        "qteam_learning_manifest_contract", module_path
+    )
+    if spec is None or spec.loader is None:
+        raise ArtifactError("cannot load QTeam learning manifest contract")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -1117,6 +1129,1231 @@ def cmd_epic_status(args, repo):
     print(json.dumps(payload, indent=2, sort_keys=True))
 
 
+PRODUCT_IMPROVEMENT_TARGETS = {
+    "skill", "worker-prompt", "tool", "policy", "eval",
+}
+PRODUCT_RETROSPECTIVE_LENSES = {
+    "product-outcome", "qteam-behavior",
+}
+PRIOR_IMPROVEMENT_RESULTS = {
+    "helped", "neutral", "regressed", "inconclusive",
+}
+
+
+def _single_line(value, label):
+    if (not isinstance(value, str) or not value.strip()
+            or "\n" in value or "\r" in value):
+        raise ArtifactError(f"{label} must be a non-empty single line")
+    return value.strip()
+
+
+def _product_closeout_paths(directory):
+    return (
+        safe_regular(directory / "product-closeout.json", "product closeout"),
+        safe_regular(
+            directory / "product-closeout-events.jsonl",
+            "product closeout event log",
+        ),
+        safe_regular(
+            directory / ".product-closeout.transaction.json",
+            "product closeout transaction",
+        ),
+    )
+
+
+def _sealed_product_closeout_sha256(closeout):
+    sealed = {
+        key: value for key, value in closeout.items() if key != "updated_at"
+    }
+    sealed["improvements"] = [
+        {
+            key: value for key, value in item.items()
+            if key not in {"status", "decision"}
+        }
+        for item in closeout["improvements"]
+    ]
+    return object_sha256(sealed)
+
+
+def _validate_sealed_evidence(value, run_ids, label):
+    if not isinstance(value, list) or not value:
+        raise ArtifactError(f"{label} needs evidence")
+    seen = set()
+    for reference in value:
+        if (not isinstance(reference, dict)
+                or set(reference) != {"run", "path", "sha256"}
+                or reference.get("run") not in run_ids
+                or not isinstance(reference.get("path"), str)
+                or not reference["path"]
+                or not re.fullmatch(r"[0-9a-f]{64}",
+                                    str(reference.get("sha256", "")))):
+            raise ArtifactError(f"invalid sealed evidence for {label}")
+        key = (reference["run"], reference["path"])
+        if key in seen:
+            raise ArtifactError(f"duplicate sealed evidence for {label}")
+        seen.add(key)
+
+
+def validate_product_closeout(closeout, epic_id=None):
+    top_level = {
+        "schema_version", "epic_id", "goal", "release_commit",
+        "qteam_runtime", "epic", "runs", "seal", "summary", "outcomes",
+        "retrospectives", "improvements", "prior_improvements",
+        "created_at", "updated_at",
+    }
+    if not isinstance(closeout, dict) or set(closeout) != top_level:
+        raise ArtifactError("product closeout has unknown or missing fields")
+    if closeout.get("schema_version") != 1:
+        raise ArtifactError("unsupported product closeout schema")
+    actual_id = safe_identifier(closeout.get("epic_id"), "epic id")
+    if epic_id is not None and actual_id != epic_id:
+        raise ArtifactError("product closeout epic identity mismatch")
+    if (not isinstance(closeout.get("goal"), str) or not closeout["goal"].strip()
+            or not HEX_OBJECT.fullmatch(str(closeout.get("release_commit", "")))
+            or not isinstance(closeout.get("summary"), str)
+            or not closeout["summary"].strip()):
+        raise ArtifactError("product closeout identity or summary is invalid")
+    if (not isinstance(closeout.get("created_at"), str)
+            or not closeout["created_at"]
+            or not isinstance(closeout.get("updated_at"), str)
+            or not closeout["updated_at"]):
+        raise ArtifactError("product closeout timestamps are invalid")
+    seal = closeout.get("seal")
+    if (not isinstance(seal, dict)
+            or set(seal) != {"txid", "recorded_at"}
+            or not re.fullmatch(r"[0-9a-f]{32}", str(seal.get("txid", "")))
+            or seal.get("recorded_at") != closeout["created_at"]):
+        raise ArtifactError("product closeout seal identity is invalid")
+
+    runtime = closeout.get("qteam_runtime")
+    if (not isinstance(runtime, dict)
+            or set(runtime) != {
+                "version", "source_commit", "marker_sha256",
+                "project_manifest", "project_manifest_sha256",
+                "managed_files", "managed_files_sha256", "config_sha256",
+            }
+            or not isinstance(runtime.get("version"), str)
+            or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", runtime["version"])
+            or not isinstance(runtime.get("source_commit"), str)
+            or not re.fullmatch(r"[0-9a-f]{7,64}", runtime["source_commit"])
+            or runtime.get("project_manifest") != ".codex/qteam-project.json"
+            or not isinstance(runtime.get("managed_files"), int)
+            or isinstance(runtime.get("managed_files"), bool)
+            or runtime["managed_files"] < 1
+            or any(not re.fullmatch(r"[0-9a-f]{64}", str(runtime.get(field, "")))
+                   for field in (
+                       "marker_sha256", "project_manifest_sha256",
+                       "managed_files_sha256", "config_sha256",
+                   ))):
+        raise ArtifactError("product closeout QTeam runtime identity is invalid")
+
+    epic = closeout.get("epic")
+    if (not isinstance(epic, dict)
+            or set(epic) != {"manifest", "manifest_sha256", "revision"}
+            or epic.get("manifest") != f".agents/epics/{actual_id}/epic.json"
+            or not re.fullmatch(r"[0-9a-f]{64}",
+                                str(epic.get("manifest_sha256", "")))
+            or not isinstance(epic.get("revision"), int)
+            or isinstance(epic.get("revision"), bool)
+            or epic["revision"] < 1):
+        raise ArtifactError("product closeout epic binding is invalid")
+
+    runs = closeout.get("runs")
+    if not isinstance(runs, dict) or len(runs) < 2:
+        raise ArtifactError("product closeout needs multiple completed runs")
+    run_ids = set(runs)
+    for run_id, record in runs.items():
+        safe_identifier(run_id, "run id")
+        required = {
+            "id", "title", "finished_head", "state_path", "state_sha256",
+            "events_path", "events_sha256", "learning",
+        }
+        if (not isinstance(record, dict) or set(record) != required
+                or record.get("id") != run_id
+                or not isinstance(record.get("title"), str)
+                or not record["title"].strip()
+                or not HEX_OBJECT.fullmatch(str(record.get("finished_head", "")))
+                or record.get("state_path") != f".agents/runs/{run_id}/state.json"
+                or record.get("events_path") != f".agents/runs/{run_id}/events.jsonl"
+                or any(not re.fullmatch(r"[0-9a-f]{64}", str(record.get(field, "")))
+                       for field in ("state_sha256", "events_sha256"))):
+            raise ArtifactError(f"invalid product closeout run binding {run_id}")
+        learning = record.get("learning")
+        if learning is not None and (
+                not isinstance(learning, dict)
+                or set(learning) != {"path", "sha256", "items", "statuses"}
+                or learning.get("path")
+                != f".agents/runs/{run_id}/learning-outbox/manifest.json"
+                or not re.fullmatch(r"[0-9a-f]{64}",
+                                    str(learning.get("sha256", "")))
+                or not isinstance(learning.get("items"), int)
+                or isinstance(learning.get("items"), bool)
+                or learning["items"] < 0
+                or not isinstance(learning.get("statuses"), dict)
+                or any(not isinstance(key, str) or not isinstance(count, int)
+                       or isinstance(count, bool) or count < 0
+                       for key, count in learning.get("statuses", {}).items())):
+            raise ArtifactError(f"invalid product closeout learning binding {run_id}")
+
+    retrospectives = closeout.get("retrospectives")
+    if not isinstance(retrospectives, list) or len(retrospectives) != 2:
+        raise ArtifactError("product closeout needs two retrospective passes")
+    lenses = set()
+    reviewers = set()
+    for retrospective in retrospectives:
+        required = {
+            "lens", "reviewer", "summary", "evidence", "validation_scope",
+            "claim_boundary",
+        }
+        if not isinstance(retrospective, dict) or set(retrospective) != required:
+            raise ArtifactError("invalid product retrospective pass")
+        lens = retrospective.get("lens")
+        if lens not in PRODUCT_RETROSPECTIVE_LENSES or lens in lenses:
+            raise ArtifactError("product retrospective lenses must be distinct")
+        lenses.add(lens)
+        reviewer = _single_line(
+            retrospective.get("reviewer"), f"{lens} retrospective reviewer"
+        )
+        if reviewer in reviewers:
+            raise ArtifactError("product closeout needs independent retrospective reviewers")
+        reviewers.add(reviewer)
+        if (not isinstance(retrospective.get("summary"), str)
+                or not retrospective["summary"].strip()):
+            raise ArtifactError(f"{lens} retrospective needs a summary")
+        _single_line(
+            retrospective.get("validation_scope"),
+            f"{lens} retrospective validation scope",
+        )
+        _single_line(
+            retrospective.get("claim_boundary"),
+            f"{lens} retrospective claim boundary",
+        )
+        _validate_sealed_evidence(
+            retrospective.get("evidence"), run_ids,
+            f"{lens} retrospective",
+        )
+    if lenses != PRODUCT_RETROSPECTIVE_LENSES:
+        raise ArtifactError("product closeout needs both retrospective lenses")
+
+    outcomes = closeout.get("outcomes")
+    if not isinstance(outcomes, list) or not outcomes:
+        raise ArtifactError("product closeout needs at least one outcome")
+    outcome_ids = set()
+    for outcome in outcomes:
+        required = {
+            "id", "title", "observation", "evidence", "validation_scope",
+            "claim_boundary",
+        }
+        if not isinstance(outcome, dict) or set(outcome) != required:
+            raise ArtifactError("invalid product closeout outcome")
+        outcome_id = safe_identifier(outcome.get("id"), "outcome id")
+        if outcome_id in outcome_ids:
+            raise ArtifactError("duplicate product closeout outcome id")
+        outcome_ids.add(outcome_id)
+        for field in ("title", "observation"):
+            if not isinstance(outcome.get(field), str) or not outcome[field].strip():
+                raise ArtifactError(f"outcome {outcome_id} needs {field}")
+        _single_line(outcome.get("validation_scope"),
+                     f"outcome {outcome_id} validation scope")
+        _single_line(outcome.get("claim_boundary"),
+                     f"outcome {outcome_id} claim boundary")
+        _validate_sealed_evidence(outcome.get("evidence"), run_ids,
+                                  f"outcome {outcome_id}")
+
+    improvements = closeout.get("improvements")
+    if not isinstance(improvements, list):
+        raise ArtifactError("product closeout improvements must be an array")
+    improvement_ids = set()
+    for item in improvements:
+        base_fields = {
+            "id", "title", "target", "outcomes", "proposal",
+            "success_criterion", "status",
+        }
+        if not isinstance(item, dict):
+            raise ArtifactError("invalid product improvement proposal")
+        status = item.get("status")
+        expected = base_fields if status == "proposed" else base_fields | {"decision"}
+        if status not in {"proposed", "approved", "rejected"} or set(item) != expected:
+            raise ArtifactError("invalid product improvement proposal state")
+        item_id = safe_identifier(item.get("id"), "improvement id")
+        if item_id in improvement_ids:
+            raise ArtifactError("duplicate product improvement proposal id")
+        improvement_ids.add(item_id)
+        if (not isinstance(item.get("title"), str) or not item["title"].strip()
+                or item.get("target") not in PRODUCT_IMPROVEMENT_TARGETS
+                or not isinstance(item.get("proposal"), str)
+                or not item["proposal"].strip()
+                or not isinstance(item.get("success_criterion"), str)
+                or not item["success_criterion"].strip()):
+            raise ArtifactError(f"invalid product improvement proposal {item_id}")
+        linked = unique_strings(
+            item.get("outcomes"), f"improvement {item_id} outcomes"
+        )
+        unknown = sorted(set(linked) - outcome_ids)
+        if unknown:
+            raise ArtifactError(
+                f"improvement {item_id} references unknown outcome: "
+                + ", ".join(unknown)
+            )
+        if not linked:
+            raise ArtifactError(f"improvement {item_id} needs an outcome")
+        if status != "proposed":
+            decision = item.get("decision")
+            if (not isinstance(decision, dict)
+                    or set(decision) != {
+                        "authority", "outcome", "evidence", "decided_at",
+                        "txid",
+                    }
+                    or decision.get("authority") != "coordinator"
+                    or decision.get("outcome") != status
+                    or not re.fullmatch(
+                        r"[0-9a-f]{32}", str(decision.get("txid", ""))
+                    )
+                    or not isinstance(decision.get("decided_at"), str)
+                    or not decision["decided_at"]):
+                raise ArtifactError(f"invalid decision for improvement {item_id}")
+            _single_line(
+                decision.get("evidence"),
+                f"improvement {item_id} decision evidence",
+            )
+
+    prior = closeout.get("prior_improvements")
+    if not isinstance(prior, list):
+        raise ArtifactError("prior improvement assessments must be an array")
+    prior_ids = set()
+    for assessment in prior:
+        required = {
+            "id", "origin", "qteam_version", "result", "observation",
+            "evidence", "validation_scope", "claim_boundary",
+        }
+        if not isinstance(assessment, dict) or set(assessment) != required:
+            raise ArtifactError("invalid prior improvement assessment")
+        assessment_id = safe_identifier(assessment.get("id"), "assessment id")
+        if assessment_id in prior_ids:
+            raise ArtifactError("duplicate prior improvement assessment id")
+        prior_ids.add(assessment_id)
+        if (not isinstance(assessment.get("origin"), str)
+                or not assessment["origin"].strip()
+                or not isinstance(assessment.get("qteam_version"), str)
+                or not assessment["qteam_version"].strip()
+                or assessment.get("result") not in PRIOR_IMPROVEMENT_RESULTS
+                or not isinstance(assessment.get("observation"), str)
+                or not assessment["observation"].strip()):
+            raise ArtifactError(
+                f"invalid prior improvement assessment {assessment_id}"
+            )
+        _single_line(assessment.get("validation_scope"),
+                     f"assessment {assessment_id} validation scope")
+        _single_line(assessment.get("claim_boundary"),
+                     f"assessment {assessment_id} claim boundary")
+        _validate_sealed_evidence(assessment.get("evidence"), run_ids,
+                                  f"assessment {assessment_id}")
+    return closeout
+
+
+def _validate_product_closeout_epic_manifest(closeout, manifest, manifest_sha256):
+    if (manifest_sha256 != closeout["epic"]["manifest_sha256"]
+            or manifest["goal"] != closeout["goal"]
+            or manifest["revision"] != closeout["epic"]["revision"]
+            or set(manifest["runs"]) != set(closeout["runs"])):
+        raise ArtifactError("product closeout epic binding is invalid")
+    for run_id, epic_run in manifest["runs"].items():
+        closeout_run = closeout["runs"][run_id]
+        if (epic_run["status"] != "done"
+                or closeout_run["title"] != epic_run["title"]
+                or closeout_run["finished_head"] != epic_run["finished_head"]
+                or closeout_run["state_sha256"]
+                != epic_run["run_state_sha256"]):
+            raise ArtifactError("product closeout epic binding is invalid")
+
+
+def _validate_product_closeout_epic_binding(directory, closeout):
+    epic_path = safe_regular(
+        directory / "epic.json", "epic manifest", required=True
+    )
+    manifest, manifest_sha256 = _product_json_snapshot(
+        epic_path, "epic manifest"
+    )
+    manifest = validate_epic_manifest(manifest, closeout["epic_id"])
+    _validate_product_closeout_epic_manifest(
+        closeout, manifest, manifest_sha256
+    )
+
+
+def _validate_product_closeout_event_shape(event):
+    common = {"event", "txid", "recorded_at"}
+    if (not isinstance(event, dict)
+            or not isinstance(event.get("txid"), str)
+            or not re.fullmatch(r"[0-9a-f]{32}", event["txid"])
+            or not isinstance(event.get("recorded_at"), str)
+            or not event["recorded_at"]):
+        raise ArtifactError("invalid product closeout transaction event")
+    if event.get("event") == "product_closeout_sealed":
+        expected = common | {
+            "epic", "release_commit", "sealed_sha256",
+        }
+        if (set(event) != expected
+                or not isinstance(event.get("epic"), str)
+                or not HEX_OBJECT.fullmatch(
+                    str(event.get("release_commit", ""))
+                )
+                or not re.fullmatch(
+                    r"[0-9a-f]{64}", str(event.get("sealed_sha256", ""))
+                )):
+            raise ArtifactError("invalid product closeout transaction event")
+        return
+    if event.get("event") == "product_improvement_decided":
+        expected = common | {
+            "item", "outcome", "evidence", "item_sha256",
+        }
+        if (set(event) != expected
+                or not isinstance(event.get("item"), str)
+                or event.get("outcome") not in {"approved", "rejected"}
+                or not isinstance(event.get("evidence"), str)
+                or not event["evidence"].strip()
+                or not re.fullmatch(
+                    r"[0-9a-f]{64}", str(event.get("item_sha256", ""))
+                )):
+            raise ArtifactError("invalid product closeout transaction event")
+        return
+    raise ArtifactError("invalid product closeout transaction event")
+
+
+def _validate_product_closeout_transaction_event(closeout, event):
+    _validate_product_closeout_event_shape(event)
+    if event["event"] == "product_closeout_sealed":
+        if (event.get("epic") != closeout["epic_id"]
+                or event.get("release_commit") != closeout["release_commit"]
+                or event.get("txid") != closeout["seal"]["txid"]
+                or event.get("recorded_at")
+                != closeout["seal"]["recorded_at"]
+                or event.get("sealed_sha256")
+                != _sealed_product_closeout_sha256(closeout)):
+            raise ArtifactError("invalid product closeout transaction event")
+        return
+    if event["event"] == "product_improvement_decided":
+        matches = [
+            item for item in closeout["improvements"]
+            if item["id"] == event.get("item")
+        ]
+        if (len(matches) != 1
+                or matches[0]["status"] != event["outcome"]
+                or matches[0]["decision"]["evidence"] != event.get("evidence")
+                or matches[0]["decision"]["txid"] != event.get("txid")
+                or matches[0]["decision"]["decided_at"]
+                != event.get("recorded_at")
+                or object_sha256(matches[0]) != event.get("item_sha256")):
+            raise ArtifactError("invalid product closeout transaction event")
+        return
+
+
+def _validate_product_closeout_stored_event_identity(closeout, event):
+    if event["event"] == "product_closeout_sealed":
+        if (event["epic"] != closeout["epic_id"]
+                or event["release_commit"] != closeout["release_commit"]
+                or event["txid"] != closeout["seal"]["txid"]
+                or event["recorded_at"]
+                != closeout["seal"]["recorded_at"]):
+            raise ArtifactError("unbound product closeout event")
+        return
+    matches = [
+        item for item in closeout["improvements"]
+        if item["id"] == event["item"]
+        and item["status"] in {"approved", "rejected"}
+        and item["decision"]["txid"] == event["txid"]
+        and item["decision"]["decided_at"] == event["recorded_at"]
+    ]
+    if len(matches) != 1:
+        raise ArtifactError("unbound product closeout event")
+
+
+def _validate_product_closeout_transaction_transition(
+        closeout_path, closeout, event):
+    if not closeout_path.exists():
+        if event["event"] != "product_closeout_sealed":
+            raise ArtifactError("invalid product closeout transaction transition")
+        return
+    current = validate_product_closeout(
+        read_json(closeout_path), closeout["epic_id"]
+    )
+    if current == closeout:
+        return
+    if event["event"] != "product_improvement_decided":
+        raise ArtifactError("invalid product closeout transaction transition")
+    expected = json.loads(json.dumps(current))
+    matches = [
+        item for item in expected["improvements"]
+        if item["id"] == event["item"]
+    ]
+    target = [
+        item for item in closeout["improvements"]
+        if item["id"] == event["item"]
+    ]
+    if (len(matches) != 1 or len(target) != 1
+            or matches[0]["status"] != "proposed"):
+        raise ArtifactError("invalid product closeout transaction transition")
+    matches[0]["status"] = target[0]["status"]
+    matches[0]["decision"] = target[0]["decision"]
+    expected["updated_at"] = closeout["updated_at"]
+    if expected != closeout:
+        raise ArtifactError("invalid product closeout transaction transition")
+
+
+def _apply_product_closeout_transaction(directory, transaction):
+    if (not isinstance(transaction, dict)
+            or set(transaction) != {"schema_version", "closeout", "event"}
+            or transaction.get("schema_version") != 1
+            or not isinstance(transaction.get("closeout"), dict)
+            or not isinstance(transaction.get("event"), dict)):
+        raise ArtifactError("invalid product closeout transaction")
+    closeout = validate_product_closeout(transaction["closeout"], directory.name)
+    _validate_product_closeout_epic_binding(directory, closeout)
+    event = transaction["event"]
+    _validate_product_closeout_transaction_event(closeout, event)
+    closeout_path, events_path, _ = _product_closeout_paths(directory)
+    _validate_product_closeout_transaction_transition(
+        closeout_path, closeout, event
+    )
+    existing_events = []
+    if events_path.exists():
+        existing_events = _product_closeout_events(events_path, closeout)
+    matching_events = [
+        existing for existing in existing_events
+        if existing["txid"] == event["txid"]
+    ]
+    if matching_events and matching_events != [event]:
+        raise ArtifactError(
+            "product closeout transaction event does not match event log"
+        )
+    atomic_json(closeout_path, closeout)
+    if not matching_events:
+        _append_event(events_path, event)
+
+
+def _finish_product_closeout_transaction(directory, intent):
+    intent.unlink()
+    directory_fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+@contextmanager
+def locked_product_closeout(repo, epic_id):
+    directory = epic_dir(repo, epic_id)
+    if not directory.is_dir() or directory.is_symlink():
+        raise ArtifactError(f"missing or unsafe epic: {epic_id}")
+    safe_regular(directory / "epic.json", "epic manifest", required=True)
+    lock_path = safe_regular(
+        directory / ".product-closeout.lock", "product closeout lock"
+    )
+    with locked_regular(lock_path, "product closeout lock"):
+        closeout_path, events_path, intent = _product_closeout_paths(directory)
+        _events_contain(events_path, "")
+        if intent.exists():
+            transaction = read_json(intent)
+            _apply_product_closeout_transaction(directory, transaction)
+            _finish_product_closeout_transaction(directory, intent)
+        yield directory, closeout_path
+
+
+def commit_product_closeout(directory, closeout, event):
+    if event.get("event") == "product_closeout_sealed":
+        identity = closeout["seal"]
+    else:
+        matches = [
+            item for item in closeout["improvements"]
+            if item["id"] == event.get("item")
+        ]
+        if len(matches) != 1 or "decision" not in matches[0]:
+            raise ArtifactError("product closeout event has no decision identity")
+        identity = {
+            "txid": matches[0]["decision"]["txid"],
+            "recorded_at": matches[0]["decision"]["decided_at"],
+        }
+    event = {**event, **identity}
+    transaction = {
+        "schema_version": 1, "closeout": closeout, "event": event,
+    }
+    _, _, intent = _product_closeout_paths(directory)
+    atomic_json(intent, transaction)
+    _apply_product_closeout_transaction(directory, transaction)
+    _finish_product_closeout_transaction(directory, intent)
+
+
+def _qteam_runtime_identity(repo):
+    marker = repo_path(repo, ".codex/agent-team-template.version")
+    values = {}
+    try:
+        marker_data, marker_sha256 = _product_bytes_snapshot(
+            marker, "QTeam runtime marker"
+        )
+        lines = marker_data.decode("utf-8").splitlines()
+    except UnicodeError as exc:
+        raise ArtifactError(f"invalid QTeam runtime marker: {exc}")
+    for line in lines:
+        if ": " not in line:
+            raise ArtifactError("invalid QTeam runtime marker")
+        key, value = line.split(": ", 1)
+        if key in values:
+            raise ArtifactError("duplicate QTeam runtime marker field")
+        values[key] = value
+    version = values.get("qteam-plugin-version")
+    source_commit = values.get("source-commit")
+    if (not isinstance(version, str)
+            or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version)
+            or not isinstance(source_commit, str)
+            or not re.fullmatch(r"[0-9a-f]{7,64}", source_commit)):
+        raise ArtifactError("QTeam runtime marker lacks version/source commit")
+    manifest_path = repo_path(repo, ".codex/qteam-project.json")
+    manifest, manifest_sha256 = _product_json_snapshot(
+        manifest_path, "QTeam project manifest"
+    )
+    try:
+        module = qteam_project_module()
+        records = module.verify_installed_files(repo, manifest)
+    except (OSError, ValueError, KeyError) as exc:
+        raise ArtifactError(f"QTeam managed runtime is invalid: {exc}")
+    if manifest.get("version") != version:
+        raise ArtifactError("QTeam runtime marker and project manifest disagree")
+    marker_record = records.get(".codex/agent-team-template.version")
+    if marker_record is None or marker_record.get("sha256") != marker_sha256:
+        raise ArtifactError("QTeam runtime marker is not manifest-bound")
+    managed = [
+        {
+            "path": path, "sha256": record["sha256"],
+            "mode": record.get("mode"),
+        }
+        for path, record in sorted(records.items())
+    ]
+    config_path = repo_path(repo, ".codex/config.toml")
+    _, config_sha256 = _product_bytes_snapshot(
+        config_path, "QTeam runtime configuration"
+    )
+    return {
+        "version": version, "source_commit": source_commit,
+        "marker_sha256": marker_sha256,
+        "project_manifest": ".codex/qteam-project.json",
+        "project_manifest_sha256": manifest_sha256,
+        "managed_files": len(managed),
+        "managed_files_sha256": object_sha256(managed),
+        "config_sha256": config_sha256,
+    }
+
+
+def _product_bytes_snapshot(path, label):
+    data = regular_bytes(path, label)
+    return data, hashlib.sha256(data).hexdigest()
+
+
+def _product_json_snapshot(path, label):
+    data, digest = _product_bytes_snapshot(path, label)
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ArtifactError(f"invalid {label}: {exc}")
+    if not isinstance(value, dict):
+        raise ArtifactError(f"{label} must be an object")
+    return value, digest
+
+
+def _validate_product_event_snapshot(data, path):
+    try:
+        lines = data.decode("utf-8").splitlines()
+        for line in lines:
+            if line and not isinstance(json.loads(line), dict):
+                raise ArtifactError(f"event log entry must be an object: {path}")
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ArtifactError(f"invalid event log {path}: {exc}")
+
+
+def _seal_product_evidence(repo, run_ids, references, label):
+    if not isinstance(references, list) or not references:
+        raise ArtifactError(f"{label} needs evidence")
+    sealed = []
+    seen = set()
+    for reference in references:
+        if (not isinstance(reference, dict)
+                or set(reference) != {"run", "path"}
+                or reference.get("run") not in run_ids):
+            raise ArtifactError(f"invalid evidence reference for {label}")
+        raw = reference.get("path")
+        if not isinstance(raw, str) or not raw or "\\" in raw:
+            raise ArtifactError(f"invalid evidence path for {label}")
+        relative = PurePosixPath(raw)
+        if (relative.is_absolute() or any(part in {"", ".", ".."}
+                                         for part in relative.parts)
+                or relative.as_posix() != raw):
+            raise ArtifactError(f"unsafe evidence path for {label}")
+        key = (reference["run"], raw)
+        if key in seen:
+            raise ArtifactError(f"duplicate evidence reference for {label}")
+        seen.add(key)
+        repository_relative = (
+            Path(".agents") / "runs" / reference["run"] / Path(*relative.parts)
+        )
+        path = repo_path(repo, repository_relative)
+        _, digest = _product_bytes_snapshot(path, f"{label} evidence")
+        sealed.append({
+            "run": reference["run"], "path": raw,
+            "sha256": digest,
+        })
+    return sealed
+
+
+def _normalize_product_closeout_draft(repo, draft, run_ids):
+    expected = {
+        "summary", "retrospectives", "outcomes", "improvements",
+        "prior_improvements",
+    }
+    if not isinstance(draft, dict) or set(draft) != expected:
+        actual = set(draft) if isinstance(draft, dict) else set()
+        raise ArtifactError(
+            "product closeout draft has unknown or missing fields: "
+            f"unknown={sorted(actual - expected)}, "
+            f"missing={sorted(expected - actual)}"
+        )
+    if not isinstance(draft.get("summary"), str) or not draft["summary"].strip():
+        raise ArtifactError("product closeout draft needs a summary")
+    retrospectives = draft.get("retrospectives")
+    if not isinstance(retrospectives, list) or len(retrospectives) != 2:
+        raise ArtifactError("product closeout needs two retrospective passes")
+    normalized_retrospectives = []
+    lenses = set()
+    reviewers = set()
+    for retrospective in retrospectives:
+        required = {
+            "lens", "reviewer", "summary", "evidence", "validation_scope",
+            "claim_boundary",
+        }
+        if not isinstance(retrospective, dict) or set(retrospective) != required:
+            raise ArtifactError("invalid product retrospective pass")
+        lens = retrospective.get("lens")
+        if lens not in PRODUCT_RETROSPECTIVE_LENSES or lens in lenses:
+            raise ArtifactError("product retrospective lenses must be distinct")
+        lenses.add(lens)
+        reviewer = _single_line(
+            retrospective.get("reviewer"), f"{lens} retrospective reviewer"
+        )
+        if reviewer in reviewers:
+            raise ArtifactError("product closeout needs independent retrospective reviewers")
+        reviewers.add(reviewer)
+        if (not isinstance(retrospective.get("summary"), str)
+                or not retrospective["summary"].strip()):
+            raise ArtifactError(f"{lens} retrospective needs a summary")
+        normalized_retrospectives.append({
+            "lens": lens, "reviewer": reviewer,
+            "summary": retrospective["summary"].strip(),
+            "evidence": _seal_product_evidence(
+                repo, run_ids, retrospective["evidence"],
+                f"{lens} retrospective",
+            ),
+            "validation_scope": _single_line(
+                retrospective["validation_scope"],
+                f"{lens} retrospective validation scope",
+            ),
+            "claim_boundary": _single_line(
+                retrospective["claim_boundary"],
+                f"{lens} retrospective claim boundary",
+            ),
+        })
+    if lenses != PRODUCT_RETROSPECTIVE_LENSES:
+        raise ArtifactError("product closeout needs both retrospective lenses")
+    outcomes = draft.get("outcomes")
+    if not isinstance(outcomes, list) or not outcomes:
+        raise ArtifactError("product closeout draft needs at least one outcome")
+    normalized_outcomes = []
+    outcome_ids = set()
+    for outcome in outcomes:
+        required = {
+            "id", "title", "observation", "evidence", "validation_scope",
+            "claim_boundary",
+        }
+        if not isinstance(outcome, dict) or set(outcome) != required:
+            raise ArtifactError("invalid product closeout outcome")
+        outcome_id = safe_identifier(outcome.get("id"), "outcome id")
+        if outcome_id in outcome_ids:
+            raise ArtifactError("duplicate product closeout outcome id")
+        outcome_ids.add(outcome_id)
+        for field in ("title", "observation"):
+            if not isinstance(outcome.get(field), str) or not outcome[field].strip():
+                raise ArtifactError(f"outcome {outcome_id} needs {field}")
+        normalized_outcomes.append({
+            "id": outcome_id, "title": outcome["title"].strip(),
+            "observation": outcome["observation"].strip(),
+            "evidence": _seal_product_evidence(
+                repo, run_ids, outcome["evidence"], f"outcome {outcome_id}"
+            ),
+            "validation_scope": _single_line(
+                outcome["validation_scope"],
+                f"outcome {outcome_id} validation scope",
+            ),
+            "claim_boundary": _single_line(
+                outcome["claim_boundary"],
+                f"outcome {outcome_id} claim boundary",
+            ),
+        })
+
+    improvements = draft.get("improvements")
+    if not isinstance(improvements, list):
+        raise ArtifactError("product closeout improvements must be an array")
+    normalized_improvements = []
+    improvement_ids = set()
+    for item in improvements:
+        required = {
+            "id", "title", "target", "outcomes", "proposal",
+            "success_criterion", "status",
+        }
+        if not isinstance(item, dict) or set(item) != required:
+            raise ArtifactError("invalid product improvement proposal")
+        item_id = safe_identifier(item.get("id"), "improvement id")
+        if item_id in improvement_ids:
+            raise ArtifactError("duplicate product improvement proposal id")
+        improvement_ids.add(item_id)
+        if (item.get("status") != "proposed"
+                or item.get("target") not in PRODUCT_IMPROVEMENT_TARGETS
+                or not isinstance(item.get("title"), str) or not item["title"].strip()
+                or not isinstance(item.get("proposal"), str)
+                or not item["proposal"].strip()
+                or not isinstance(item.get("success_criterion"), str)
+                or not item["success_criterion"].strip()):
+            raise ArtifactError(f"invalid product improvement proposal {item_id}")
+        linked = unique_strings(
+            item.get("outcomes"), f"improvement {item_id} outcomes"
+        )
+        unknown = sorted(set(linked) - outcome_ids)
+        if unknown:
+            raise ArtifactError(
+                f"improvement {item_id} references unknown outcome: "
+                + ", ".join(unknown)
+            )
+        if not linked:
+            raise ArtifactError(f"improvement {item_id} needs an outcome")
+        normalized_improvements.append({
+            "id": item_id, "title": item["title"].strip(),
+            "target": item["target"], "outcomes": sorted(linked),
+            "proposal": item["proposal"].strip(),
+            "success_criterion": item["success_criterion"].strip(),
+            "status": "proposed",
+        })
+
+    prior = draft.get("prior_improvements")
+    if not isinstance(prior, list):
+        raise ArtifactError("prior improvement assessments must be an array")
+    normalized_prior = []
+    prior_ids = set()
+    for assessment in prior:
+        required = {
+            "id", "origin", "qteam_version", "result", "observation",
+            "evidence", "validation_scope", "claim_boundary",
+        }
+        if not isinstance(assessment, dict) or set(assessment) != required:
+            raise ArtifactError("invalid prior improvement assessment")
+        assessment_id = safe_identifier(assessment.get("id"), "assessment id")
+        if assessment_id in prior_ids:
+            raise ArtifactError("duplicate prior improvement assessment id")
+        prior_ids.add(assessment_id)
+        if (not isinstance(assessment.get("origin"), str)
+                or not assessment["origin"].strip()
+                or not isinstance(assessment.get("qteam_version"), str)
+                or not assessment["qteam_version"].strip()
+                or assessment.get("result") not in PRIOR_IMPROVEMENT_RESULTS
+                or not isinstance(assessment.get("observation"), str)
+                or not assessment["observation"].strip()):
+            raise ArtifactError(
+                f"invalid prior improvement assessment {assessment_id}"
+            )
+        normalized_prior.append({
+            "id": assessment_id, "origin": assessment["origin"].strip(),
+            "qteam_version": assessment["qteam_version"].strip(),
+            "result": assessment["result"],
+            "observation": assessment["observation"].strip(),
+            "evidence": _seal_product_evidence(
+                repo, run_ids, assessment["evidence"],
+                f"assessment {assessment_id}",
+            ),
+            "validation_scope": _single_line(
+                assessment["validation_scope"],
+                f"assessment {assessment_id} validation scope",
+            ),
+            "claim_boundary": _single_line(
+                assessment["claim_boundary"],
+                f"assessment {assessment_id} claim boundary",
+            ),
+        })
+    return {
+        "summary": draft["summary"].strip(),
+        "retrospectives": sorted(
+            normalized_retrospectives, key=lambda item: item["lens"]
+        ),
+        "outcomes": sorted(normalized_outcomes, key=lambda item: item["id"]),
+        "improvements": sorted(
+            normalized_improvements, key=lambda item: item["id"]
+        ),
+        "prior_improvements": sorted(
+            normalized_prior, key=lambda item: item["id"]
+        ),
+    }
+
+
+def _snapshot_product_runs(repo, manifest, release):
+    snapshots = {}
+    for run_id, record in sorted(manifest["runs"].items()):
+        if record["status"] != "done":
+            raise ArtifactError(f"epic run {run_id} is not durably done")
+        _, ancestor_status = git(
+            ["merge-base", "--is-ancestor", record["finished_head"], release],
+            repo, check=False,
+        )
+        if ancestor_status:
+            raise ArtifactError(
+                f"release commit does not contain finished head of {run_id}"
+            )
+        state_path = repo_path(repo, f".agents/runs/{run_id}/state.json")
+        state, state_sha256 = _product_json_snapshot(
+            state_path, f"completed run state for {run_id}"
+        )
+        if (state.get("run_id") != run_id or state.get("phase") != "DONE"
+                or state.get("finished") is not True
+                or state.get("finished_head") != record["finished_head"]
+                or state_sha256 != record["run_state_sha256"]):
+            raise ArtifactError(f"completed run evidence changed for {run_id}")
+        events_path = repo_path(repo, f".agents/runs/{run_id}/events.jsonl")
+        events_data, events_sha256 = _product_bytes_snapshot(
+            events_path, f"completed run event log for {run_id}"
+        )
+        _validate_product_event_snapshot(events_data, events_path)
+        learning_path = repo_path(
+            repo, f".agents/runs/{run_id}/learning-outbox/manifest.json",
+            must_exist=False,
+        )
+        learning = None
+        if learning_path.exists():
+            manifest_value, learning_sha256 = _product_json_snapshot(
+                learning_path, f"learning manifest for {run_id}"
+            )
+            try:
+                qteam_eval_module().validate_learning_manifest(
+                    manifest_value, run_id
+                )
+            except ValueError as exc:
+                raise ArtifactError(f"invalid learning manifest for {run_id}: {exc}")
+            items = manifest_value.get("items")
+            statuses = {}
+            for item in items:
+                statuses[item["status"]] = statuses.get(item["status"], 0) + 1
+            learning = {
+                "path": learning_path.relative_to(repo).as_posix(),
+                "sha256": learning_sha256,
+                "items": len(items), "statuses": statuses,
+            }
+        snapshots[run_id] = {
+            "id": run_id, "title": record["title"],
+            "finished_head": record["finished_head"],
+            "state_path": state_path.relative_to(repo).as_posix(),
+            "state_sha256": state_sha256,
+            "events_path": events_path.relative_to(repo).as_posix(),
+            "events_sha256": events_sha256, "learning": learning,
+        }
+    return snapshots
+
+
+def cmd_product_closeout_seal(args, repo):
+    release, _ = git(["rev-parse", f"{args.release}^{{commit}}"], repo)
+    draft = read_json(Path(args.file).resolve())
+    with locked_epic(repo, args.epic) as epic_directory:
+        epic_path = safe_regular(
+            epic_directory / "epic.json", "epic manifest", required=True
+        )
+        manifest = validate_epic_manifest(read_json(epic_path), args.epic)
+        if len(manifest["runs"]) < 2:
+            raise ArtifactError(
+                "product closeout requires an epic with multiple runs; "
+                "use per-run LEARNING_EXPORT for one-run products"
+            )
+        runs = _snapshot_product_runs(repo, manifest, release)
+        normalized = _normalize_product_closeout_draft(
+            repo, draft, set(runs)
+        )
+        timestamp = now()
+        closeout = {
+            "schema_version": 1, "epic_id": args.epic,
+            "goal": manifest["goal"], "release_commit": release,
+            "qteam_runtime": _qteam_runtime_identity(repo),
+            "seal": {"txid": uuid.uuid4().hex, "recorded_at": timestamp},
+            "epic": {
+                "manifest": epic_path.relative_to(repo).as_posix(),
+                "manifest_sha256": file_sha256(epic_path),
+                "revision": manifest["revision"],
+            },
+            "runs": runs, **normalized,
+            "created_at": timestamp, "updated_at": timestamp,
+        }
+        validate_product_closeout(closeout, args.epic)
+        with locked_product_closeout(repo, args.epic) as (directory, path):
+            if path.exists():
+                raise ArtifactError(f"product closeout already exists: {args.epic}")
+            commit_product_closeout(
+                directory, closeout,
+                {"event": "product_closeout_sealed", "epic": args.epic,
+                 "release_commit": release,
+                 "sealed_sha256": _sealed_product_closeout_sha256(closeout)},
+            )
+    print(path)
+
+
+def _product_closeout_events(path, closeout=None):
+    safe_regular(path, "product closeout event log", required=True)
+    events = []
+    try:
+        data, _ = _product_bytes_snapshot(path, "product closeout event log")
+        for line in data.decode("utf-8").splitlines():
+            if not line:
+                continue
+            event = json.loads(line)
+            if not isinstance(event, dict):
+                raise ArtifactError("product closeout event must be an object")
+            if closeout is not None:
+                _validate_product_closeout_event_shape(event)
+                _validate_product_closeout_stored_event_identity(
+                    closeout, event
+                )
+            events.append(event)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ArtifactError(f"invalid product closeout event log: {exc}")
+    txids = [event.get("txid") for event in events]
+    if any(not isinstance(txid, str) for txid in txids):
+        raise ArtifactError("product closeout event lacks a transaction id")
+    if len(txids) != len(set(txids)):
+        raise ArtifactError("duplicate product closeout event transaction id")
+    return events
+
+
+def _product_evidence_matches(repo, raw_path, expected_sha256):
+    try:
+        path = repo_path(repo, raw_path)
+        _, digest = _product_bytes_snapshot(path, "product closeout evidence")
+        return digest == expected_sha256
+    except (ArtifactError, OSError):
+        return False
+
+
+def _product_closeout_seal_event_matches(closeout, events):
+    matches = [
+        event for event in events
+        if event.get("event") == "product_closeout_sealed"
+        and event.get("epic") == closeout["epic_id"]
+        and event.get("release_commit") == closeout["release_commit"]
+        and event.get("txid") == closeout["seal"]["txid"]
+        and event.get("recorded_at") == closeout["seal"]["recorded_at"]
+        and event.get("sealed_sha256")
+        == _sealed_product_closeout_sha256(closeout)
+    ]
+    return len(matches) == 1
+
+
+def _product_closeout_evidence_stale(repo, closeout):
+    stale = []
+    try:
+        epic_path = repo_path(repo, closeout["epic"]["manifest"])
+        manifest, manifest_sha256 = _product_json_snapshot(
+            epic_path, "epic manifest"
+        )
+        manifest = validate_epic_manifest(manifest, closeout["epic_id"])
+        _validate_product_closeout_epic_manifest(
+            closeout, manifest, manifest_sha256
+        )
+    except (ArtifactError, OSError):
+        stale.append({"path": closeout["epic"]["manifest"],
+                      "reason": "epic manifest binding changed"})
+    _, release_status = git(
+        ["cat-file", "-e", f"{closeout['release_commit']}^{{commit}}"],
+        repo, check=False,
+    )
+    if release_status:
+        stale.append({"path": None, "reason": "release commit is missing"})
+    for run_id, record in closeout["runs"].items():
+        for path_field, digest_field in (
+                ("state_path", "state_sha256"),
+                ("events_path", "events_sha256")):
+            if not _product_evidence_matches(
+                    repo, record[path_field], record[digest_field]):
+                stale.append({
+                    "path": record[path_field],
+                    "reason": f"{run_id} evidence digest changed",
+                })
+        learning = record["learning"]
+        if learning is not None and not _product_evidence_matches(
+                repo, learning["path"], learning["sha256"]):
+            stale.append({
+                "path": learning["path"],
+                "reason": f"{run_id} learning evidence digest changed",
+            })
+        if not release_status:
+            _, ancestor_status = git(
+                ["merge-base", "--is-ancestor", record["finished_head"],
+                 closeout["release_commit"]], repo, check=False,
+            )
+            if ancestor_status:
+                stale.append({
+                    "path": None,
+                    "reason": f"release commit lost finished head of {run_id}",
+                })
+    for record in [
+            *closeout["retrospectives"], *closeout["outcomes"],
+            *closeout["prior_improvements"]]:
+        for reference in record["evidence"]:
+            evidence_path = (
+                Path(".agents") / "runs" / reference["run"]
+                / Path(*PurePosixPath(reference["path"]).parts)
+            )
+            if not _product_evidence_matches(
+                    repo, evidence_path, reference["sha256"]):
+                stale.append({
+                    "path": evidence_path.as_posix(),
+                    "reason": "referenced outcome evidence digest changed",
+                })
+    return stale
+
+
+def check_product_closeout(repo, epic_id):
+    with locked_product_closeout(repo, epic_id) as (directory, path):
+        if not path.exists():
+            raise ArtifactError(f"product closeout is missing: {epic_id}")
+        closeout = validate_product_closeout(read_json(path), epic_id)
+        stale = _product_closeout_evidence_stale(repo, closeout)
+        events = _product_closeout_events(
+            directory / "product-closeout-events.jsonl", closeout
+        )
+        if not _product_closeout_seal_event_matches(closeout, events):
+            stale.append({
+                "path": path.relative_to(repo).as_posix(),
+                "reason": "product closeout lacks one bound sealed closeout event",
+            })
+        pending = []
+        approved = []
+        rejected = []
+        for item in closeout["improvements"]:
+            if item["status"] == "proposed":
+                pending.append(item["id"])
+                continue
+            matches = [
+                event for event in events
+                if event.get("event") == "product_improvement_decided"
+                and event.get("item") == item["id"]
+                and event.get("outcome") == item["status"]
+                and event.get("evidence") == item["decision"]["evidence"]
+                and event.get("txid") == item["decision"]["txid"]
+                and event.get("recorded_at") == item["decision"]["decided_at"]
+                and event.get("item_sha256") == object_sha256(item)
+            ]
+            if len(matches) != 1:
+                stale.append({
+                    "path": path.relative_to(repo).as_posix(),
+                    "reason": f"improvement {item['id']} lacks one bound decision event",
+                })
+            (approved if item["status"] == "approved" else rejected).append(
+                item["id"]
+            )
+        status = "stale" if stale else (
+            "pending-decisions" if pending else "complete"
+        )
+        report = {
+            "schema_version": 1, "epic_id": epic_id, "status": status,
+            "release_commit": closeout["release_commit"],
+            "pending": sorted(pending), "approved": sorted(approved),
+            "rejected": sorted(rejected), "stale": stale,
+            "closeout_sha256": file_sha256(path),
+        }
+        return closeout, report
+
+
+def cmd_product_closeout_check(args, repo):
+    _, report = check_product_closeout(repo, args.epic)
+    print(json.dumps(report, indent=2, sort_keys=True))
+    if report["status"] == "stale":
+        raise SystemExit(1)
+
+
+def cmd_product_closeout_status(args, repo):
+    cmd_product_closeout_check(args, repo)
+
+
+def cmd_product_closeout_decision(args, repo):
+    evidence = _single_line(args.evidence, "coordinator decision evidence")
+    with locked_product_closeout(repo, args.epic) as (directory, path):
+        if not path.exists():
+            raise ArtifactError(f"product closeout is missing: {args.epic}")
+        closeout = validate_product_closeout(read_json(path), args.epic)
+        events = _product_closeout_events(
+            directory / "product-closeout-events.jsonl", closeout
+        )
+        if not _product_closeout_seal_event_matches(closeout, events):
+            raise ArtifactError(
+                "product closeout lacks one bound sealed closeout event"
+            )
+        if _product_closeout_evidence_stale(repo, closeout):
+            raise ArtifactError("product closeout evidence is stale")
+        matches = [
+            item for item in closeout["improvements"] if item["id"] == args.item
+        ]
+        if len(matches) != 1:
+            raise ArtifactError(f"unknown product improvement proposal: {args.item}")
+        item = matches[0]
+        if item["status"] != "proposed":
+            raise ArtifactError(f"product improvement {args.item} is already decided")
+        item["status"] = args.outcome
+        decision_time = now()
+        item["decision"] = {
+            "authority": "coordinator", "outcome": args.outcome,
+            "evidence": evidence, "decided_at": decision_time,
+            "txid": uuid.uuid4().hex,
+        }
+        closeout["updated_at"] = decision_time
+        validate_product_closeout(closeout, args.epic)
+        commit_product_closeout(
+            directory, closeout,
+            {
+                "event": "product_improvement_decided", "item": args.item,
+                "outcome": args.outcome, "evidence": evidence,
+                "item_sha256": object_sha256(item),
+            },
+        )
+    print(path)
+
+
+def cmd_product_closeout_brief(args, repo):
+    closeout, report = check_product_closeout(repo, args.epic)
+    if report["status"] == "stale":
+        raise ArtifactError("product closeout is stale")
+    if report["pending"]:
+        raise ArtifactError("product closeout has pending improvement decisions")
+    path = repo_path(
+        repo, f".agents/epics/{args.epic}/product-closeout.json"
+    )
+    payload = {
+        "schema_version": 1,
+        "source": {
+            "epic_id": args.epic,
+            "release_commit": closeout["release_commit"],
+            "qteam_runtime": closeout["qteam_runtime"],
+            "product_closeout": path.relative_to(repo).as_posix(),
+            "product_closeout_sha256": file_sha256(path),
+        },
+        "summary": closeout["summary"],
+        "retrospectives": closeout["retrospectives"],
+        "outcomes": closeout["outcomes"],
+        "prior_improvements": closeout["prior_improvements"],
+        "improvements": [
+            item for item in closeout["improvements"]
+            if item["status"] == "approved"
+        ],
+        "generated_at": now(),
+    }
+    print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+
+
 def _git_blob(repo, path, base=None):
     relative = path.relative_to(repo).as_posix()
     if base is not None:
@@ -1694,6 +2931,26 @@ def parser():
     p = sub.add_parser("epic-status")
     p.add_argument("--epic", required=True)
     p.set_defaults(func=cmd_epic_status)
+    p = sub.add_parser("product-closeout-seal")
+    p.add_argument("--epic", required=True)
+    p.add_argument("--release", default="HEAD")
+    p.add_argument("--file", required=True)
+    p.set_defaults(func=cmd_product_closeout_seal)
+    p = sub.add_parser("product-closeout-check")
+    p.add_argument("--epic", required=True)
+    p.set_defaults(func=cmd_product_closeout_check)
+    p = sub.add_parser("product-closeout-status")
+    p.add_argument("--epic", required=True)
+    p.set_defaults(func=cmd_product_closeout_status)
+    p = sub.add_parser("product-closeout-decision")
+    p.add_argument("--epic", required=True)
+    p.add_argument("--item", required=True)
+    p.add_argument("--outcome", choices=("approved", "rejected"), required=True)
+    p.add_argument("--evidence", required=True)
+    p.set_defaults(func=cmd_product_closeout_decision)
+    p = sub.add_parser("product-closeout-brief")
+    p.add_argument("--epic", required=True)
+    p.set_defaults(func=cmd_product_closeout_brief)
     p = sub.add_parser("index-seal")
     p.add_argument("--file", required=True)
     p.add_argument("--output", required=True)

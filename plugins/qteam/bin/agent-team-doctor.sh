@@ -67,7 +67,7 @@ for schema in run-state task task-policy project-policy quality-lane queue-item 
               tdd-cycle trajectory eval-case diagnosis experiment decision-gate \
               handoff scenario-coverage worker-result verification finding \
               review-result review-receipt artifact-lint code-index epic spec-drift \
-              goal-status; do
+              goal-status product-closeout; do
   [[ -f ".codex/schemas/$schema.schema.json" ]] || fail "missing schema: $schema"
 done
 SCHEMA_OK=1
@@ -78,7 +78,7 @@ done
 
 for duplicate in agent-team-dev qteam-router qteam-tdd qteam-diagnose qteam-explore qteam-review \
                  qteam-goal qteam-harden deslop thermo-nuclear-code-quality-review \
-                 diagram-creator handoff isometric show-me \
+                 qteam-retrospect diagram-creator handoff isometric show-me \
                  using-superpowers executing-plans subagent-driven-development \
                  requesting-code-review receiving-code-review \
                  finishing-a-development-branch using-git-worktrees \

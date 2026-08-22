@@ -26,23 +26,26 @@ so the plugin and read-only role configuration are both loaded.
 Route in this order:
 
 1. Active unfinished run: resume its recorded phase. Never brainstorm again.
-2. Bug, regression, hang, or performance failure: use `qteam-diagnose`.
-3. Clear destination but unknown solution space, or an explicit request to find
+2. Fully delivered multi-run epic whose product should improve QTeam: use
+   `qteam-retrospect`. It seals cross-run evidence and approved proposals; it
+   never edits completed runs or canonical QTeam behavior.
+3. Bug, regression, hang, or performance failure: use `qteam-diagnose`.
+4. Clear destination but unknown solution space, or an explicit request to find
    paths/ideas/knowledge beyond the stated options: use `qteam-explore`. It
    produces a bounded evidence brief; an explicit deep/broad request uses its
    full research-frontier rule. It never starts an implementation loop.
-4. Huge multi-session effort whose decision path is foggy: use `wayfinder`.
+5. Huge multi-session effort whose decision path is foggy: use `wayfinder`.
    When it decomposes into multiple independently executable specs, create one
    QTeam epic manifest with cross-run dependencies and stable contracts. Hand
    each unblocked run to `to-spec`; do not create an epic for a single run.
-5. Unclear new behavior: classify it before `brainstorming`:
+6. Unclear new behavior: classify it before `brainstorming`:
    - spike: a disposable learning task/experiment whose result returns for
      approval, never an unreviewed shipping shortcut;
    - bounded: a short design for a local, reversible change;
    - architectural: full alternatives, domain model, spec, and ticket DAG.
    Invoke `grilling` only on an unresolved high-impact branch and
    `grill-with-docs` only when the domain vocabulary is changing.
-6. Sufficient approved context: use `to-spec`, then `to-tickets`, then
+7. Sufficient approved context: use `to-spec`, then `to-tickets`, then
    `agent-team-dev` execution.
 
 Inside execution, route only policy-triggered quality lanes to `qteam-harden`.

@@ -1,7 +1,7 @@
 {
   "name": "qteam",
-  "version": "0.17.0+codex.20260822000000",
-  "description": "Durable graph delivery plus behavior-preserving diff cleanup, strict structural review, evidence-backed architecture maps, contract-backed diagrams, TDD, diagnosis, and safe finish.",
+  "version": "0.18.0+codex.20260822095728",
+  "description": "Durable graph delivery plus governed product retrospectives, evidence-backed self-improvement, strict structural review, TDD, diagnosis, and safe finish.",
   "author": {
     "name": "qscuio",
     "url": "https://github.com/qscuio"
@@ -27,13 +27,15 @@
     "diagrams",
     "uml",
     "teaching",
-    "handoff"
+    "handoff",
+    "retrospectives",
+    "self-improvement"
   ],
   "skills": "./skills/",
   "interface": {
     "displayName": "QTeam",
     "shortDescription": "Durable, gated multi-agent software delivery",
-    "longDescription": "Discover evidence-backed solution paths, then deliver through durable goals, isolated worktrees, scenario-complete TDD, behavior-preserving diff cleanup, immutable structural-quality review, adaptive quality lanes, contract-backed diagrams, deterministic policy, and safe finish gates.",
+    "longDescription": "Discover evidence-backed solution paths, deliver through durable goals and isolated worktrees, then turn completed multi-run products into governed, eval-backed QTeam improvement proposals without mutating canonical behavior automatically.",
     "developerName": "qscuio",
     "category": "Developer Tools",
     "capabilities": [
@@ -46,6 +48,7 @@
       "Set up QTeam in this repository.",
       "Use QTeam to execute this implementation goal.",
       "Resume the active QTeam run.",
+      "Close out this delivered QTeam epic and produce an approved self-improvement brief.",
       "Map this repository as an evidence-backed isometric architecture.",
       "Create a UML diagram for this design.",
       "Teach me this mechanism with an interactive Show Me UI."

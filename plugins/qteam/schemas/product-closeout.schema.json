@@ -1,0 +1,345 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qteam.local/schemas/product-closeout.schema.json",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "epic_id",
+    "goal",
+    "release_commit",
+    "qteam_runtime",
+    "epic",
+    "runs",
+    "seal",
+    "summary",
+    "retrospectives",
+    "outcomes",
+    "improvements",
+    "prior_improvements",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "epic_id": {"$ref": "#/$defs/id"},
+    "goal": {"$ref": "#/$defs/non_blank"},
+    "release_commit": {"$ref": "#/$defs/commit"},
+    "qteam_runtime": {"$ref": "#/$defs/qteam_runtime"},
+    "epic": {"$ref": "#/$defs/epic"},
+    "runs": {
+      "type": "object",
+      "minProperties": 2,
+      "propertyNames": {"$ref": "#/$defs/id"},
+      "additionalProperties": {"$ref": "#/$defs/run"}
+    },
+    "seal": {"$ref": "#/$defs/seal"},
+    "summary": {"$ref": "#/$defs/non_blank"},
+    "retrospectives": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": {"$ref": "#/$defs/retrospective"},
+      "allOf": [
+        {
+          "contains": {
+            "properties": {"lens": {"const": "product-outcome"}}
+          },
+          "minContains": 1,
+          "maxContains": 1
+        },
+        {
+          "contains": {
+            "properties": {"lens": {"const": "qteam-behavior"}}
+          },
+          "minContains": 1,
+          "maxContains": 1
+        }
+      ]
+    },
+    "outcomes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/outcome"}
+    },
+    "improvements": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/improvement"}
+    },
+    "prior_improvements": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/prior_improvement"}
+    },
+    "created_at": {"$ref": "#/$defs/non_blank"},
+    "updated_at": {"$ref": "#/$defs/non_blank"}
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "commit": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "txid": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+    "non_blank": {"type": "string", "pattern": "\\S"},
+    "single_line": {
+      "type": "string",
+      "pattern": "^(?=.*\\S)[^\\r\\n]+$"
+    },
+    "evidence_path": {
+      "type": "string",
+      "pattern": "^(?!/)(?!.*\\\\)(?!.*(?:^|/)\\.\\.?/)(?!\\.\\.?$)(?!.*//).+$"
+    },
+    "qteam_runtime": {
+      "type": "object",
+      "required": [
+        "version",
+        "source_commit",
+        "marker_sha256",
+        "project_manifest",
+        "project_manifest_sha256",
+        "managed_files",
+        "managed_files_sha256",
+        "config_sha256"
+      ],
+      "properties": {
+        "version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+        "source_commit": {"type": "string", "pattern": "^[0-9a-f]{7,64}$"},
+        "marker_sha256": {"$ref": "#/$defs/sha256"},
+        "project_manifest": {"const": ".codex/qteam-project.json"},
+        "project_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "managed_files": {"type": "integer", "minimum": 1},
+        "managed_files_sha256": {"$ref": "#/$defs/sha256"},
+        "config_sha256": {"$ref": "#/$defs/sha256"}
+      },
+      "additionalProperties": false
+    },
+    "seal": {
+      "type": "object",
+      "required": ["txid", "recorded_at"],
+      "properties": {
+        "txid": {"$ref": "#/$defs/txid"},
+        "recorded_at": {"$ref": "#/$defs/non_blank"}
+      },
+      "additionalProperties": false
+    },
+    "epic": {
+      "type": "object",
+      "required": ["manifest", "manifest_sha256", "revision"],
+      "properties": {
+        "manifest": {
+          "type": "string",
+          "pattern": "^\\.agents/epics/(?![^/]*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*/epic\\.json$"
+        },
+        "manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "revision": {"type": "integer", "minimum": 1}
+      },
+      "additionalProperties": false
+    },
+    "learning": {
+      "type": "object",
+      "required": ["path", "sha256", "items", "statuses"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "pattern": "^\\.agents/runs/(?![^/]*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*/learning-outbox/manifest\\.json$"
+        },
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "items": {"type": "integer", "minimum": 0},
+        "statuses": {
+          "type": "object",
+          "additionalProperties": {"type": "integer", "minimum": 0}
+        }
+      },
+      "additionalProperties": false
+    },
+    "run": {
+      "type": "object",
+      "required": [
+        "id",
+        "title",
+        "finished_head",
+        "state_path",
+        "state_sha256",
+        "events_path",
+        "events_sha256",
+        "learning"
+      ],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "title": {"$ref": "#/$defs/non_blank"},
+        "finished_head": {"$ref": "#/$defs/commit"},
+        "state_path": {
+          "type": "string",
+          "pattern": "^\\.agents/runs/(?![^/]*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*/state\\.json$"
+        },
+        "state_sha256": {"$ref": "#/$defs/sha256"},
+        "events_path": {
+          "type": "string",
+          "pattern": "^\\.agents/runs/(?![^/]*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*/events\\.jsonl$"
+        },
+        "events_sha256": {"$ref": "#/$defs/sha256"},
+        "learning": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/learning"}
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["run", "path", "sha256"],
+      "properties": {
+        "run": {"$ref": "#/$defs/id"},
+        "path": {"$ref": "#/$defs/evidence_path"},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      },
+      "additionalProperties": false
+    },
+    "retrospective": {
+      "type": "object",
+      "required": [
+        "lens",
+        "reviewer",
+        "summary",
+        "evidence",
+        "validation_scope",
+        "claim_boundary"
+      ],
+      "properties": {
+        "lens": {"enum": ["product-outcome", "qteam-behavior"]},
+        "reviewer": {"$ref": "#/$defs/single_line"},
+        "summary": {"$ref": "#/$defs/non_blank"},
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/evidence"}
+        },
+        "validation_scope": {"$ref": "#/$defs/single_line"},
+        "claim_boundary": {"$ref": "#/$defs/single_line"}
+      },
+      "additionalProperties": false
+    },
+    "outcome": {
+      "type": "object",
+      "required": [
+        "id",
+        "title",
+        "observation",
+        "evidence",
+        "validation_scope",
+        "claim_boundary"
+      ],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "title": {"$ref": "#/$defs/non_blank"},
+        "observation": {"$ref": "#/$defs/non_blank"},
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/evidence"}
+        },
+        "validation_scope": {"$ref": "#/$defs/single_line"},
+        "claim_boundary": {"$ref": "#/$defs/single_line"}
+      },
+      "additionalProperties": false
+    },
+    "decision": {
+      "type": "object",
+      "required": ["authority", "outcome", "evidence", "decided_at", "txid"],
+      "properties": {
+        "authority": {"const": "coordinator"},
+        "outcome": {"enum": ["approved", "rejected"]},
+        "evidence": {"$ref": "#/$defs/single_line"},
+        "decided_at": {"$ref": "#/$defs/non_blank"},
+        "txid": {"$ref": "#/$defs/txid"}
+      },
+      "additionalProperties": false
+    },
+    "improvement": {
+      "type": "object",
+      "required": [
+        "id",
+        "title",
+        "target",
+        "outcomes",
+        "proposal",
+        "success_criterion",
+        "status"
+      ],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "title": {"$ref": "#/$defs/non_blank"},
+        "target": {"enum": ["skill", "worker-prompt", "tool", "policy", "eval"]},
+        "outcomes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/id"}
+        },
+        "proposal": {"$ref": "#/$defs/non_blank"},
+        "success_criterion": {"$ref": "#/$defs/non_blank"},
+        "status": {"enum": ["proposed", "approved", "rejected"]},
+        "decision": {"$ref": "#/$defs/decision"}
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {"properties": {"status": {"const": "proposed"}}},
+          "then": {"not": {"required": ["decision"]}},
+          "else": {"required": ["decision"]}
+        },
+        {
+          "if": {"properties": {"status": {"const": "approved"}}},
+          "then": {
+            "properties": {
+              "decision": {
+                "properties": {"outcome": {"const": "approved"}}
+              }
+            }
+          }
+        },
+        {
+          "if": {"properties": {"status": {"const": "rejected"}}},
+          "then": {
+            "properties": {
+              "decision": {
+                "properties": {"outcome": {"const": "rejected"}}
+              }
+            }
+          }
+        }
+      ]
+    },
+    "prior_improvement": {
+      "type": "object",
+      "required": [
+        "id",
+        "origin",
+        "qteam_version",
+        "result",
+        "observation",
+        "evidence",
+        "validation_scope",
+        "claim_boundary"
+      ],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "origin": {"$ref": "#/$defs/non_blank"},
+        "qteam_version": {"$ref": "#/$defs/non_blank"},
+        "result": {"enum": ["helped", "neutral", "regressed", "inconclusive"]},
+        "observation": {"$ref": "#/$defs/non_blank"},
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/evidence"}
+        },
+        "validation_scope": {"$ref": "#/$defs/single_line"},
+        "claim_boundary": {"$ref": "#/$defs/single_line"}
+      },
+      "additionalProperties": false
+    }
+  }
+}

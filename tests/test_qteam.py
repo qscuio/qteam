@@ -6703,6 +6703,8 @@ class InstallerTests(RepoCase):
                          ".codex/schemas/artifact-lint.schema.json").is_file())
         self.assertTrue((self.repo / ".codex/schemas/epic.schema.json").is_file())
         self.assertTrue((self.repo /
+                         ".codex/schemas/product-closeout.schema.json").is_file())
+        self.assertTrue((self.repo /
                          ".codex/schemas/code-index.schema.json").is_file())
         self.assertTrue((self.repo /
                          ".codex/schemas/spec-drift.schema.json").is_file())
@@ -6790,6 +6792,18 @@ class InstallerTests(RepoCase):
         self.assertIn("goal-status", doctor.stdout)
         hidden_goal_schema.rename(goal_schema)
 
+        closeout_schema = self.repo / ".codex/schemas/product-closeout.schema.json"
+        hidden_closeout_schema = closeout_schema.with_suffix(".hidden")
+        closeout_schema.rename(hidden_closeout_schema)
+        doctor = subprocess.run(
+            [str(self.repo / ".codex/bin/agent-team-doctor")],
+            cwd=self.repo, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env=self.fake_plugin_env(),
+        )
+        self.assertNotEqual(doctor.returncode, 0)
+        self.assertIn("product-closeout", doctor.stdout)
+        hidden_closeout_schema.rename(closeout_schema)
+
         conflict = self.repo / ".agents/skills/qteam-explore"
         conflict.mkdir(parents=True)
         (conflict / "SKILL.md").write_text("local discovery\n", encoding="utf-8")
@@ -6809,6 +6823,20 @@ class InstallerTests(RepoCase):
         self.assertNotEqual(doctor.returncode, 0)
         self.assertIn("qteam-goal", doctor.stdout)
         shutil.rmtree(goal_conflict)
+
+        retrospect_conflict = self.repo / ".agents/skills/qteam-retrospect"
+        retrospect_conflict.mkdir(parents=True)
+        (retrospect_conflict / "SKILL.md").write_text(
+            "competing retrospective\n", encoding="utf-8"
+        )
+        doctor = subprocess.run(
+            [str(self.repo / ".codex/bin/agent-team-doctor")],
+            cwd=self.repo, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env=self.fake_plugin_env(),
+        )
+        self.assertNotEqual(doctor.returncode, 0)
+        self.assertIn("qteam-retrospect", doctor.stdout)
+        shutil.rmtree(retrospect_conflict)
 
         removed = self.run_tool(PROJECT_UNINSTALL, str(self.repo))
         self.assertEqual(removed.returncode, 0, removed.stdout + removed.stderr)
@@ -7211,22 +7239,22 @@ class PluginTests(RepoCase):
             manifest["version"].split("+", 1)[0],
             (PLUGIN / "VERSION").read_text(encoding="utf-8").strip(),
         )
-        self.assertRegex(manifest["version"], r"^0\.17\.0\+codex\.[0-9]+$")
+        self.assertRegex(manifest["version"], r"^0\.18\.0\+codex\.[0-9]+$")
 
         claude = json.loads((PLUGIN / ".claude-plugin/plugin.json").read_text())
         cursor = json.loads((PLUGIN / ".cursor-plugin/plugin.json").read_text())
         claude_marketplace = json.loads(
             (SOURCE / ".claude-plugin/marketplace.json").read_text()
         )
-        self.assertEqual(claude["version"], "0.17.0")
-        self.assertEqual(cursor["version"], "0.17.0")
+        self.assertEqual(claude["version"], "0.18.0")
+        self.assertEqual(cursor["version"], "0.18.0")
         self.assertEqual(cursor["skills"], "./skills/")
-        self.assertEqual(claude_marketplace["plugins"][0]["version"], "0.17.0")
+        self.assertEqual(claude_marketplace["plugins"][0]["version"], "0.18.0")
         self.assertEqual(
             claude_marketplace["plugins"][0]["source"], "./plugins/qteam"
         )
         self.assertIn(
-            'server_version = "QTeamWeb/0.17"',
+            'server_version = "QTeamWeb/0.18"',
             (PLUGIN / "bin/agent-team-web.py").read_text(encoding="utf-8"),
         )
 
@@ -7865,6 +7893,7 @@ class PluginTests(RepoCase):
                     ".codex/qteam-ui/styles.css",
                     ".codex/bin/agent-team-goal",
                     ".codex/schemas/goal-status.schema.json",
+                    ".codex/schemas/product-closeout.schema.json",
                 }
                 if schema_version == 2:
                     previous_paths.add(importer_path)
@@ -7950,6 +7979,7 @@ class PluginTests(RepoCase):
             ".codex/qteam-ui/styles.css",
             ".codex/bin/agent-team-goal",
             ".codex/schemas/goal-status.schema.json",
+            ".codex/schemas/product-closeout.schema.json",
         }
         manifest["installed_files"] = [
             record for record in manifest["installed_files"]
@@ -7987,6 +8017,7 @@ class PluginTests(RepoCase):
             ".codex/licenses/Simple-Icons-CC0-1.0.txt",
             ".codex/licenses/Log-Z-Logos-MIT.txt",
             ".codex/licenses/Devicon-MIT.txt",
+            ".codex/schemas/product-closeout.schema.json",
         }
         manifest["installed_files"] = [
             record for record in manifest["installed_files"]
@@ -8018,6 +8049,7 @@ class PluginTests(RepoCase):
             ".codex/licenses/Simple-Icons-CC0-1.0.txt",
             ".codex/licenses/Log-Z-Logos-MIT.txt",
             ".codex/licenses/Devicon-MIT.txt",
+            ".codex/schemas/product-closeout.schema.json",
         }
         manifest["installed_files"] = [
             record for record in manifest["installed_files"]
@@ -8038,7 +8070,7 @@ class PluginTests(RepoCase):
         for license_path in license_paths:
             self.assertTrue((self.repo / license_path).is_file())
         current = json.loads(manifest_path.read_text(encoding="utf-8"))
-        self.assertEqual(current["version"], "0.17.0")
+        self.assertEqual(current["version"], "0.18.0")
 
     def test_setup_upgrades_v016_runtime_with_quality_references(self):
         self.run_tool(PROJECT_SETUP, str(self.repo), check=True)
@@ -8048,6 +8080,7 @@ class PluginTests(RepoCase):
             ".codex/practices/deslop.md",
             ".codex/standards/structural-quality.md",
             ".codex/licenses/Cursor-Team-Kit-MIT.txt",
+            ".codex/schemas/product-closeout.schema.json",
         }
         manifest["installed_files"] = [
             record for record in manifest["installed_files"]
@@ -8068,7 +8101,31 @@ class PluginTests(RepoCase):
         for relative in additions:
             self.assertTrue((self.repo / relative).is_file())
         current = json.loads(manifest_path.read_text(encoding="utf-8"))
-        self.assertEqual(current["version"], "0.17.0")
+        self.assertEqual(current["version"], "0.18.0")
+
+    def test_setup_upgrades_v017_runtime_with_product_closeout_schema(self):
+        self.run_tool(PROJECT_SETUP, str(self.repo), check=True)
+        manifest_path = self.repo / ".codex/qteam-project.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        closeout_schema = ".codex/schemas/product-closeout.schema.json"
+        manifest["installed_files"] = [
+            record for record in manifest["installed_files"]
+            if record["path"] != closeout_schema
+        ]
+        (self.repo / closeout_schema).unlink()
+        manifest["version"] = "0.17.0"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        env, _state, _log = self.fake_codex_env()
+        upgraded = subprocess.run(
+            [str(QTEAM), "setup", str(self.repo)], cwd=SOURCE, env=env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(upgraded.returncode, 0,
+                         upgraded.stdout + upgraded.stderr)
+        self.assertTrue((self.repo / closeout_schema).is_file())
+        current = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(current["version"], "0.18.0")
 
     def test_uninstall_conflict_makes_no_plugin_or_marketplace_mutation(self):
         env, state, log = self.fake_codex_env()

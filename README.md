@@ -9,6 +9,20 @@ Autoresearch while keeping exactly one orchestration authority.
 The core rule is simple: roles are created only for distinct permission,
 context, output, or lifecycle boundaries; reusable practices remain skills.
 
+## What changed in 0.18
+
+- `$qteam-retrospect` closes the learning loop after a multi-run epic delivers
+  a product. Two independent read-only passes examine product outcomes and
+  QTeam behavior, then seal their claims to the exact release, completed run
+  state, event logs, learning manifests, runtime version, and cited evidence.
+- Improvement proposals require item-level coordinator decisions. The resulting
+  brief contains approved proposals only and becomes input to a separate,
+  eval-first QTeam implementation run; a closeout cannot edit completed runs,
+  qnote, another repository, or canonical QTeam behavior.
+- Later products record whether earlier QTeam changes helped, were neutral,
+  regressed behavior, or remain inconclusive. This release adds no CI, PR,
+  publication, or automatic self-modification path.
+
 ## What changed in 0.17
 
 - `$deslop` adds a bounded, behavior-preserving cleanup pass after GREEN. QTeam
@@ -391,7 +405,7 @@ codex plugin add qteam@qteam
 ```
 
 Claude setup analogously uses `claude plugin marketplace add` plus
-`claude plugin install/update`, verifies the installed 0.17 version, and its
+`claude plugin install/update`, verifies the installed 0.18 version, and its
 uninstall command removes both registrations.
 
 Start the Web UI after project setup:

@@ -1,10 +1,10 @@
 {
   "name": "qteam",
-  "description": "Durable delivery with diff cleanup, structural review, architecture maps, diagrams, and portable handoffs for Claude Code",
-  "version": "0.17.0",
+  "description": "Durable delivery with governed product retrospectives, evidence-backed self-improvement, structural review, and portable handoffs for Claude Code",
+  "version": "0.18.0",
   "author": {"name": "qscuio"},
   "homepage": "https://github.com/qscuio/qteam",
   "repository": "https://github.com/qscuio/qteam",
   "license": "MIT",
-  "keywords": ["skills", "delivery", "tdd", "debugging", "goals", "isometric", "architecture-map", "diagrams", "uml", "teaching", "handoff"]
+  "keywords": ["skills", "delivery", "tdd", "debugging", "goals", "retrospectives", "self-improvement", "architecture-map", "diagrams", "handoff"]
 }

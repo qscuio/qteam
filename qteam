@@ -407,7 +407,7 @@ main() {
           echo "QTeam setup complete for $host."
           return 0
         fi
-        for local_skill in diagram-creator handoff isometric qteam-explore qteam-goal qteam-harden show-me; do
+        for local_skill in diagram-creator handoff isometric qteam-explore qteam-goal qteam-harden qteam-retrospect show-me; do
           if [[ -e "$project_root/.agents/skills/$local_skill" || \
                 -L "$project_root/.agents/skills/$local_skill" ]]; then
             echo "error: repository-local .agents/skills/$local_skill conflicts with the QTeam plugin and is not QTeam-owned" >&2

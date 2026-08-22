@@ -1,0 +1,60 @@
+{
+  "summary": "The release met its acceptance criteria; one late review finding exposed a reusable QTeam gap.",
+  "retrospectives": [
+    {
+      "lens": "product-outcome",
+      "reviewer": "product-review-session-id",
+      "summary": "The product met its acceptance boundary and preserved its recorded domain contracts.",
+      "evidence": [
+        {
+          "run": "run-a",
+          "path": "reviews/wave-1-standards.json"
+        }
+      ],
+      "validation_scope": "the delivered product release and its recorded requirements",
+      "claim_boundary": "does not assess QTeam process effectiveness"
+    },
+    {
+      "lens": "qteam-behavior",
+      "reviewer": "qteam-review-session-id",
+      "summary": "A reusable planning gap allowed an invariant to reach late review.",
+      "evidence": [
+        {
+          "run": "run-a",
+          "path": "reviews/wave-1-standards.json"
+        }
+      ],
+      "validation_scope": "the QTeam execution and review evidence for this epic",
+      "claim_boundary": "does not claim the same gap exists in unrelated product domains"
+    }
+  ],
+  "outcomes": [
+    {
+      "id": "O1",
+      "title": "Invariant discovered during late review",
+      "observation": "The invariant was absent from planning evidence and found after implementation.",
+      "evidence": [
+        {
+          "run": "run-a",
+          "path": "reviews/wave-1-standards.json"
+        }
+      ],
+      "validation_scope": "the cited reviewed delivery at its recorded finished head",
+      "claim_boundary": "does not establish that the same invariant applies outside this product domain"
+    }
+  ],
+  "improvements": [
+    {
+      "id": "I1",
+      "title": "Move the invariant check before implementation",
+      "target": "skill",
+      "outcomes": [
+        "O1"
+      ],
+      "proposal": "Teach the applicable design skill to test this invariant before producing implementation tickets.",
+      "success_criterion": "A held-out replay of the product decision rejects the defective design before implementation.",
+      "status": "proposed"
+    }
+  ],
+  "prior_improvements": []
+}
